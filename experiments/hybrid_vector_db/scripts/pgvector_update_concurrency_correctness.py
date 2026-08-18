@@ -1104,7 +1104,16 @@ def validate_runtime_provenance(manifest: dict[str, Any]) -> list[str]:
         errors.append("correctness provenance is absent or incompatible")
     build_id = str(manifest.get("build_id", ""))
     library_sha = str(manifest.get("vector_library_sha256", ""))
-    if manifest.get("build_id_error") or not build_id.startswith("sqlens-v11-"):
+    if manifest.get("build_id_error") or not build_id.startswith(
+        (
+            "sqlens-v11-",
+            "sqlens-v12-",
+            "sqlens-v13-",
+            "sqlens-v14-",
+            "sqlens-v15-",
+            "sqlens-v16-",
+        )
+    ):
         errors.append("loaded SQLens build ID is absent or incompatible")
     if manifest.get("vector_library_error") or len(library_sha) != 64 or any(
         char not in "0123456789abcdef" for char in library_sha.lower()

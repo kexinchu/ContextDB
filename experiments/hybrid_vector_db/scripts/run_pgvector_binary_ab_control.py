@@ -30,14 +30,18 @@ from typing import Any, Mapping, Sequence
 
 
 OFFICIAL_VECTOR_SO_SHA256 = (
-    "812292e3e7553c3dbe6a4187b528430a7f9c25693f4876b8d22f88829592a778"
+    "a97f730478cd3628820fb072273f8185c94ffa76a9ee802a006db7028e7b8d87"
 )
 UPSTREAM_EF_PATCH_SHA256 = {
     10_000: "d63b8d75015cffb90d9bd7f04d0c8f572502f0b84f77f59f581d224db7601bcf",
     100_000: "2393fff3ac210d9fd19478ed7552db559359d19cdae693de51e42c71d04cf225",
 }
-DEFAULT_SQLENS_BUILD_PREFIX = "sqlens-v11-"
-DEFAULT_SQLENS_PROFILE_SEMANTICS = 7.0
+DEFAULT_SQLENS_BUILD_PREFIX = "sqlens-v16-d3-full-materialization-persisted-reuse-"
+DEFAULT_SQLENS_BUILD_ID = (
+    "sqlens-v16-d3-sticky-rejection-mixed-predicate-reuse-d2-edge-trace-"
+    "readbuffer-profile-orderchangefix-ef500k-20260729-r36"
+)
+DEFAULT_SQLENS_PROFILE_SEMANTICS = 9.0
 RUNNER_PATH = Path(__file__).with_name("pgvector_upstream_overhead_control.py")
 ACTIVE_SESSION_QUERY = """
 SELECT count(*)
@@ -102,9 +106,14 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+OFFICIAL_RELEASE_EF_SEARCH_VALUES = (
+    20, 40, 60, 80, 100, 150, 200, 250, 500, 750, 1000,
+)
+
+
 def _default_config_ladder_sha256() -> str:
     configs: list[dict[str, Any]] = []
-    for ef_search in (250, 500, 750, 1000):
+    for ef_search in OFFICIAL_RELEASE_EF_SEARCH_VALUES:
         configs.append(
             {
                 "ef_search": ef_search,
@@ -144,7 +153,25 @@ def _controller_spec_source_hashes(spec: Mapping[str, Any]) -> dict[str, Any]:
 
     filters_path = required_path("filters_csv")
     truth_path = required_path("truth_csv")
-    graph_path = required_path("graph_identity_json")
+    workload_mode = bool(
+        spec.get("calibration_workload_csv")
+        or spec.get("measurement_workload_csv")
+    )
+    if workload_mode != bool(
+        spec.get("calibration_workload_csv")
+        and spec.get("measurement_workload_csv")
+    ):
+        raise FinalizationError("controller workload input pair is incomplete")
+    graph_path = None if workload_mode else required_path("graph_identity_json")
+    calibration_path = (
+        required_path("calibration_workload_csv") if workload_mode else None
+    )
+    measurement_path = (
+        required_path("measurement_workload_csv") if workload_mode else None
+    )
+    index_build_path = (
+        required_path("official_index_build_manifest") if workload_mode else None
+    )
     filters = _read_csv(filters_path)
     design_filters = [str(value) for value in spec.get("formal_design_filters", [])]
     if not design_filters:
@@ -188,7 +215,6 @@ def _controller_spec_source_hashes(spec: Mapping[str, Any]) -> dict[str, Any]:
         "runner_sha256": sha256_file(RUNNER_PATH),
         "filters_sha256": sha256_file(filters_path),
         "truth_sha256": sha256_file(truth_path),
-        "graph_identity_sha256": sha256_file(graph_path),
         "hybrid_sql_sha256_by_filter": sql_hashes,
         "candidate_validity_predicate_sha256": hashlib.sha256(
             candidate.encode("utf-8")
@@ -199,6 +225,22 @@ def _controller_spec_source_hashes(spec: Mapping[str, Any]) -> dict[str, Any]:
             else _default_config_ladder_sha256()
         ),
     }
+    if workload_mode:
+        assert calibration_path is not None
+        assert measurement_path is not None
+        assert index_build_path is not None
+        expected.update(
+            {
+                "calibration_workload_sha256": sha256_file(calibration_path),
+                "measurement_workload_sha256": sha256_file(measurement_path),
+                "official_index_build_manifest_sha256": sha256_file(
+                    index_build_path
+                ),
+            }
+        )
+    else:
+        assert graph_path is not None
+        expected["graph_identity_sha256"] = sha256_file(graph_path)
     if patch:
         if not isinstance(patch, Mapping) or not patch.get("path"):
             raise FinalizationError("controller evaluation patch contract is invalid")
@@ -356,6 +398,69 @@ def counterbalanced_final_schedule(
     return schedule, audit
 
 
+def three_round_final_schedule(
+    run_uuid: str, seed: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    material = f"{run_uuid}|{seed}|pgvector-final-ab-ba-seeded"
+    seeded_ab = (
+        int(hashlib.sha256(material.encode("utf-8")).hexdigest(), 16) & 1
+    ) == 0
+    a, b = ("official", "sqlens_disabled")
+    rounds = [
+        ("AB", [a, b]),
+        ("BA", [b, a]),
+        ("AB" if seeded_ab else "BA", [a, b] if seeded_ab else [b, a]),
+    ]
+    schedule: list[dict[str, Any]] = []
+    for round_no, (order, implementations) in enumerate(rounds):
+        for position, implementation in enumerate(implementations):
+            schedule.append(
+                {
+                    "sequence": len(schedule) + 1,
+                    "final_block": round_no,
+                    "repeat": round_no,
+                    "round_kind": "seeded" if round_no == 2 else order,
+                    "position_in_round": position,
+                    "implementation": implementation,
+                }
+            )
+    arm_counts = {
+        implementation: sum(
+            item["implementation"] == implementation for item in schedule
+        )
+        for implementation in (a, b)
+    }
+    round_orders = [order for order, _implementations in rounds]
+    audit = {
+        "seed": seed,
+        "seed_material_sha256": hashlib.sha256(material.encode("utf-8")).hexdigest(),
+        "protocol": "AB/BA/seeded-three-round",
+        "pair_orders": round_orders,
+        "concrete_pair_orders": [implementations for _order, implementations in rounds],
+        "arm_counts": arm_counts,
+        "rounds": 3,
+        "pairable_by": ["request_no", "repeat"],
+        "seeded_balance_verified": arm_counts == {a: 3, b: 3},
+    }
+    if not audit["seeded_balance_verified"]:
+        raise ControllerError("internal three-round schedule balance audit failed")
+    return schedule, audit
+
+
+def frozen_workload_enabled(args: argparse.Namespace) -> bool:
+    calibration = getattr(args, "calibration_workload_csv", None)
+    measurement = getattr(args, "measurement_workload_csv", None)
+    if bool(calibration) != bool(measurement):
+        raise ControllerError(
+            "--calibration-workload-csv and --measurement-workload-csv must be supplied together"
+        )
+    return bool(calibration)
+
+
+def final_block_count(args: argparse.Namespace) -> int:
+    return 3 if frozen_workload_enabled(args) else 2
+
+
 def audit_controller_execution_journal(manifest: Mapping[str, Any]) -> dict[str, Any]:
     calibration_order = list(manifest.get("calibration_order", []))
     final_schedule = list(manifest.get("final_schedule", []))
@@ -410,15 +515,15 @@ def audit_controller_execution_journal(manifest: Mapping[str, Any]) -> dict[str,
         for record in successful
     )
     balance = manifest.get("seeded_balance_audit", {})
+    expected_final_runs = len(final_schedule)
     passed = (
         actual == expected
         and same_run
         and append_only
         and binary_bound
-        and len(expected) == 6
+        and len(expected) == len(calibration_order) + expected_final_runs
         and expected_digests_valid
         and balance.get("seeded_balance_verified") is True
-        and balance.get("pair_orders") == ["AB", "BA"]
     )
     audit = {
         "expected": expected,
@@ -446,6 +551,54 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
 def _read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as source:
         return list(csv.DictReader(source))
+
+
+def load_measurement_request_contract(
+    path: Path, *, expected_requests: int = 10_000
+) -> dict[int, dict[str, str]]:
+    rows = _read_csv(path)
+    required = {"request_no", "query_no", "query_id", "filter_name"}
+    if not rows or not required.issubset(rows[0]):
+        raise FinalizationError(
+            f"measurement workload is missing {sorted(required)}"
+        )
+    by_request: dict[int, dict[str, str]] = {}
+    for row in rows:
+        request_no = int(row["request_no"])
+        if request_no in by_request:
+            raise FinalizationError(
+                f"measurement workload repeats request_no={request_no}"
+            )
+        by_request[request_no] = dict(row)
+    if (
+        len(rows) != expected_requests
+        or set(by_request) != set(range(expected_requests))
+    ):
+        raise FinalizationError(
+            "measurement workload request_no coverage is not exactly "
+            f"0..{expected_requests - 1}"
+        )
+    return by_request
+
+
+def expected_request_repeat_keys(
+    requests: Mapping[int, Mapping[str, str]],
+    repeats: int,
+    *,
+    filter_name: str | None = None,
+) -> set[tuple[int, int]]:
+    if repeats <= 0:
+        raise FinalizationError("repeat count must be positive")
+    request_nos = [
+        request_no
+        for request_no, request in requests.items()
+        if filter_name is None or request.get("filter_name") == filter_name
+    ]
+    return {
+        (request_no, repeat)
+        for request_no in request_nos
+        for repeat in range(repeats)
+    }
 
 
 def _target_key(target: float) -> str:
@@ -540,6 +693,10 @@ def _validate_controller_bound_arm(
     args = manifest.get("args")
     if not isinstance(args, Mapping):
         raise FinalizationError(f"arm {arm} runner args are missing")
+    if controller_spec.get("dsn_sha256") and (
+        args.get("dsn_sha256") != controller_spec.get("dsn_sha256")
+    ):
+        raise FinalizationError(f"arm {arm} DSN fingerprint is not controller-bound")
     repeats = controller_spec.get("repeats")
     if not isinstance(repeats, Mapping):
         raise FinalizationError("controller repeat contract is missing")
@@ -548,12 +705,11 @@ def _validate_controller_bound_arm(
     common_args = {
         "filters_csv": str(controller_spec.get("filters_csv", "")),
         "truth_csv": str(controller_spec.get("truth_csv", "")),
-        "graph_identity_json": str(controller_spec.get("graph_identity_json", "")),
         "table": controller_spec.get("table"),
         "index": controller_spec.get("index"),
         "source_index": controller_spec.get("source_index"),
-        "clone_index": controller_spec.get("clone_index"),
         "data_epoch": controller_spec.get("data_epoch"),
+        "planner_mode": controller_spec.get("planner_mode"),
         "candidate_validity_predicate": controller_spec.get(
             "candidate_validity_predicate", ""
         ),
@@ -572,6 +728,35 @@ def _validate_controller_bound_arm(
         ),
         "upstream_evaluation_patch": patch_path,
     }
+    workload_mode = bool(controller_spec.get("measurement_workload_csv"))
+    if workload_mode:
+        common_args.update(
+            {
+                "calibration_workload_csv": str(
+                    controller_spec.get("calibration_workload_csv", "")
+                ),
+                "measurement_workload_csv": str(
+                    controller_spec.get("measurement_workload_csv", "")
+                ),
+                "official_index_build_manifest": str(
+                    controller_spec.get("official_index_build_manifest", "")
+                ),
+                "official_index_source_commit": controller_spec.get(
+                    "binary_sources", {}
+                )
+                .get("official", {})
+                .get("source_commit"),
+            }
+        )
+    else:
+        common_args.update(
+            {
+                "graph_identity_json": str(
+                    controller_spec.get("graph_identity_json", "")
+                ),
+                "clone_index": controller_spec.get("clone_index"),
+            }
+        )
     for key, expected in common_args.items():
         if args.get(key) != expected:
             raise FinalizationError(f"arm {arm} runner arg {key} is not controller-bound")
@@ -589,6 +774,7 @@ def _validate_controller_bound_arm(
         source_args.update(
             {
                 "required_sqlens_build_prefix": source.get("required_sqlens_build_prefix"),
+                "expected_sqlens_build_id": source.get("expected_sqlens_build_id"),
                 "minimum_sqlens_profile_semantics": source.get(
                     "minimum_sqlens_profile_semantics"
                 ),
@@ -609,18 +795,22 @@ def _validate_controller_bound_arm(
                 f"arm {arm} source provenance {artifact_key} is not controller-bound"
             )
 
-    expected_design = {
-        "formal_family": controller_spec.get("formal_family"),
-        "filters": list(filters),
-        "target_recalls": list(targets),
-        "target_metric": "query_level_mean_recall_at_10",
-        "uncertainty": "query_bootstrap_95pct_ci_reported_not_used_as_target",
-        "cell_keys": [
-            f"{name}|{_target_key(target)}" for name in filters for target in targets
-        ],
-        "cell_count": len(filters) * len(targets),
-    }
-    if manifest.get("formal_design") != expected_design:
+    design = manifest.get("formal_design")
+    if not isinstance(design, Mapping) or any(
+        (
+            design.get("formal_family") != controller_spec.get("formal_family"),
+            list(design.get("filters", [])) != list(filters),
+            [float(value) for value in design.get("target_recalls", [])]
+            != list(targets),
+            design.get("cell_count") != len(filters) * len(targets),
+            design.get("target_metric") != "query_level_mean_recall_at_10",
+            (
+                workload_mode
+                and design.get("calibration_selection_policy")
+                != "lcb_then_max_recall"
+            ),
+        )
+    ):
         raise FinalizationError(f"arm {arm} formal design is not controller-bound")
     if manifest.get("query_splits") != dict(expected_splits):
         raise FinalizationError(f"arm {arm} query split contract is not controller-bound")
@@ -628,18 +818,49 @@ def _validate_controller_bound_arm(
     schedule = manifest.get("schedule_contract")
     if not isinstance(schedule, Mapping):
         raise FinalizationError(f"arm {arm} schedule contract is missing")
-    expected_schedule = {
-        "schedule_seed": controller_spec.get("schedule_seed"),
-        "screen_query_nos": list(range(0, 20)),
-        "verification_query_nos": list(range(20, 100)),
-        "final_query_nos": list(range(100, 200)),
-        "screen_repeats": repeats.get("screen"),
-        "verification_repeats": repeats.get("verification"),
-        "final_repeats": repeats.get("final"),
-        "final_blocks": 2,
-        "final_repeat_partition": "contiguous equal halves",
-        "balanced_config_order": "seeded cyclic rotation per query/repeat block",
-    }
+    if workload_mode:
+        calibration_rows = _read_csv(
+            Path(str(controller_spec["calibration_workload_csv"]))
+        )
+        measurement_rows = _read_csv(
+            Path(str(controller_spec["measurement_workload_csv"]))
+        )
+        expected_schedule = {
+            "schedule_seed": controller_spec.get("schedule_seed"),
+            "screen_query_nos": [int(row["query_no"]) for row in calibration_rows],
+            "verification_query_nos": [
+                int(row["query_no"]) for row in calibration_rows
+            ],
+            "final_query_nos": [int(row["query_no"]) for row in measurement_rows],
+            "calibration_request_nos": [
+                int(row["request_no"]) for row in calibration_rows
+            ],
+            "measurement_request_nos": [
+                int(row["request_no"]) for row in measurement_rows
+            ],
+            "screen_repeats": repeats.get("screen"),
+            "verification_repeats": repeats.get("verification"),
+            "final_repeats": 3,
+            "final_blocks": 3,
+            "final_repeat_partition": (
+                "one measurement-trace repeat per AB/BA/seeded round"
+            ),
+            "pairing_key": ["request_no", "repeat"],
+            "balanced_config_order": "seeded cyclic rotation per query/repeat block",
+        }
+    else:
+        expected_schedule = {
+            "schedule_seed": controller_spec.get("schedule_seed"),
+            "screen_query_nos": list(range(0, 20)),
+            "verification_query_nos": list(range(20, 100)),
+            "final_query_nos": list(range(100, 200)),
+            "screen_repeats": repeats.get("screen"),
+            "verification_repeats": repeats.get("verification"),
+            "final_repeats": repeats.get("final"),
+            "final_blocks": 2,
+            "final_repeat_partition": "contiguous equal halves",
+            "balanced_config_order": "seeded cyclic rotation per query/repeat block",
+        }
     for key, expected in expected_schedule.items():
         if schedule.get(key) != expected:
             raise FinalizationError(f"arm {arm} schedule field {key} is not controller-bound")
@@ -736,15 +957,25 @@ def finalize_ab_artifacts(
     targets = [float(value) for value in design.get("target_recalls", [])]
     if len(filters) != 14 or targets != [0.90, 0.95, 0.99] or design.get("cell_count") != 42:
         raise FinalizationError("formal design is not the fixed 14-filter/3-target/42-cell design")
-    if design.get("formal_family") not in {"off", "strict_order"}:
-        raise FinalizationError("formal family must be predeclared as off or strict_order")
-    expected_splits = {
-        "screen": {"first": 0, "last": 19, "queries": 20},
-        "verification": {"first": 20, "last": 99, "queries": 80},
-        "final": {"first": 100, "last": 199, "queries": 100},
-    }
+    workload_mode = bool(controller_spec.get("measurement_workload_csv"))
+    allowed_families = {"all"} if workload_mode else {"off", "strict_order"}
+    if design.get("formal_family") not in allowed_families:
+        raise FinalizationError(
+            "formal family is not valid for the selected protocol"
+        )
+    if workload_mode:
+        expected_splits = {
+            "calibration": {"first": 0, "last": 199},
+            "measurement": {"first": 200, "last": 10199},
+        }
+    else:
+        expected_splits = {
+            "screen": {"first": 0, "last": 19, "queries": 20},
+            "verification": {"first": 20, "last": 99, "queries": 80},
+            "final": {"first": 100, "last": 199, "queries": 100},
+        }
     if official.get("query_splits") != expected_splits:
-        raise FinalizationError("query split contract is not the fixed q0..q199 formal split")
+        raise FinalizationError("query split contract does not match the protocol")
     if controller_spec.get("target_recalls") != targets:
         raise FinalizationError("controller target recall contract is not the fixed formal design")
     if controller_spec.get("formal_family") != design.get("formal_family"):
@@ -770,12 +1001,21 @@ def finalize_ab_artifacts(
     if official.get("config_ladder") != sqlens.get("config_ladder"):
         raise FinalizationError("cross-arm config contract mismatch")
     shared_hashes = official.get("source_hashes", {})
-    for key in (
+    required_source_hashes = [
         "runner_sha256",
         "filters_sha256",
         "truth_sha256",
-        "graph_identity_sha256",
-    ):
+    ]
+    required_source_hashes.extend(
+        [
+            "calibration_workload_sha256",
+            "measurement_workload_sha256",
+            "official_index_build_manifest_sha256",
+        ]
+        if workload_mode
+        else ["graph_identity_sha256"]
+    )
+    for key in required_source_hashes:
         if not re.fullmatch(r"[0-9a-f]{64}", str(shared_hashes.get(key, ""))):
             raise FinalizationError(f"shared source hash {key} is missing or invalid")
     sql_hashes = shared_hashes.get("hybrid_sql_sha256_by_filter", {})
@@ -793,15 +1033,30 @@ def finalize_ab_artifacts(
         r"[0-9a-f]{64}", str(database.get("indexdef_sha256", ""))
     ):
         raise FinalizationError("database/table/index/data-epoch fingerprint is incomplete")
-    graph_binding = database.get("source_clone_graph_identity", {})
-    graph_proof = graph_binding.get("proof", {})
-    if (
-        graph_proof.get("same_heap") is not True
-        or graph_proof.get("logical_equal") is not True
-        or not graph_binding.get("source_index")
-        or not graph_binding.get("clone_index")
-    ):
-        raise FinalizationError("source/clone logical graph identity proof is incomplete")
+    if workload_mode:
+        index_binding = database.get("official_index_build_identity", {})
+        if (
+            index_binding.get("artifact_valid") is not True
+            or index_binding.get("same_index_for_both_arms") is not True
+            or index_binding.get("index") != controller_spec.get("index")
+            or index_binding.get("builder", {}).get("vector_so_sha256")
+            != OFFICIAL_VECTOR_SO_SHA256
+        ):
+            raise FinalizationError(
+                "shared official-built source-index proof is incomplete"
+            )
+    else:
+        graph_binding = database.get("source_clone_graph_identity", {})
+        graph_proof = graph_binding.get("proof", {})
+        if (
+            graph_proof.get("same_heap") is not True
+            or graph_proof.get("logical_equal") is not True
+            or not graph_binding.get("source_index")
+            or not graph_binding.get("clone_index")
+        ):
+            raise FinalizationError(
+                "source/clone logical graph identity proof is incomplete"
+            )
 
     for arm, manifest in by_arm.items():
         binary = manifest.get("server_binary_provenance", {})
@@ -831,10 +1086,15 @@ def finalize_ab_artifacts(
             phase: sum(item.get("phase") == phase for item in block_audits)
             for phase in ("screen", "verification", "final")
         }
+        expected_phase_counts = (
+            {"screen": 14, "verification": 14, "final": 42}
+            if workload_mode
+            else {"screen": 14, "verification": 14, "final": 28}
+        )
         if (
             guc_audit.get("all_nonstock_forced_safe") is not True
             or guc_audit.get("unhandled_nonstock_gucs")
-            or phase_counts != {"screen": 14, "verification": 14, "final": 28}
+            or phase_counts != expected_phase_counts
             or any(
                 not re.fullmatch(r"[0-9a-f]{64}", str(item.get("after_sha256", "")))
                 for item in block_audits
@@ -844,7 +1104,13 @@ def finalize_ab_artifacts(
                 f"arm {arm} does not prove an inert SQLens GUC inventory at every block"
             )
         warmups = list(manifest.get("warmup_invocations", []))
-        required_warmups = {("calibration", None), ("final", 0), ("final", 1)}
+        required_warmups = {
+            ("calibration", None),
+            *{
+                ("final", block)
+                for block in range(3 if workload_mode else 2)
+            },
+        }
         observed_warmups = {
             (
                 str(item.get("execution_stage")),
@@ -952,8 +1218,30 @@ def finalize_ab_artifacts(
         )
     if actual_official_digest == actual_sqlens_digest:
         raise FinalizationError("the two arms resolve to the same binary digest")
+    if workload_mode:
+        expected_build_id = (
+            controller_spec.get("binary_sources", {})
+            .get("sqlens_disabled", {})
+            .get("expected_sqlens_build_id")
+        )
+        runtime = sqlens.get("runtime_provenance", {})
+        profile_gate = runtime.get("profile_gate", {})
+        if (
+            expected_build_id != DEFAULT_SQLENS_BUILD_ID
+            or runtime.get("loaded_vector_sqlens_build_id") != expected_build_id
+            or profile_gate.get("expected_build_id") != expected_build_id
+            or profile_gate.get("exact_build_id_match") is not True
+        ):
+            raise FinalizationError(
+                "SQLens-disabled arm lacks exact r36 runtime identity proof"
+            )
 
     raw_by_arm: dict[str, list[dict[str, str]]] = {}
+    measurement_workload_by_request: dict[int, dict[str, str]] = {}
+    if workload_mode:
+        measurement_workload_by_request = load_measurement_request_contract(
+            Path(str(controller_spec["measurement_workload_csv"]))
+        )
     allowed_labels: dict[str, dict[str, set[str]]] = {
         arm: {name: set() for name in filters} for arm in by_arm
     }
@@ -972,21 +1260,39 @@ def finalize_ab_artifacts(
             raise FinalizationError(f"arm {arm} raw output hash mismatch")
         rows = _read_csv(raw_path)
         seen_measurements: set[str] = set()
-        half = int(manifest["schedule_contract"]["final_repeats"]) // 2
         for row in rows:
             if row.get("phase") != "final":
                 continue
             try:
                 query_no = int(row["query_no"])
                 repeat = int(row["repeat"])
+                request_no = (
+                    int(row["request_no"]) if workload_mode else query_no
+                )
             except (KeyError, ValueError) as exc:
                 raise FinalizationError(f"arm {arm} has invalid final key fields") from exc
             filter_name = str(row.get("filter_name", ""))
             config_label = str(row.get("config_label", ""))
             expected_measurement = (
-                f"{arm}|final|{filter_name}|q{query_no}|r{repeat}|{config_label}"
+                f"{arm}|final|{filter_name}|q{request_no}|r{repeat}|{config_label}"
             )
-            expected_block = "0" if repeat < half else "1"
+            expected_block = (
+                str(repeat)
+                if workload_mode
+                else (
+                    "0"
+                    if repeat
+                    < int(manifest["schedule_contract"]["final_repeats"]) // 2
+                    else "1"
+                )
+            )
+            request_contract = measurement_workload_by_request.get(request_no)
+            request_matches = (
+                request_contract is not None
+                and int(request_contract["query_no"]) == query_no
+                and int(request_contract["query_id"]) == int(row["query_id"])
+                and request_contract["filter_name"] == filter_name
+            )
             measurement = str(row.get("measurement_key", ""))
             if (
                 row.get("run_uuid") != official.get("run_uuid")
@@ -994,6 +1300,7 @@ def finalize_ab_artifacts(
                 or row.get("execution_stage") != "final"
                 or row.get("query_split") != "final"
                 or row.get("final_block") != expected_block
+                or (workload_mode and not request_matches)
                 or filter_name not in allowed_labels[arm]
                 or config_label not in allowed_labels[arm][filter_name]
                 or measurement != expected_measurement
@@ -1002,23 +1309,70 @@ def finalize_ab_artifacts(
                 raise FinalizationError(
                     f"arm {arm} contains a foreign/duplicate final measurement row"
                 )
+            if arm == "sqlens_disabled" and workload_mode and (
+                str(row.get("disabled_path_verified", "")).lower() != "true"
+                or row.get("disabled_final_path") != "stock"
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(row.get("disabled_profile_sha256", "")),
+                )
+            ):
+                raise FinalizationError(
+                    "sqlens-disabled final row lacks per-query stock-path proof"
+                )
             seen_measurements.add(measurement)
         raw_by_arm[arm] = rows
 
-    final_query_nos = [int(value) for value in official["schedule_contract"]["final_query_nos"]]
+    final_query_nos = [
+        int(value) for value in official["schedule_contract"]["final_query_nos"]
+    ]
     final_repeats = int(official["schedule_contract"]["final_repeats"])
-    if final_query_nos != list(range(100, 200)) or final_repeats <= 0 or final_repeats % 2:
-        raise FinalizationError("final schedule must cover q100..q199 with positive even repeats")
-    expected_pair_keys = {
-        (query_no, repeat)
-        for query_no in final_query_nos
-        for repeat in range(final_repeats)
-    }
+    if workload_mode:
+        if final_query_nos != [
+            int(measurement_workload_by_request[number]["query_no"])
+            for number in range(10_000)
+        ] or final_repeats != 3:
+            raise FinalizationError(
+                "final schedule must cover the frozen q10k trace with r3"
+            )
+        final_request_nos = list(range(10_000))
+    else:
+        if (
+            final_query_nos != list(range(100, 200))
+            or final_repeats <= 0
+            or final_repeats % 2
+        ):
+            raise FinalizationError(
+                "legacy final schedule must cover q100..q199 with positive even repeats"
+            )
+        final_request_nos = final_query_nos
     cells: list[dict[str, Any]] = []
     expected_cell_keys = {
         f"{name}|{_target_key(target)}" for name in filters for target in targets
     }
     for filter_name in filters:
+        cell_request_nos = (
+            [
+                request_no
+                for request_no, request in measurement_workload_by_request.items()
+                if request["filter_name"] == filter_name
+            ]
+            if workload_mode
+            else final_request_nos
+        )
+        cell_expected_pair_keys = (
+            expected_request_repeat_keys(
+                measurement_workload_by_request,
+                final_repeats,
+                filter_name=filter_name,
+            )
+            if workload_mode
+            else {
+                (request_no, repeat)
+                for request_no in cell_request_nos
+                for repeat in range(final_repeats)
+            }
+        )
         for target in targets:
             cell_key = f"{filter_name}|{_target_key(target)}"
             selections = {
@@ -1046,7 +1400,12 @@ def finalize_ab_artifacts(
                 latency_map: dict[tuple[int, int], float] = {}
                 recall_by_query: dict[int, list[float]] = {}
                 for row in selected_rows:
-                    key = (int(row["query_no"]), int(row["repeat"]))
+                    request_no = (
+                        int(row["request_no"])
+                        if workload_mode
+                        else int(row["query_no"])
+                    )
+                    key = (request_no, int(row["repeat"]))
                     expected_pair_key = f"final|{filter_name}|q{key[0]}|r{key[1]}"
                     if key in latency_map or row.get("pair_key") != expected_pair_key:
                         raise FinalizationError(f"cell {cell_key}/{arm} has duplicate or invalid pair keys")
@@ -1066,7 +1425,7 @@ def finalize_ab_artifacts(
                             f"cell {cell_key}/{arm} has invalid/self-included recall evidence"
                         )
                     recall_by_query.setdefault(key[0], []).append(recall)
-                if set(latency_map) != expected_pair_keys:
+                if set(latency_map) != cell_expected_pair_keys:
                     raise FinalizationError(f"cell {cell_key}/{arm} final key set is incomplete or foreign")
                 latency_maps[arm] = latency_map
                 recall_seed = int(
@@ -1083,20 +1442,20 @@ def finalize_ab_artifacts(
                         f"cell {cell_key}/{arm} held-out recall LCB "
                         f"{recall_lcbs[arm]:.6f} misses target {target:.6f}"
                     )
-            ordered_keys = sorted(expected_pair_keys)
+            ordered_keys = sorted(cell_expected_pair_keys)
             official_query_means = [
                 statistics.fmean(
-                    latency_maps["official"][(query_no, repeat)]
+                    latency_maps["official"][(request_no, repeat)]
                     for repeat in range(final_repeats)
                 )
-                for query_no in final_query_nos
+                for request_no in cell_request_nos
             ]
             sqlens_query_means = [
                 statistics.fmean(
-                    latency_maps["sqlens_disabled"][(query_no, repeat)]
+                    latency_maps["sqlens_disabled"][(request_no, repeat)]
                     for repeat in range(final_repeats)
                 )
-                for query_no in final_query_nos
+                for request_no in cell_request_nos
             ]
             seed_material = f"{bootstrap_seed}|{cell_key}"
             cell_seed = int(hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:16], 16)
@@ -1113,7 +1472,7 @@ def finalize_ab_artifacts(
                     "target_recall": target,
                     "status": "paired",
                     "pairs": len(ordered_keys),
-                    "bootstrap_clusters": len(final_query_nos),
+                    "bootstrap_clusters": len(cell_request_nos),
                     "arm_selection": selections,
                     "official_recall_lcb95": recall_lcbs["official"],
                     "sqlens_disabled_recall_lcb95": recall_lcbs["sqlens_disabled"],
@@ -1135,7 +1494,12 @@ def finalize_ab_artifacts(
             "cell_count": 42,
             "paired_cells": sum(cell["status"] == "paired" for cell in cells),
             "incomparable_cells": 0,
-            "pair_key_fields": ["filter_name", "target_recall", "query_no", "repeat"],
+            "pair_key_fields": [
+                "filter_name",
+                "target_recall",
+                "request_no" if workload_mode else "query_no",
+                "repeat",
+            ],
             "bootstrap_samples": bootstrap_samples,
             "bootstrap_seed": bootstrap_seed,
             "bootstrap_unit": "query_no after averaging paired repeats",
@@ -1287,6 +1651,7 @@ def source_spec(args: argparse.Namespace, implementation: str) -> dict[str, Any]
         "compiler_flags": args.sqlens_vector_compiler_flags,
         "source_repo": str(args.sqlens_vector_source_repo),
         "required_sqlens_build_prefix": args.required_sqlens_build_prefix,
+        "expected_sqlens_build_id": args.expected_sqlens_build_id,
         "minimum_sqlens_profile_semantics": args.minimum_sqlens_profile_semantics,
     }
 
@@ -1321,11 +1686,11 @@ def shared_runner_args(args: argparse.Namespace, *, resume: bool | None = None) 
     argv = [
         "--filters-csv", str(args.filters_csv),
         "--truth-csv", str(args.truth_csv),
+        "--dsn", args.dsn,
+        "--planner-mode", args.planner_mode,
         "--table", args.table,
         "--index", args.index,
         "--source-index", args.source_index,
-        "--clone-index", args.clone_index,
-        "--graph-identity-json", str(args.graph_identity_json),
         "--out-dir", str(args.out_dir),
         "--tag", args.tag,
         "--run-uuid", args.run_uuid,
@@ -1347,6 +1712,28 @@ def shared_runner_args(args: argparse.Namespace, *, resume: bool | None = None) 
         "--server-container", args.server_container,
         "--resume" if resume_enabled else "--no-resume",
     ]
+    if frozen_workload_enabled(args):
+        argv.extend(
+            [
+                "--calibration-workload-csv",
+                str(args.calibration_workload_csv),
+                "--measurement-workload-csv",
+                str(args.measurement_workload_csv),
+                "--official-index-build-manifest",
+                str(args.official_index_build_manifest),
+                "--official-index-source-commit",
+                args.official_vector_source_commit,
+            ]
+        )
+    else:
+        argv.extend(
+            [
+                "--clone-index",
+                args.clone_index,
+                "--graph-identity-json",
+                str(args.graph_identity_json),
+            ]
+        )
     if args.config_ladder:
         argv.extend(["--config-ladder", str(args.config_ladder)])
     for relation in args.prewarm_relations:
@@ -1388,10 +1775,20 @@ def build_runner_argv(
     if implementation == "sqlens_disabled":
         argv.extend([
             "--required-sqlens-build-prefix", args.required_sqlens_build_prefix,
+            "--expected-sqlens-build-id", args.expected_sqlens_build_id,
             "--minimum-sqlens-profile-semantics",
             format(args.minimum_sqlens_profile_semantics, "g"),
         ])
     return argv
+
+
+def redact_runner_argv(argv: Sequence[str]) -> list[str]:
+    redacted = list(argv)
+    if "--dsn" in redacted:
+        position = redacted.index("--dsn") + 1
+        if position < len(redacted):
+            redacted[position] = "<redacted; see controller dsn_sha256>"
+    return redacted
 
 
 def run_external_runner(
@@ -1423,7 +1820,7 @@ def run_external_runner(
             "implementation": implementation,
             "execution_stage": execution_stage,
             "final_block": final_block,
-            "argv": argv,
+            "argv": redact_runner_argv(argv),
             "started_at_utc": started,
             "finished_at_utc": utc_now(),
             "exit_code": result.returncode,
@@ -1455,7 +1852,7 @@ def run_external_runner(
             "implementation": implementation,
             "execution_stage": execution_stage,
             "final_block": final_block,
-            "argv": argv,
+            "argv": redact_runner_argv(argv),
             "started_at_utc": started,
             "finished_at_utc": utc_now(),
             "exit_code": None,
@@ -1479,7 +1876,8 @@ def run_external_runner(
         if execution_stage == "calibration"
         else (
             {"final_in_progress"}
-            if final_block == 0
+            if final_block is not None
+            and final_block < final_block_count(args) - 1
             else {"arm_ready", "staging_unconfirmed"}
         )
     )
@@ -1606,8 +2004,11 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
     args.candidate_validity_predicate = getattr(
         args, "candidate_validity_predicate", ""
     )
+    workload_mode = frozen_workload_enabled(args)
     required = {
         "server container": args.server_container,
+        "DSN": args.dsn,
+        "planner mode": args.planner_mode,
         "official binary": args.official_vector_so,
         "SQLens-disabled binary": args.sqlens_vector_so,
         "SQLens digest": args.sqlens_vector_so_sha256,
@@ -1623,17 +2024,39 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         "SQLens compiler flags": args.sqlens_vector_compiler_flags,
         "official source repository": args.official_vector_source_repo,
         "SQLens source repository": args.sqlens_vector_source_repo,
-        "graph identity JSON": args.graph_identity_json,
         "source graph index": args.source_index,
-        "clone graph index": args.clone_index,
     }
+    if workload_mode:
+        required.update(
+            {
+                "calibration workload CSV": args.calibration_workload_csv,
+                "measurement workload CSV": args.measurement_workload_csv,
+                "official index-build manifest": args.official_index_build_manifest,
+                "exact SQLens build ID": args.expected_sqlens_build_id,
+            }
+        )
+    else:
+        required.update(
+            {
+                "graph identity JSON": args.graph_identity_json,
+                "clone graph index": args.clone_index,
+            }
+        )
     missing = [label for label, value in required.items() if not value]
     if missing:
         raise ControllerError("missing required runtime option(s): " + ", ".join(missing))
     if tuple(args.target_recalls) != (0.90, 0.95, 0.99):
         raise ControllerError("formal target recalls must be exactly 0.90,0.95,0.99")
-    if args.formal_family not in {"off", "strict_order"}:
-        raise ControllerError("formal family must be off or strict_order")
+    if args.formal_family not in (
+        {"all"} if workload_mode else {"off", "strict_order"}
+    ):
+        raise ControllerError(
+            "frozen q10k/r3 formal runs require formal-family=all"
+            if workload_mode
+            else "legacy formal family must be off or strict_order"
+        )
+    if args.planner_mode not in {"auto", "forced_hnsw"}:
+        raise ControllerError("planner mode must be auto or forced_hnsw")
     if args.max_ef_search not in {1000, *UPSTREAM_EF_PATCH_SHA256}:
         raise ControllerError("max_ef_search must be 1000, 10000, or 100000")
     if any(
@@ -1660,18 +2083,41 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
             raise ControllerError("upstream evaluation patch SHA256 is not canonical")
     if args.filter_names:
         raise ControllerError("formal controller runs always use the fixed 14-filter CSV")
-    if args.final_repeats % 2:
-        raise ControllerError("formal final repeats must be even for AB/BA blocks")
+    if workload_mode and args.final_repeats != 3:
+        raise ControllerError("frozen formal final repeats must equal 3")
+    if not workload_mode and args.final_repeats % 2:
+        raise ControllerError("legacy formal final repeats must be even")
+    if workload_mode:
+        if args.index != args.source_index:
+            raise ControllerError(
+                "P0-2 requires a single shared official-built source index"
+            )
+        if args.clone_index not in {None, "", args.index}:
+            raise ControllerError(
+                "P0-2 must not require a source-vs-BFS clone index"
+            )
+        if args.expected_sqlens_build_id != DEFAULT_SQLENS_BUILD_ID:
+            raise ControllerError(
+                "P0-2 requires exact equality with the frozen r36 build ID"
+            )
     for label, path in (
         ("official source repository", args.official_vector_source_repo),
         ("SQLens source repository", args.sqlens_vector_source_repo),
     ):
         if not path.is_dir():
             raise ControllerError(f"{label} does not exist: {path}")
-    if not args.graph_identity_json.is_file():
-        raise ControllerError(
-            f"graph identity JSON does not exist: {args.graph_identity_json}"
-        )
+    required_files = (
+        [
+            args.calibration_workload_csv,
+            args.measurement_workload_csv,
+            args.official_index_build_manifest,
+        ]
+        if workload_mode
+        else [args.graph_identity_json]
+    )
+    for path in required_files:
+        if not path.is_file():
+            raise ControllerError(f"formal input does not exist: {path}")
 
 
 def _legacy_ephemeral_run_controller(args: argparse.Namespace) -> dict[str, Any]:
@@ -1787,8 +2233,10 @@ def run_controller(args: argparse.Namespace) -> dict[str, Any]:
     # A busy preflight must not create recovery state or restart PostgreSQL.
     preflight_active_session_gate = enforce_active_session_gate(args)
     binary_path = discover_vector_so(args.server_container)
-    schedule, balance_audit = counterbalanced_final_schedule(
-        args.run_uuid, args.schedule_seed
+    schedule, balance_audit = (
+        three_round_final_schedule(args.run_uuid, args.schedule_seed)
+        if frozen_workload_enabled(args)
+        else counterbalanced_final_schedule(args.run_uuid, args.schedule_seed)
     )
     calibration_order = list(balance_audit["concrete_pair_orders"][0])
     controller_spec = {
@@ -1796,6 +2244,8 @@ def run_controller(args: argparse.Namespace) -> dict[str, Any]:
         "implementations": ["official", "sqlens_disabled"],
         "binary_sources": sources,
         "database": database_identity(args),
+        "dsn_sha256": hashlib.sha256(args.dsn.encode("utf-8")).hexdigest(),
+        "planner_mode": args.planner_mode,
         "formal_family": args.formal_family,
         "max_ef_search": args.max_ef_search,
         "candidate_validity_predicate": args.candidate_validity_predicate,
@@ -1811,6 +2261,16 @@ def run_controller(args: argparse.Namespace) -> dict[str, Any]:
         "data_epoch": args.data_epoch,
         "filters_csv": str(args.filters_csv),
         "truth_csv": str(args.truth_csv),
+        "calibration_workload_csv": (
+            str(args.calibration_workload_csv)
+            if args.calibration_workload_csv
+            else None
+        ),
+        "measurement_workload_csv": (
+            str(args.measurement_workload_csv)
+            if args.measurement_workload_csv
+            else None
+        ),
         "formal_design_filters": [
             str(row.get("filter_name", ""))
             for row in _read_csv(args.filters_csv)
@@ -1820,7 +2280,14 @@ def run_controller(args: argparse.Namespace) -> dict[str, Any]:
         "source_index": args.source_index,
         "clone_index": args.clone_index,
         "k": args.k,
-        "graph_identity_json": str(args.graph_identity_json),
+        "graph_identity_json": (
+            str(args.graph_identity_json) if args.graph_identity_json else None
+        ),
+        "official_index_build_manifest": (
+            str(args.official_index_build_manifest)
+            if args.official_index_build_manifest
+            else None
+        ),
         "target_recalls": args.target_recalls,
         "repeats": {
             "screen": args.screen_repeats,
@@ -1830,6 +2297,7 @@ def run_controller(args: argparse.Namespace) -> dict[str, Any]:
         "schedule_seed": args.schedule_seed,
         "calibration_order": calibration_order,
         "final_schedule": schedule,
+        "final_blocks": final_block_count(args),
         "prewarm_relations": list(args.prewarm_relations),
     }
     controller_spec["input_source_hashes"] = _controller_spec_source_hashes(controller_spec)
@@ -2073,24 +2541,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sqlens-vector-compiler-flags", default="")
     parser.add_argument("--sqlens-vector-source-repo", type=Path)
     parser.add_argument("--required-sqlens-build-prefix", "--sqlens-build-prefix", default=DEFAULT_SQLENS_BUILD_PREFIX)
+    parser.add_argument(
+        "--expected-sqlens-build-id",
+        default="",
+        help="exact SQLens build ID; required by the frozen P0-2 protocol",
+    )
     parser.add_argument("--minimum-sqlens-profile-semantics", "--sqlens-profile-semantics", type=float, default=DEFAULT_SQLENS_PROFILE_SEMANTICS)
     parser.add_argument("--filters-csv", type=Path, default=Path("experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"))
-    parser.add_argument("--truth-csv", type=Path, default=Path("results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal.csv"))
+    parser.add_argument("--truth-csv", type=Path, default=Path("results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_unique_embeddings_formal.csv"))
+    parser.add_argument("--calibration-workload-csv", type=Path)
+    parser.add_argument("--measurement-workload-csv", type=Path)
     parser.add_argument("--config-ladder", type=Path)
     parser.add_argument("--max-ef-search", type=positive_int, default=1000)
     parser.add_argument("--upstream-evaluation-patch", type=Path)
     parser.add_argument("--candidate-validity-predicate", default="embedding_valid")
     parser.add_argument("--table", type=validate_identifier, default="public.amazon_grocery_reviews_10m_pgvector")
-    parser.add_argument("--index", type=validate_identifier, default="public.amazon10m_embedding_valid_hnsw_source_idx")
-    parser.add_argument("--source-index", type=validate_identifier, default="public.amazon10m_embedding_valid_hnsw_source_idx")
-    parser.add_argument("--clone-index", type=validate_identifier, default="public.amazon10m_embedding_valid_hnsw_bfs_clone_idx")
+    parser.add_argument("--index", type=validate_identifier, default="public.amazon10m_hnsw_m32ef200_dupbridge_r29_source_idx")
+    parser.add_argument("--source-index", type=validate_identifier, default="public.amazon10m_hnsw_m32ef200_dupbridge_r29_source_idx")
+    parser.add_argument("--clone-index", type=validate_identifier, default="public.amazon10m_embedding_valid_hnsw_m32ef200_fullmem_bfs_idx")
     parser.add_argument("--graph-identity-json", type=Path)
+    parser.add_argument("--official-index-build-manifest", type=Path)
     parser.add_argument("--out-dir", type=Path, default=Path("results/hybrid_vector_db"))
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--publish-path", type=Path)
     parser.add_argument("--tag", default="20260718")
     parser.add_argument("--run-uuid", default="")
-    parser.add_argument("--formal-family", choices=("off", "strict_order"), default="off")
+    parser.add_argument("--formal-family", choices=("off", "strict_order", "all"), default="off")
+    parser.add_argument(
+        "--planner-mode", choices=("auto", "forced_hnsw"), default="auto"
+    )
+    parser.add_argument(
+        "--dsn",
+        default="",
+        help="explicit DSN passed to both runner arms; persisted only as SHA-256",
+    )
     parser.add_argument("--data-epoch", default="")
     parser.add_argument("--filter-names", nargs="*", default=[])
     parser.add_argument("--k", type=positive_int, default=10)
@@ -2127,7 +2611,11 @@ def build_parser() -> argparse.ArgumentParser:
 def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
     dry_uuid = args.run_uuid or "<generated-at-runtime>"
     manifest = args.manifest or args.out_dir / "staging" / dry_uuid / "controller.json"
-    schedule, audit = counterbalanced_final_schedule(dry_uuid, args.schedule_seed)
+    schedule, audit = (
+        three_round_final_schedule(dry_uuid, args.schedule_seed)
+        if frozen_workload_enabled(args)
+        else counterbalanced_final_schedule(dry_uuid, args.schedule_seed)
+    )
     return {
         "controller": "run_pgvector_binary_ab_control",
         "runner": str(RUNNER_PATH),
@@ -2136,6 +2624,13 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
         "final_schedule": schedule,
         "seeded_balance_audit": audit,
         "formal_family": args.formal_family,
+        "planner_mode": args.planner_mode,
+        "dsn_sha256": (
+            hashlib.sha256(args.dsn.encode("utf-8")).hexdigest()
+            if args.dsn
+            else None
+        ),
+        "frozen_workload_protocol": frozen_workload_enabled(args),
         "formal_target_recalls": args.target_recalls,
         "formal_cell_count": 42,
         "run_uuid": dry_uuid,

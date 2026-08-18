@@ -68,6 +68,27 @@ def checkpoint_state(original_schema, blocks=None):
     }
 
 
+def current_input_provenance(digest="hash"):
+    record = {"path": "/tmp/input", "sha256": digest}
+    return {
+        "protocol": runner.CURRENT_PROTOCOL,
+        "truth_manifest": dict(record),
+        "import_manifest": dict(record),
+        "truth_csv": dict(record),
+        "filters_csv": dict(record),
+        "vectors_fbin": dict(record),
+        "query_cohort_csv": dict(record),
+        "query_cohort_manifest": dict(record),
+        "import_attributes_csv": dict(record),
+        "corpus_gates": {
+            "rows": 10_000_000,
+            "candidate_rows": 9_979_556,
+            "filter_count_coverage": 14,
+            "complete_filter_matrix": 14,
+        },
+    }
+
+
 class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
     def test_default_cutoff_grid_includes_zero_and_covers_all_amazon_filters(self):
         self.assertEqual(runner.DEFAULT_FLAT_SEARCH_CUTOFFS[0], 0)
@@ -85,7 +106,7 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
             "0": 0, "25000": 0, "100000": 100_000, "250000": 100_000,
         })
         self.assertEqual(proof["flat_configuration_equivalence"]["representative"], {
-            "configured_filter_strategy": "sweeping", "ef": 100,
+            "configured_filter_strategy": "sweeping", "ef": runner.DEFAULT_EF_VALUES[0],
             "flat_search_cutoff": 100_000,
         })
         self.assertEqual(
@@ -122,7 +143,7 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         filters = (filter_spec(),)
         flat = summary(100, 100_000, 1.0, 5.0, strategy="sweeping")
         stopped = [flat, summary(100, 0, 0.99, 10.0), summary(250, 0, 0.99, 12.0)]
-        with self.assertRaisesRegex(RuntimeError, "highest_target_reached"):
+        with self.assertRaisesRegex(RuntimeError, "highest_target_lcb95_reached"):
             runner.validate_monotone_calibration_state(
                 stopped, filters, [0, 100_000], [100, 250], 0.99, 1.05,
             )
@@ -177,7 +198,7 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
                 )
                 self.assertFalse(rejected["dominance_proven"])
 
-    def test_dominance_termination_status_is_not_unattainable(self):
+    def test_dominance_is_diagnostic_and_cannot_terminate_lcb_grid(self):
         spec = filter_spec()
         rows = [
             summary(100, 100_000, 1.0, 5.0, strategy="sweeping",
@@ -188,21 +209,24 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         termination = runner.hnsw_route_termination(
             rows, "acorn", spec, [0, 100_000], [100, 250, 500], 0.99, 1.05,
         )
-        self.assertEqual(termination["termination_reason"], "dominated_by_exact_flat")
+        self.assertEqual(termination["termination_reason"], "in_progress")
+        self.assertTrue(termination["dominance_proof"]["dominance_proven"])
+        self.assertTrue(termination["dominance_is_diagnostic_only"])
+        self.assertEqual(termination["stop_metric"], "recall_lcb95")
         self.assertEqual(
             runner.hnsw_route_target_status(rows[1:], 0.99, termination),
-            "dominated_by_exact_flat",
+            "incomplete",
         )
         proof = runner.configuration_grid_proof(
             rows, spec, [0, 100_000], [100, 250, 500], [0.90, 0.99], 1.05,
         )
         self.assertEqual(
             proof["hnsw_routes"]["acorn"]["target_statuses"]["0.99"],
-            "dominated_by_exact_flat",
+            "incomplete",
         )
         self.assertTrue(proof["hnsw_routes"]["acorn"]["termination"]["dominance_proof"]["dominance_proven"])
 
-    def test_target_status_uses_unattainable_only_after_dominance_proof(self):
+    def test_target_status_does_not_resolve_from_dominance_only(self):
         spec = filter_spec()
         proof = {
             "hnsw_routes": {
@@ -217,10 +241,10 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
                 runner.calibration_target_status(
                     [], spec, 0.99, [0, 100_000], [100, 250], [0.99], 1.05,
                 ),
-                "unattainable_on_grid",
+                "incomplete_grid",
             )
 
-    def test_resume_recomputes_dominance_and_rejects_blocks_after_stop(self):
+    def test_resume_ignores_dominance_and_rejects_blocks_after_lcb_stop(self):
         spec = filter_spec()
         flat = summary(100, 100_000, 1.0, 5.0, strategy="sweeping",
                        recall_mean=1.0, ci_low=4.5, ci_high=5.0)
@@ -230,9 +254,15 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
             [flat, first, second], (spec,), [0, 100_000], [100, 250, 500], 0.99, 1.05,
         )
         third = summary(500, 0, 0.86, 8.5, ci_low=7.5)
-        with self.assertRaisesRegex(RuntimeError, "dominated_by_exact_flat"):
+        runner.validate_monotone_calibration_state(
+            [flat, first, second, third], (spec,), [0, 100_000],
+            [100, 250, 500], 0.99, 1.05,
+        )
+
+        lcb_reached = summary(250, 0, 0.99, 8.0, ci_low=7.0)
+        with self.assertRaisesRegex(RuntimeError, "highest_target_lcb95_reached"):
             runner.validate_monotone_calibration_state(
-                [flat, first, second, third], (spec,), [0, 100_000],
+                [flat, first, lcb_reached, third], (spec,), [0, 100_000],
                 [100, 250, 500], 0.99, 1.05,
             )
 
@@ -258,36 +288,50 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         self.assertEqual((winner["flat_search_cutoff"], winner["ef"]), (100_000, 100))
         self.assertEqual(runner.select_fastest_config(candidates, 0.99)["flat_search_cutoff"], 100_000)
 
-    def test_selection_uses_query_level_mean_and_reports_bootstrap_lcb(self):
+    def test_selection_uses_lcb95_as_the_qualification_gate(self):
         spec = filter_spec()
         candidates = [
+            summary(100, 0, 0.89, 1.0, strategy="acorn", recall_mean=0.99),
             summary(250, 0, 0.923, 2.0, strategy="sweeping", recall_mean=0.943),
             summary(100, 100_000, 1.0, 5.0, strategy="sweeping", recall_mean=1.0),
         ]
         selected = runner.select_conservative_config(
-            candidates, 0.90, spec, [0, 100_000], [100, 250], 0.05
+            candidates, 0.90, spec, [0, 100_000], [100, 250], 0.0
         )
-        self.assertEqual(selected["selection_mode"], "calibration_query_level_mean_recall")
+        self.assertEqual(selected["selection_mode"], "calibration_lcb95_qualified_fastest")
         self.assertEqual((selected["flat_search_cutoff"], selected["ef"]), (0, 250))
+        self.assertTrue(selected["calibration_lcb95_qualified"])
+        self.assertFalse(selected["fallback_used"])
 
-        conservative = runner.select_conservative_config(
-            [
-                summary(250, 0, 0.951, 2.0, strategy="sweeping"),
-                candidates[1],
-            ],
-            0.90, spec, [0, 100_000], [100, 250], 0.05,
-        )
-        self.assertEqual(conservative["selection_mode"], "calibration_query_level_mean_recall")
-        self.assertEqual((conservative["flat_search_cutoff"], conservative["ef"]), (0, 250))
-        self.assertAlmostEqual(runner.required_calibration_lcb(0.95, 0.05), 0.95)
-        self.assertAlmostEqual(runner.required_calibration_lcb(0.99, 0.05), 0.99)
+        self.assertIsNone(runner.select_conservative_config(
+            [candidates[0], candidates[2]], 0.90, spec,
+            [0, 100_000], [100, 250], 0.0,
+        ))
+        self.assertAlmostEqual(runner.required_calibration_lcb(0.95), 0.95)
+        self.assertAlmostEqual(runner.required_calibration_lcb(0.99), 0.99)
 
-    def test_conservative_selection_fails_closed_without_exact_flat_calibration(self):
+    def test_max_recall_fallback_requires_both_complete_hnsw_grids(self):
         spec = filter_spec()
         self.assertIsNone(runner.select_conservative_config(
-            [summary(250, 0, 0.923, 2.0, strategy="sweeping", recall_mean=0.89)],
-            0.90, spec, [0, 100_000], [100, 250], 0.05,
+            [summary(100, 0, 0.88, 2.0, strategy="sweeping", recall_mean=0.89)],
+            0.90, spec, [0, 100_000], [100, 250], 0.0,
         ))
+        complete = [
+            summary(100, 0, 0.86, 3.0, recall_mean=0.88),
+            summary(250, 0, 0.88, 4.0, recall_mean=0.91),
+            summary(100, 0, 0.87, 2.0, strategy="sweeping", recall_mean=0.89),
+            summary(250, 0, 0.89, 5.0, strategy="sweeping", recall_mean=0.91),
+        ]
+        selected = runner.select_conservative_config(
+            complete, 0.95, spec, [0, 100_000], [100, 250], 0.0,
+        )
+        self.assertEqual(selected["selection_mode"], "calibration_max_mean_recall_fallback")
+        self.assertEqual(
+            (selected["configured_filter_strategy"], selected["ef"]),
+            ("acorn", 250),
+        )
+        self.assertFalse(selected["calibration_lcb95_qualified"])
+        self.assertTrue(selected["fallback_used"])
 
     def test_unattainable_requires_every_cutoff_route_complete_without_errors(self):
         spec = filter_spec()
@@ -308,7 +352,7 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
             runner.calibration_target_status(
                 complete, spec, 0.99, cutoff_grid, [100, 250], [0.99], 1.05,
             ),
-            "unattainable_on_grid",
+            "selected",
         )
         proof = runner.configuration_grid_proof(
             complete, spec, cutoff_grid, [100, 250], [0.99], 1.05,
@@ -365,12 +409,23 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         budget = runner.calibration_query_budget(
             runner.baseline.FILTERS, runner.DEFAULT_EF_VALUES, warmup_queries=1
         )
-        self.assertEqual(budget["maximum_effective_blocks_before_hnsw_early_stop"], 294)
+        expected_hnsw_blocks = (
+            len(runner.baseline.FILTERS)
+            * len(runner.DEFAULT_FILTER_STRATEGIES)
+            * len(runner.DEFAULT_EF_VALUES)
+        )
+        expected_blocks = len(runner.baseline.FILTERS) + expected_hnsw_blocks
+        expected_timed = (
+            expected_blocks
+            * len(runner.CALIBRATION_QUERY_NOS)
+            * runner.CALIBRATION_REPEATS
+        )
+        self.assertEqual(budget["maximum_effective_blocks_before_hnsw_early_stop"], expected_blocks)
         self.assertEqual(budget["flat_representative_blocks"], 14)
-        self.assertEqual(budget["maximum_hnsw_blocks"], 280)
-        self.assertEqual(budget["maximum_timed_queries_before_hnsw_early_stop"], 47_040)
-        self.assertEqual(budget["configured_warmup_queries"], 294)
-        self.assertEqual(budget["maximum_total_service_queries"], 47_334)
+        self.assertEqual(budget["maximum_hnsw_blocks"], expected_hnsw_blocks)
+        self.assertEqual(budget["maximum_timed_queries_before_hnsw_early_stop"], expected_timed)
+        self.assertEqual(budget["configured_warmup_queries"], expected_blocks)
+        self.assertEqual(budget["maximum_total_service_queries"], expected_timed + expected_blocks)
 
     def test_flat_held_out_result_is_an_exactness_gate(self):
         spec = filter_spec()
@@ -410,6 +465,50 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         self.assertEqual(final_summary["comparison_status"], "unconfirmed")
         self.assertEqual(final_summary["recall_mean"], 0.96)
         self.assertEqual(final_summary["latency_mean_ms"], 5.0)
+        publication_errors = runner.publication_gate_errors([], [final_summary])
+        self.assertTrue(any("not confirmed" in error for error in publication_errors))
+
+    def test_timed_graphql_payload_only_requests_row_id_and_distance(self):
+        query = runner.minimal_graphql_query(
+            runner.CLASS_NAME, [0.25, 0.5], {"path": ["rating"], "operator": "Equal", "valueNumber": 5}, 11
+        )
+        self.assertIn("{ row_id _additional { distance } }", query)
+        for scalar_field in runner.baseline.PROPERTY_TYPES:
+            if scalar_field != "row_id":
+                self.assertNotIn(f" {scalar_field} ", query)
+        response = {
+            "data": {"Get": {runner.CLASS_NAME: [
+                {"row_id": 7, "_additional": {"distance": 0.1}},
+                {"row_id": 9, "_additional": {"distance": 0.2}},
+            ]}}
+        }
+        with mock.patch.object(runner.baseline, "graphql", return_value=(response, 0)) as graphql:
+            result = runner.query_once_minimal(
+                "http://unused", [0.25, 0.5],
+                {"path": ["rating"], "operator": "Equal", "valueNumber": 5},
+                query_id=7,
+            )
+        self.assertEqual(result.ids, (9,))
+        self.assertTrue(result.filter_membership_valid)
+        sent_query = graphql.call_args.args[1]
+        self.assertIn("{ row_id _additional { distance } }", sent_query)
+
+    def test_summary_explicitly_does_not_report_latency_reciprocal_as_qps(self):
+        measured = [{
+            "phase": "calibration", "configured_filter_strategy": "acorn",
+            "filter_name": "f", "ef": 100, "query_no": query_no,
+            "query_id": query_no, "repeat": repeat, "end_to_end_ms": 2.0,
+            "recall_at_10": 1.0, "valid": True, "error": "", "order_error": "",
+            "retry_count": 0,
+        } for query_no in runner.CALIBRATION_QUERY_NOS for repeat in range(2)]
+        result = runner.summarize_configuration(
+            measured, strategy="acorn", filter_name="f", cutoff=0, ef=100,
+            query_nos=runner.CALIBRATION_QUERY_NOS, repeats=2,
+            bootstrap_seed=1,
+        )
+        self.assertEqual(result["single_client_service_qps"], "N/A")
+        self.assertFalse(result["qps_measured"])
+        self.assertEqual(result["service_qps_definition"], runner.QPS_DEFINITION)
 
     def test_artifact_gate_rejects_measurement_error_and_missing_block_pairs(self):
         errors = runner.artifact_gate_errors(
@@ -427,6 +526,39 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
             {}, [], [], [], (), [0, 100_000], [100], calibration,
         )
         self.assertTrue(any("calibration block coverage mismatch" in error for error in errors))
+
+    def test_artifact_gate_recomputes_lcb_selection_instead_of_trusting_labels(self):
+        spec = filter_spec()
+        calibration = [
+            summary(100, 0, 0.95, 4.0, recall_mean=0.97),
+            summary(100, 100_000, 1.0, 3.0, strategy="sweeping", recall_mean=1.0),
+        ]
+        selected = runner.select_conservative_config(
+            calibration, 0.90, spec, [0, 100_000], [100, 250],
+        )
+        held_out = {**summary(100, 0, 0.94, 5.0, recall_mean=0.96), "phase": "final"}
+        flat = {
+            **summary(100, 100_000, 1.0, 3.0, strategy="sweeping", recall_mean=1.0),
+            "phase": "final",
+        }
+        final_summary = runner._summary_row_for_target(selected, 0.90, held_out)
+        groups = {
+            ("acorn", "f", 0, 100): [0.90],
+            ("sweeping", "f", 100_000, 100): [],
+        }
+        with mock.patch.object(
+            runner.baseline, "measurement_block_integrity_errors", return_value=[]
+        ):
+            self.assertEqual(runner.artifact_gate_errors(
+                groups, [final_summary], [], [held_out, flat], (spec,),
+                [0, 100_000], [100, 250], calibration,
+            ), [])
+            tampered = {**final_summary, "fallback_used": True}
+            errors = runner.artifact_gate_errors(
+                groups, [tampered], [], [held_out, flat], (spec,),
+                [0, 100_000], [100, 250], calibration,
+            )
+        self.assertTrue(any("fallback_used" in error for error in errors))
 
     def test_manifest_outcome_counts_keep_all_three_categories(self):
         self.assertEqual(
@@ -470,11 +602,102 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(ValueError, "dominance guard"):
             runner._validate_args(invalid_guard)
-        reporting_only_margin = runner.build_parser().parse_args([
+        nonzero_margin = runner.build_parser().parse_args([
             "--service-image-digest", "sha256:x", "--calibration-lcb-margin", "0.02",
         ])
-        runner._validate_args(reporting_only_margin)
+        with self.assertRaisesRegex(ValueError, "must be 0"):
+            runner._validate_args(nonzero_margin)
         self.assertEqual(runner.main(["--dry-run"]), 0)
+
+    def test_current_truth_and_import_manifests_bind_all_input_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filters_csv = root / "filters.csv"
+            truth_csv = root / "truth.csv"
+            fbin = root / "vectors.fbin"
+            attributes = root / "attributes.csv"
+            cohort_csv = root / "queries.csv"
+            for path, content in (
+                (filters_csv, "filters"),
+                (truth_csv, "truth"),
+                (fbin, "vectors"),
+                (attributes, "attributes"),
+                (cohort_csv, "queries"),
+            ):
+                path.write_text(content, encoding="utf-8")
+            cohort_manifest = root / "queries.manifest.json"
+            cohort_manifest.write_text(
+                json.dumps({"artifact_valid": True}), encoding="utf-8"
+            )
+
+            def record(path):
+                return {
+                    "path": str(path),
+                    "sha256": runner.baseline.sha256_file(path),
+                }
+
+            truth_manifest = root / "truth.manifest.json"
+            truth_manifest.write_text(json.dumps({
+                "artifact_valid": True,
+                "k": 10,
+                "filters": 14,
+                "outputs": {"truth_csv": record(truth_csv)},
+                "inputs": {
+                    "filters_csv": record(filters_csv),
+                    "fbin": record(fbin),
+                    "postgres": {"query_population": {"query_source": {
+                        "cohort_csv": record(cohort_csv),
+                        "manifest": record(cohort_manifest),
+                    }}},
+                },
+            }), encoding="utf-8")
+            import_manifest = root / "import.manifest.json"
+            import_manifest.write_text(json.dumps({
+                "artifact": "weaviate_amazon10m_formal_corpus",
+                "artifact_valid": True,
+                "status": "complete",
+                "input_files": {
+                    "filters_csv": record(filters_csv),
+                    "vectors_fbin": record(fbin),
+                    "attributes_csv": record(attributes),
+                },
+                "completion_gates": {
+                    "passed": True,
+                    "total_rows": {"actual": 10_000_000},
+                    "embedding_valid_rows": {"actual": 9_979_556},
+                    "filter_counts": {
+                        spec.name: {
+                            "actual": spec.expected_rows, "passed": True
+                        }
+                        for spec in runner.baseline.FILTERS
+                    },
+                },
+            }), encoding="utf-8")
+            args = runner.build_parser().parse_args([
+                "--filters-csv", str(filters_csv),
+                "--truth-csv", str(truth_csv),
+                "--fbin", str(fbin),
+                "--truth-manifest", str(truth_manifest),
+                "--import-manifest", str(import_manifest),
+                "--service-image-digest", "sha256:test",
+            ])
+            source_hashes = {
+                "filters_csv": runner.baseline.sha256_file(filters_csv),
+                "truth_csv": runner.baseline.sha256_file(truth_csv),
+                "fbin": runner.baseline.sha256_file(fbin),
+            }
+            provenance = runner.validate_current_input_manifests(
+                args, runner.baseline.FILTERS, source_hashes
+            )
+            self.assertEqual(provenance["protocol"], runner.CURRENT_PROTOCOL)
+            self.assertEqual(provenance["corpus_gates"]["filter_count_coverage"], 14)
+            tampered = json.loads(import_manifest.read_text(encoding="utf-8"))
+            tampered["input_files"]["filters_csv"]["sha256"] = "0" * 64
+            import_manifest.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                runner.validate_current_input_manifests(
+                    args, runner.baseline.FILTERS, source_hashes
+                )
 
     def test_filter_selection_is_ordered_unique_complete_and_run_spec_bound(self):
         filters = (filter_spec("f1", 40_000), filter_spec("f2", 50_000))
@@ -488,17 +711,29 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
             "--service-image-digest", "sha256:test", "--flat-search-cutoffs", "0", "100000",
             "--filter-names", "f2", "f1", "--hnsw-dominance-guard", "1.2",
         ])
-        specification = runner.run_specification(args, selected, {0: 7}, {"runner": "hash"})
+        specification = runner.run_specification(
+            args, selected, {0: 7}, {"runner": "hash"}, current_input_provenance()
+        )
         self.assertEqual(specification["filter_names"], ["f2", "f1"])
         self.assertEqual(specification["service_image_digest"], "sha256:test")
         self.assertEqual(specification["hnsw_flat_dominance"]["guard"], 1.2)
         self.assertEqual(
             specification["calibration"]["selection_rule"],
-            runner.baseline.TARGET_SELECTION_RULE,
+            runner.CALIBRATION_SELECTION_RULE,
         )
         self.assertEqual(
             specification["calibration"]["selection_policy"],
             runner.CALIBRATION_SELECTION_POLICY,
+        )
+        self.assertEqual(
+            specification["calibration"]["qualification_metric"], "recall_lcb95"
+        )
+        self.assertEqual(
+            specification["calibration"]["bootstrap_ci_lcb"],
+            "qualification_and_early_stop",
+        )
+        self.assertTrue(
+            specification["calibration"]["fallback_requires_full_hnsw_grid"]
         )
         self.assertEqual(specification["effective_cutoffs_by_filter"], {
             "f2": [0, 100_000], "f1": [0, 100_000],
@@ -547,7 +782,7 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         original = schema_definition("sweeping", 111, 7)
         leftover = schema_definition("acorn", 100, 100_000)
         vectors = [[0.0]] * 200
-        query_ids = {0: 0}
+        query_ids = {query_no: query_no for query_no in range(20, 200)}
         total = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": runner.baseline.EXPECTED_ROWS}}]}}}
         filtered = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": spec.expected_rows}}]}}}
         with tempfile.TemporaryDirectory() as tmp:
@@ -555,6 +790,7 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
             checkpoint = Path(tmp) / "checkpoint.json"
             argv = [
                 "--out", str(out), "--checkpoint", str(checkpoint),
+                "--protocol", runner.LEGACY_EXECUTION_PROTOCOL,
                 "--service-image-digest", "sha256:immutable", "--filter-names", "f",
                 "--flat-search-cutoffs", "0", "100000", "--ef-values", "100",
                 "--targets", "0.9", "--warmup-queries", "0",
@@ -565,8 +801,12 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
                 mock.patch.object(runner.baseline, "read_fbin_memmap", return_value=(vectors, len(vectors), 1)),
                 mock.patch.object(runner.baseline, "load_truth", return_value=({}, query_ids)),
                 mock.patch.object(runner.baseline, "sha256_file", return_value="hash"),
+                mock.patch.object(
+                    runner, "validate_current_input_manifests",
+                    return_value=current_input_provenance(),
+                ),
             )
-            with common_patches[0], common_patches[1], common_patches[2], common_patches[3], \
+            with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4], \
                     mock.patch.object(runner.baseline, "isolate_existing_outputs", return_value=None), \
                     mock.patch.object(runner.baseline, "request_json", side_effect=[(original, 0), ({"version": "1.38.0"}, 0)]), \
                     mock.patch.object(runner.baseline, "get_ready_nodes", return_value=({"nodes": []}, 0)), \
@@ -588,8 +828,12 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
                 mock.patch.object(runner.baseline, "read_fbin_memmap", return_value=(vectors, len(vectors), 1)),
                 mock.patch.object(runner.baseline, "load_truth", return_value=({}, query_ids)),
                 mock.patch.object(runner.baseline, "sha256_file", return_value="hash"),
+                mock.patch.object(
+                    runner, "validate_current_input_manifests",
+                    return_value=current_input_provenance(),
+                ),
             )
-            with resume_patches[0], resume_patches[1], resume_patches[2], resume_patches[3], \
+            with resume_patches[0], resume_patches[1], resume_patches[2], resume_patches[3], resume_patches[4], \
                     mock.patch.object(runner.baseline, "request_json", side_effect=[(leftover, 0), ({"version": "1.39.0"}, 0)]), \
                     mock.patch.object(runner.baseline, "get_ready_nodes", return_value=({"nodes": []}, 0)), \
                     mock.patch.object(runner, "put_hnsw_config") as mutate, \
@@ -609,7 +853,7 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         spec = filter_spec()
         original = schema_definition("sweeping", 111, 7)
         vectors = [[0.0]] * 200
-        query_ids = {0: 0}
+        query_ids = {query_no: query_no for query_no in range(20, 200)}
         total = {
             "data": {"Aggregate": {runner.CLASS_NAME: [
                 {"meta": {"count": runner.baseline.EXPECTED_ROWS}}
@@ -625,6 +869,7 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
             checkpoint = Path(tmp) / "checkpoint.json"
             args = runner.build_parser().parse_args([
                 "--out", str(out), "--checkpoint", str(checkpoint),
+                "--protocol", runner.LEGACY_EXECUTION_PROTOCOL,
                 "--service-image-digest", "sha256:immutable", "--filter-names", "f",
                 "--flat-search-cutoffs", "0", "100000", "--ef-values", "100",
                 "--targets", "0.9", "--warmup-queries", "0",
@@ -633,6 +878,10 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
                     mock.patch.object(runner.baseline, "read_fbin_memmap", return_value=(vectors, len(vectors), 1)), \
                     mock.patch.object(runner.baseline, "load_truth", return_value=({}, query_ids)), \
                     mock.patch.object(runner.baseline, "sha256_file", return_value="hash"), \
+                    mock.patch.object(
+                        runner, "validate_current_input_manifests",
+                        return_value=current_input_provenance(),
+                    ), \
                     mock.patch.object(runner.baseline, "isolate_existing_outputs", return_value=None), \
                     mock.patch.object(runner.baseline, "request_json", side_effect=[(original, 0), ({"version": "1.38.0"}, 0)]), \
                     mock.patch.object(runner.baseline, "get_ready_nodes", return_value=({"nodes": []}, 0)), \
@@ -649,12 +898,96 @@ class WeaviateProductionMatchedRecallBaselineTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             runner.raise_after_schema_restore(SystemExit(7), None)
 
-    def test_expected_route_is_declared_inference_not_observation(self):
+    def test_formal_frozen_workload_binds_request_query_filter_and_split(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "workload.csv"
+            path.write_text(
+                "request_no,query_no,query_id,filter_name,trace_cycle,split\n"
+                "1,11,111,f2,0,measurement\n"
+                "0,10,110,f1,0,measurement\n",
+                encoding="utf-8",
+            )
+            requests = runner.load_frozen_workload(
+                path,
+                split="measurement",
+                expected_requests=2,
+                expected_query_nos=(10, 11),
+                query_ids={10: 110, 11: 111},
+                filter_names={"f1", "f2"},
+            )
+            self.assertEqual(
+                [(row.request_no, row.query_no, row.query_id, row.filter_name)
+                 for row in requests],
+                [(0, 10, 110, "f1"), (1, 11, 111, "f2")],
+            )
+            tampered = path.read_text(encoding="utf-8").replace(
+                "1,11,111,f2", "1,11,999,f2"
+            )
+            path.write_text(tampered, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "disagrees with exact GT"):
+                runner.load_frozen_workload(
+                    path,
+                    split="measurement",
+                    expected_requests=2,
+                    expected_query_nos=(10, 11),
+                    query_ids={10: 110, 11: 111},
+                    filter_names={"f1", "f2"},
+                )
+
+    def test_formal_checkpoint_keeps_same_config_targets_as_distinct_blocks(self):
+        request = runner.WorkloadRequest(0, 10, 110, "f")
+        blocks = [
+            runner._block_record(
+                "final", "acorn", "f", 0, 100, (request,), 3, target=target
+            )
+            for target in (0.90, 0.95)
+        ]
+        raw_rows = [
+            {
+                "phase": "final",
+                "configured_filter_strategy": "acorn",
+                "filter_name": "f",
+                "flat_search_cutoff": 0,
+                "ef": 100,
+                "target_recall": runner._target_token(target),
+                "request_no": 0,
+                "query_no": 10,
+                "query_id": 110,
+                "repeat": repeat,
+            }
+            for target in (0.90, 0.95)
+            for repeat in range(3)
+        ]
+        summaries = [
+            {
+                "configured_filter_strategy": "acorn",
+                "filter_name": "f",
+                "flat_search_cutoff": 0,
+                "ef": 100,
+                "target_recall": runner._target_token(target),
+            }
+            for target in (0.90, 0.95)
+        ]
+        original = schema_definition("acorn", 100, 0)
+        payload = {
+            "raw_rows": raw_rows,
+            "calibration_summaries": [],
+            "final_results": summaries,
+            "state": checkpoint_state(original, blocks),
+        }
+        runner._validate_checkpoint_blocks(payload, {10: 110})
+        payload["raw_rows"].pop()
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            runner._validate_checkpoint_blocks(payload, {10: 110})
+
+    def test_route_reports_configuration_and_automatic_fallback_not_inference(self):
         spec = runner.baseline.FILTERS[-1]
-        record = runner.expected_route(spec, spec.expected_rows + 1)
-        self.assertEqual(record["expected_route"], "flat")
+        record = runner.expected_route(spec, spec.expected_rows + 1, "acorn")
+        self.assertEqual(record["configured_filter_strategy"], "acorn")
+        self.assertEqual(record["automatic_fallback"], "possible_service_internal")
         self.assertFalse(record["route_observed"])
-        self.assertIn("allowList.Len() < flatSearchCutoff", record["inference"])
+        self.assertEqual(record["effective_route"], "N/A")
+        self.assertNotIn("expected_route", record)
 
 
 if __name__ == "__main__":

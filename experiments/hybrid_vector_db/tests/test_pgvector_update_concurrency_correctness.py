@@ -40,7 +40,12 @@ class PgvectorUpdateConcurrencyCorrectnessTests(unittest.TestCase):
             "vector_library_error": "",
         }
         self.assertEqual(validate_runtime_provenance(valid), [])
+        self.assertEqual(
+            validate_runtime_provenance(valid | {"build_id": "sqlens-v16-release"}),
+            [],
+        )
         self.assertTrue(validate_runtime_provenance(valid | {"build_id": "stock"}))
+        self.assertTrue(validate_runtime_provenance(valid | {"build_id": "sqlens-v10-old"}))
         self.assertTrue(validate_runtime_provenance(valid | {"vector_library_sha256": "missing"}))
 
     def test_grid_covers_all_operations_and_excludes_truncate_during_build(self):

@@ -1,0 +1,31 @@
+{
+  "original": {
+    "labelor_top70": 700,
+    "labelor_top55": 700,
+    "labelor_top40": 700,
+    "labelor_top30": 600,
+    "labelor_top20": 800,
+    "labelor_top14": 750,
+    "labelor_top9": 800,
+    "labelor_top6": 1000,
+    "labelor_top3": 1100,
+    "label_175": 2700,
+    "label_79": 4600,
+    "label_2039": 42000,
+    "label_1432": 7000,
+    "label_281": 16000
+  },
+  "design1_bloom_bfs_layout_d3": {
+    "labelor_top70": 700,
+    "labelor_top55": 700,
+    "labelor_top40": 700,
+    "labelor_top30": 600,
+    "labelor_top20": 800,
+    "labelor_top14": 750,
+    "labelor_top9": 800,
+    "labelor_top6": 1000,
+    "labelor_top3": 1100,
+    "label_1432": 7000,
+    "label_281": 16000
+  }
+}

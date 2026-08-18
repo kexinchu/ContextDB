@@ -10,8 +10,12 @@ from typing import Any
 import numpy as np
 import psycopg
 
-from common_pg import pg_config_from_env
-from prepare_yfcc_pgvector import DIM, spmat_fields, xbin_mmap
+try:
+    from .common_pg import pg_config_from_env
+    from .prepare_yfcc_pgvector import DIM, spmat_fields, xbin_mmap
+except ImportError:
+    from common_pg import pg_config_from_env
+    from prepare_yfcc_pgvector import DIM, spmat_fields, xbin_mmap
 
 
 DATA_DIR = Path(os.environ.get("YFCC10M_DATA_DIR", Path(os.environ.get("OOD_ANNS_DATA", "data/ood_anns")) / "YFCC10M"))
@@ -35,12 +39,65 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def distance_tolerance(distance_sq: float) -> float:
+    return max(1e-9, abs(float(distance_sq)) * 1e-6)
+
+
+def truth_boundary(distances: list[float], k: int) -> tuple[float, float, int, bool]:
+    if len(distances) < k:
+        raise ValueError(f"exact result has {len(distances)} distances, expected at least {k}")
+    kth = float(distances[k - 1])
+    tolerance = distance_tolerance(kth)
+    strict = sum(value < kth - tolerance for value in distances[:k])
+    boundary_tied = len(distances) > k and distances[k] <= kth + tolerance
+    return kth, tolerance, strict, boundary_tied
+
+
+def formal_filter_rows(filter_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "filter_name": row["filter_name"],
+            "target_rate": row["target_band_pct"],
+            "actual_pct": row["filter_pct"],
+            "expected_rows": row["filter_rows"],
+            "predicate": row["predicate"],
+            "atoms": "||OR||".join(
+                f"sql:tags @> ARRAY[{int(label)}]::int[]"
+                for label in row["labels_tuple"]
+            ),
+        }
+        for row in filter_rows
+    ]
+
+
 def tag_text(labels: tuple[int, ...]) -> str:
     return " ".join(str(int(x)) for x in labels)
 
 
 def predicate(labels: tuple[int, ...]) -> str:
     return "tags && ARRAY[" + ",".join(str(int(x)) for x in labels) + "]::int[]"
+
+
+def load_existing_filters(path: Path) -> list[dict[str, Any]]:
+    unique: dict[str, dict[str, Any]] = {}
+    with path.open(newline="", encoding="utf-8") as source:
+        for source_row in csv.DictReader(source):
+            labels = tuple(int(value) for value in str(source_row["tags"]).split())
+            row = {
+                "target_band_pct": float(source_row["target_band_pct"]),
+                "filter_pct": float(source_row["filter_pct"]),
+                "filter_rows": int(source_row["filter_rows"]),
+                "filter_name": source_row["filter_name"],
+                "tags": tag_text(labels),
+                "predicate": source_row["predicate"],
+                "labels_tuple": labels,
+            }
+            previous = unique.setdefault(str(row["filter_name"]), row)
+            if previous["predicate"] != row["predicate"]:
+                raise ValueError(f"filter {row['filter_name']} maps to multiple predicates")
+    if len(unique) != 14:
+        raise ValueError(f"formal YFCC workload requires 14 filters, found {len(unique)}")
+    return sorted(unique.values(), key=lambda row: float(row["target_band_pct"]), reverse=True)
 
 
 def load_query_ids(query_table: str, queries_per_filter: int) -> list[int]:
@@ -51,7 +108,7 @@ def load_query_ids(query_table: str, queries_per_filter: int) -> list[int]:
             f"""
             SELECT qid
             FROM {query_table}
-            ORDER BY md5(qid::text)
+            ORDER BY md5(qid::text), qid
             LIMIT %s
             """,
             (int(queries_per_filter),),
@@ -183,6 +240,8 @@ def generate_truth(
     selected_rows: list[dict[str, Any]] = []
     truth_rows: list[dict[str, Any]] = []
     started = time.perf_counter()
+    query_no_by_id = {qid: query_no for query_no, qid in enumerate(qids)}
+    top_width = args.k + 1 if args.formal_matched_recall else args.k
 
     for batch_start in range(0, len(qids), args.query_batch):
         batch_qids = qids[batch_start : batch_start + args.query_batch]
@@ -191,8 +250,8 @@ def generate_truth(
         q = np.asarray(xq[batch_qids], dtype=np.float32)
         q_t = np.ascontiguousarray(q.T)
         q_norm = np.einsum("ij,ij->i", q, q)
-        top_dist = np.full((len(specs), args.k), np.inf, dtype=np.float32)
-        top_ids = np.full((len(specs), args.k), -1, dtype=np.int32)
+        top_dist = np.full((len(specs), top_width), np.inf, dtype=np.float32)
+        top_ids = np.full((len(specs), top_width), -1, dtype=np.int32)
 
         for chunk_start in range(0, xb.shape[0], args.chunk_rows):
             chunk_end = min(chunk_start + args.chunk_rows, xb.shape[0])
@@ -210,7 +269,14 @@ def generate_truth(
                     mask = label_mask_for_chunk(indptr, indices, chunk_start, chunk_end, labels)
                     mask_cache[labels] = mask
                 if np.any(mask):
-                    update_topk(top_dist, top_ids, spec_pos, dist[mask, qid_pos[qid]], candidate_ids[mask], args.k)
+                    update_topk(
+                        top_dist,
+                        top_ids,
+                        spec_pos,
+                        dist[mask, qid_pos[qid]],
+                        candidate_ids[mask],
+                        top_width,
+                    )
 
             if args.progress_chunks and ((chunk_start // args.chunk_rows) + 1) % args.progress_chunks == 0:
                 elapsed = (time.perf_counter() - started) / 60.0
@@ -222,6 +288,13 @@ def generate_truth(
 
         for spec_pos, (qid, row) in enumerate(specs):
             ids = [int(x) for x in top_ids[spec_pos] if int(x) >= 0]
+            distances = [
+                float(value)
+                for item_id, value in zip(top_ids[spec_pos], top_dist[spec_pos])
+                if int(item_id) >= 0
+            ]
+            result_ids = ids[: args.k]
+            result_distances = distances[: args.k]
             base = {
                 "target_band_pct": row["target_band_pct"],
                 "filter_pct": row["filter_pct"],
@@ -231,14 +304,55 @@ def generate_truth(
                 "tags": row["tags"],
                 "predicate": row["predicate"],
             }
-            selected_rows.append({**base, "gt": " ".join(str(x) for x in ids)})
-            truth_rows.append(
-                {
-                    "truth_key": f"overlap|{float(row['target_band_pct'])}|{int(qid)}|{row['filter_name']}",
-                    **base,
-                    "gt": " ".join(str(x) for x in ids),
-                }
-            )
+            selected_rows.append({**base, "gt": " ".join(str(x) for x in result_ids)})
+            if args.formal_matched_recall:
+                kth, tolerance, strict, boundary_tied = truth_boundary(distances, args.k)
+                query_no = query_no_by_id[qid]
+                truth_rows.append(
+                    {
+                        "query_no": query_no,
+                        "query_id": int(qid),
+                        "query_split": (
+                            "calibration" if query_no < args.calibration_queries else "final"
+                        ),
+                        "filter_name": row["filter_name"],
+                        "target_rate": row["target_band_pct"],
+                        "predicate": row["predicate"],
+                        "candidate_validity_predicate": "TRUE",
+                        "candidate_validity_provenance": "full_hnsw_index_and_source_metadata",
+                        "query_validity_predicate": "TRUE",
+                        "query_validity_provenance": "external_query_table",
+                        "actual_selectivity": row["filter_pct"],
+                        "method": "pre_filter_exact",
+                        "k": args.k,
+                        "latency_ms": "",
+                        "recall_at_10_exact_filtered": 1.0,
+                        "returned": len(result_ids),
+                        "candidates": row["filter_rows"],
+                        "filtered_rows": row["filter_rows"],
+                        "search_candidate_rows": row["filter_rows"],
+                        "result_ids": ",".join(str(value) for value in result_ids),
+                        "exact_filtered_topk_ids": ",".join(str(value) for value in result_ids),
+                        "exact_filtered_topk_distances_sq": ",".join(
+                            f"{value:.9g}" for value in result_distances
+                        ),
+                        "kth_distance_sq": f"{kth:.9g}",
+                        "tie_tolerance": f"{tolerance:.9g}",
+                        "strict_closer_count": strict,
+                        "boundary_tied": boundary_tied,
+                        "self_excluded": False,
+                        "candidate_rows": row["filter_rows"],
+                        "self_excluded_rows": 0,
+                    }
+                )
+            else:
+                truth_rows.append(
+                    {
+                        "truth_key": f"overlap|{float(row['target_band_pct'])}|{int(qid)}|{row['filter_name']}",
+                        **base,
+                        "gt": " ".join(str(x) for x in result_ids),
+                    }
+                )
         write_csv(args.selected_out, selected_rows)
         write_csv(args.truth_out, truth_rows)
         elapsed = (time.perf_counter() - started) / 60.0
@@ -251,8 +365,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build YFCC10M tags-overlap workload and exact SQL-valid top-k truth.")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--query-table", default="yfcc10m_queries")
+    parser.add_argument("--filters-in", type=Path)
     parser.add_argument("--selected-out", type=Path, default=Path("results/hybrid_vector_db/yfcc10m_overlap_selectivity14_selected_q100_20260716.csv"))
     parser.add_argument("--truth-out", type=Path, default=Path("results/hybrid_vector_db/yfcc10m_overlap_selectivity14_truth_q100_20260716.csv"))
+    parser.add_argument("--filters-out", type=Path)
     parser.add_argument("--target-bands", type=float, nargs="+", default=TARGET_BANDS)
     parser.add_argument("--queries-per-filter", type=int, default=100)
     parser.add_argument("--pair-top-tags", type=int, default=80)
@@ -261,14 +377,43 @@ def main() -> None:
     parser.add_argument("--progress-chunks", type=int, default=25)
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--select-only", action="store_true")
+    parser.add_argument("--filters-only", action="store_true")
+    parser.add_argument("--formal-matched-recall", action="store_true")
+    parser.add_argument("--calibration-queries", type=int, default=80)
     args = parser.parse_args()
+
+    if args.formal_matched_recall:
+        if args.queries_per_filter != 180:
+            raise SystemExit("formal matched-recall truth requires --queries-per-filter=180")
+        if args.calibration_queries != 80:
+            raise SystemExit("formal matched-recall truth requires --calibration-queries=80")
+        if args.filters_out is None:
+            raise SystemExit("formal matched-recall truth requires --filters-out")
 
     args.base_u8bin = args.data_dir / "base.10M.u8bin"
     args.query_u8bin = args.data_dir / "query.public.100K.u8bin"
     base_metadata = args.data_dir / "base.metadata.10M.spmat"
 
     nrow, ncol, _, indptr, indices, _ = spmat_fields(base_metadata)
-    filters = choose_filters(nrow, ncol, indptr, indices, [float(x) for x in args.target_bands], int(args.pair_top_tags))
+    filters = (
+        load_existing_filters(args.filters_in)
+        if args.filters_in is not None
+        else choose_filters(
+            nrow,
+            ncol,
+            indptr,
+            indices,
+            [float(x) for x in args.target_bands],
+            int(args.pair_top_tags),
+        )
+    )
+    if args.filters_out is not None:
+        write_csv(args.filters_out, formal_filter_rows(filters))
+        print(f"wrote filters {args.filters_out}", flush=True)
+    if args.filters_only:
+        if args.filters_out is None:
+            raise SystemExit("--filters-only requires --filters-out")
+        return
     qids = load_query_ids(args.query_table, int(args.queries_per_filter))
     print(f"using {len(qids)} qids for each of {len(filters)} filters", flush=True)
 

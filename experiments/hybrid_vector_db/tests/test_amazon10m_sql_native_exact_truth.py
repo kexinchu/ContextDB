@@ -275,6 +275,44 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Faiss"):
             truth.validate_formal_dimensions(args, filters)
 
+    def test_q10200_protocol_resolves_mainline_slice_and_dimensions(self) -> None:
+        args = truth.resolve_protocol_args(
+            truth.create_argument_parser().parse_args(["--protocol", "q10200"])
+        )
+        source_filters = truth.read_filters(truth.DEFAULT_FILTERS)
+        filters = truth.read_filters(
+            truth.DEFAULT_FILTERS, set(args.filter_names)
+        )
+        workloads = truth.select_workloads(args.workload_names, args.protocol)
+        truth.validate_formal_dimensions(
+            args, filters, workloads, source_filters
+        )
+        self.assertEqual(args.calibration_queries, 100)
+        self.assertEqual(args.final_queries, 10_100)
+        self.assertEqual(args.query_ids_csv, truth.DEFAULT_Q10200_QUERY_IDS)
+        self.assertEqual(
+            tuple(workload.name for workload in workloads),
+            truth.MAIN_WORKLOAD_NAMES,
+        )
+        self.assertEqual(
+            tuple(spec.name for spec in filters), truth.MAIN_FILTER_NAMES
+        )
+        self.assertEqual(
+            len(workloads) * len(filters) * 10_200,
+            122_400,
+        )
+
+    def test_q10200_workload_subset_remains_appendix_compatible(self) -> None:
+        selected = truth.select_workloads(
+            ["boolean_complex_wide_or"], truth.PROTOCOL_Q10200
+        )
+        self.assertEqual(
+            [workload.name for workload in selected],
+            ["boolean_complex_wide_or"],
+        )
+        with self.assertRaisesRegex(ValueError, "unknown workloads"):
+            truth.select_workloads(["not_registered"], truth.PROTOCOL_Q10200)
+
     def test_spot_check_compares_every_strict_rank_and_accepts_tied_substitution(self) -> None:
         valid = truth.validate_spot_check(
             [10, 11, 12], [0.0, 1.0, 1.0], [(10, 0.0), (12, 1.0), (11, 1.0)], k=2
@@ -294,9 +332,28 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
 
     def test_workloads_are_acl_grant_temporal_and_fact_temporal_without_rls_collapse(self) -> None:
         self.assertEqual(
-            [workload.name for workload in truth.WORKLOADS],
+            [workload.name for workload in truth.WORKLOADS[:3]],
             ["acl_only", "grant_temporal_selectivity", "fact_temporal_selectivity"],
         )
+        boolean = truth.WORKLOADS[3:]
+        self.assertEqual(len(boolean), 6)
+        self.assertEqual(
+            [workload.width for workload in boolean],
+            ["wide", "wide", "medium", "medium", "narrow", "narrow"],
+        )
+        predicates = " ".join(workload.boolean_predicate.upper() for workload in boolean)
+        self.assertIn("EXISTS", predicates)
+        self.assertIn("NOT EXISTS", predicates)
+        self.assertIn(" OR ", predicates)
+        self.assertTrue(
+            all(
+                "helpful_vote >= 20" in workload.boolean_predicate
+                for workload in boolean
+                if workload.width == "narrow"
+            )
+        )
+        self.assertIn("item_rating_number >= 1340", boolean[1].boolean_predicate)
+        self.assertIn("item_rating_number < 10066", boolean[2].boolean_predicate)
         sql_by_workload = {
             workload.name: truth.build_candidate_sql("public.vectors", "rating = 5", workload)
             for workload in truth.WORKLOADS
@@ -318,6 +375,37 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
             "grant_row.valid_from <= %(as_of)s",
             sql_by_workload["fact_temporal_selectivity"],
         )
+        self.assertIn(
+            "NOT EXISTS",
+            sql_by_workload["boolean_complex_narrow_not_exists"],
+        )
+        self.assertIn(
+            " OR ",
+            sql_by_workload["boolean_complex_wide_or"],
+        )
+        self.assertNotIn(
+            "valid_from <= %(as_of)s",
+            sql_by_workload["boolean_complex_wide_or"],
+        )
+
+    def test_formal_input_hashes_fail_closed(self) -> None:
+        paths = (Path("filters.csv"), Path("queries.csv"), Path("queries.json"))
+        with mock.patch.object(
+            truth,
+            "sha256_file",
+            side_effect=[
+                truth.FORMAL_FILTERS_SHA256,
+                truth.FORMAL_QUERY_COHORT_SHA256,
+                truth.FORMAL_QUERY_COHORT_MANIFEST_SHA256,
+            ],
+        ):
+            proof = truth.require_formal_input_hashes(*paths)
+        self.assertEqual(proof["filters_csv"], truth.FORMAL_FILTERS_SHA256)
+        with (
+            mock.patch.object(truth, "sha256_file", return_value="0" * 64),
+            self.assertRaisesRegex(RuntimeError, "hashes do not match"),
+        ):
+            truth.require_formal_input_hashes(*paths)
 
     def test_formal_guard_locks_all_data_relations_and_rechecks_same_version(self) -> None:
         cursor = mock.MagicMock()
@@ -372,6 +460,9 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
             ],
         ]
         fingerprint = truth.relation_fingerprint(cursor, "public.t")
+        size_sql = " ".join(cursor.execute.call_args_list[0].args[0].split())
+        self.assertIn("pg_table_size(c.oid)::bigint", size_sql)
+        self.assertNotIn("pg_total_relation_size", size_sql)
         self.assertEqual(fingerprint["columns"], [["id", "bigint", True]])
         self.assertEqual(fingerprint["policies"][0][0], "policy")
         self.assertEqual(fingerprint["data_epoch"], 9)

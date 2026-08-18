@@ -1,0 +1,34 @@
+{
+  "original": {
+    "labelor_top70": 50000,
+    "labelor_top55": 50000,
+    "labelor_top40": 50000,
+    "labelor_top30": 50000,
+    "labelor_top20": 50000,
+    "labelor_top14": 50000,
+    "labelor_top9": 50000,
+    "labelor_top6": 50000,
+    "labelor_top3": 50000,
+    "label_175": 100000,
+    "label_79": 100000,
+    "label_2039": 500000,
+    "label_1432": 300000,
+    "label_281": 200000
+  },
+  "design1_bloom_bfs_layout_d3": {
+    "labelor_top70": 50000,
+    "labelor_top55": 50000,
+    "labelor_top40": 50000,
+    "labelor_top30": 50000,
+    "labelor_top20": 50000,
+    "labelor_top14": 50000,
+    "labelor_top9": 50000,
+    "labelor_top6": 50000,
+    "labelor_top3": 50000,
+    "label_175": 50000,
+    "label_79": 50000,
+    "label_2039": 100000,
+    "label_1432": 100000,
+    "label_281": 100000
+  }
+}

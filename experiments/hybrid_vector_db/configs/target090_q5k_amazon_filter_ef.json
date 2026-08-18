@@ -1,0 +1,34 @@
+{
+  "original": {
+    "popular_ge1000": 22,
+    "popular_ge1340": 25,
+    "popular_ge1780": 35,
+    "popular_ge2428": 33,
+    "popular_ge3284": 38,
+    "popular_ge4559": 45,
+    "price_10_to_20": 52,
+    "popular_ge10066": 95,
+    "rating5_price_le10": 220,
+    "long_review_ge500": 11000,
+    "grocery_rating5": 700,
+    "grocery_helpful": 1600,
+    "helpful_ge20": 8000,
+    "grocery_long500": 20
+  },
+  "design1_bloom_bfs_layout_d3": {
+    "popular_ge1000": 22,
+    "popular_ge1340": 25,
+    "popular_ge1780": 35,
+    "popular_ge2428": 33,
+    "popular_ge3284": 38,
+    "popular_ge4559": 45,
+    "price_10_to_20": 52,
+    "popular_ge10066": 95,
+    "rating5_price_le10": 220,
+    "long_review_ge500": 130,
+    "grocery_rating5": 11,
+    "grocery_helpful": 11,
+    "helpful_ge20": 11,
+    "grocery_long500": 11
+  }
+}

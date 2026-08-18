@@ -144,7 +144,8 @@ class FinalizeSqlensMatchedRecallComparisonTests(unittest.TestCase):
             root = Path(directory)
             input_path, _ = self._fixture(root, raw_official=True)
             outputs = finalize_artifacts(input_path, root / "comparison")
-            rows = list(csv.DictReader(outputs["summary"].open(newline="", encoding="utf-8")))
+            with outputs["summary"].open(newline="", encoding="utf-8") as source:
+                rows = list(csv.DictReader(source))
             self.assertEqual(len(rows), 14 * 3 * 5)
             official = next(
                 row for row in rows

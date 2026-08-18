@@ -1,0 +1,69 @@
+{
+  "amazon": {
+    "popular_ge1000": {
+      "guidance": false,
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 21, "iterative_scan": "off"}
+    },
+    "popular_ge1340": {
+      "guidance": false,
+      "stock": {"ef_search": 23, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 24, "iterative_scan": "off"}
+    },
+    "popular_ge1780": {
+      "guidance": false,
+      "stock": {"ef_search": 31, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 32, "iterative_scan": "off"}
+    },
+    "popular_ge2428": {
+      "guidance": false,
+      "stock": {"ef_search": 32, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 33, "iterative_scan": "off"}
+    },
+    "popular_ge3284": {
+      "guidance": false,
+      "stock": {"ef_search": 39, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 40, "iterative_scan": "off"}
+    },
+    "popular_ge4559": {
+      "guidance": false,
+      "stock": {"ef_search": 47, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 48, "iterative_scan": "off"}
+    },
+    "price_10_to_20": {
+      "guidance": false,
+      "stock": {"ef_search": 52, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 53, "iterative_scan": "off"}
+    },
+    "popular_ge10066": {
+      "guidance": false,
+      "stock": {"ef_search": 80, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 82, "iterative_scan": "off"}
+    },
+    "rating5_price_le10": {
+      "guidance": false,
+      "stock": {"ef_search": 245, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 250, "iterative_scan": "off"}
+    },
+    "long_review_ge500": {
+      "stock": {"ef_search": 10500, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 130, "max_scan_tuples": 14500, "traversal_guided_target": 11}
+    },
+    "grocery_rating5": {
+      "stock": {"ef_search": 800, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 11, "max_scan_tuples": 4500, "traversal_guided_target": 11}
+    },
+    "grocery_helpful": {
+      "stock": {"ef_search": 1400, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 11, "max_scan_tuples": 6700, "traversal_guided_target": 11}
+    },
+    "helpful_ge20": {
+      "stock": {"ef_search": 9000, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 11, "max_scan_tuples": 20000, "traversal_guided_target": 11}
+    },
+    "grocery_long500": {
+      "stock": {"ef_search": 20, "iterative_scan": "strict_order", "max_scan_tuples": 75000},
+      "sqlens": {"ef_search": 11, "max_scan_tuples": 68000, "traversal_guided_target": 11}
+    }
+  }
+}

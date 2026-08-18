@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "contract_id": "sigmod-p0-r41-20260801",
+  "purpose": "immutable SQLens distance-aware matched-recall release identity",
+  "expected_sqlens_build_id": "sqlens-v16-distance-aware-route-budget-ef500k-20260801-r41",
+  "expected_vector_so_sha256": "8f53226d35cae28d4e1b6926b13b01fa01fd1f6720c5f57c96c7886905f5eaf0"
+}

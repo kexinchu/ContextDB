@@ -43,6 +43,7 @@
 #include "utils/inval.h"
 #include "utils/array.h"
 #include "utils/float.h"
+#include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -126,6 +127,7 @@ typedef enum HnswAdaptiveState
 	HNSW_ADAPTIVE_PAGE,
 	HNSW_ADAPTIVE_BLOOM,
 	HNSW_ADAPTIVE_EXACT,
+	HNSW_ADAPTIVE_REJECTED,
 	HNSW_ADAPTIVE_STALE
 } HnswAdaptiveState;
 
@@ -150,6 +152,7 @@ typedef struct HnswGuidanceDescriptorEntry
 	int64		exactEpoch;
 	Oid			exactRelFileNode;
 	HnswAdaptiveState adaptiveState;
+	int			adaptiveTargetKind;
 	uint64		adaptiveRequests;
 	uint64		adaptiveCycleRequests;
 	uint64		adaptiveProbes;
@@ -232,6 +235,7 @@ typedef struct HnswActiveGuidance
 	bool		composedGuideHit;
 	int64		composedGuideHits;
 	int64		composedGuideMisses;
+	int64		fastReactivationHits;
 	HnswGuidanceAtom atom[HNSW_GUIDANCE_MAX_ATOMS];
 	bool		composedExactActive;
 	bool		composedExactHit;
@@ -295,6 +299,7 @@ typedef struct HnswAdaptiveProfile
 	int64		rejections;
 	int64		pageBuilds;
 	int64		bloomBuilds;
+	int64		exactBuilds;
 	int64		refinements;
 	int64		staleBypasses;
 	int64		evictions;
@@ -302,6 +307,12 @@ typedef struct HnswAdaptiveProfile
 	double		score;
 	int64		checks;
 	int64		skips;
+	int64		fragmentCacheHits;
+	int64		fragmentStoreHits;
+	int64		fragmentBuilds;
+	int64		fastReactivationHits;
+	int64		eventSequence;
+	double		fragmentBuildMs;
 } HnswAdaptiveProfile;
 
 static HnswMaterializeProfile hnsw_materialize_last_profile;
@@ -316,7 +327,9 @@ static int	hnsw_d3_probe_requests = 2;
 static double hnsw_d3_min_benefit_per_byte = 0;
 static int	hnsw_d3_max_fragment_mb = 16;
 static double hnsw_d3_page_min_skip_rate = 0.05;
+static char *hnsw_fragment_store_namespace;
 static bool hnsw_fragment_store_ready = false;
+static SPIPlanPtr hnsw_relation_version_plan = NULL;
 static uint64 hnsw_metadata_cache_clock = 0;
 static int64 hnsw_metadata_cache_evictions = 0;
 static HnswAdaptiveProbe hnsw_adaptive_probe;
@@ -642,7 +655,13 @@ _PG_init(void)
 							 "Sets the page-guidance skip rate below which adaptive refinement uses Bloom",
 							 "The following activation builds Bloom after a page scan records a lower skip rate.",
 							 &hnsw_d3_page_min_skip_rate,
-							 0.05, 0, 1, PGC_USERSET, 0, NULL, NULL, NULL);
+								 0.05, 0, 1, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable("hnsw.fragment_store_namespace",
+							   "Scopes persisted HNSW guidance fragments",
+							   "Nonempty namespaces isolate fragment-store reads and writes while preserving the logical predicate atom name.",
+							   &hnsw_fragment_store_namespace,
+							   "", PGC_USERSET, 0, NULL, NULL, NULL);
 }
 
 static const char *
@@ -683,6 +702,8 @@ HnswTraversalStockBypassReasonName(HnswTraversalStockBypassReason reason)
 			return "low_estimated_skip_rate";
 		case HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN:
 			return "iterative_scan";
+		case HNSW_TRAVERSAL_BYPASS_STALE_RELATION:
+			return "stale_relation";
 	}
 	return "unknown";
 }
@@ -706,6 +727,8 @@ HnswTraversalAdmissionReasonName(HnswTraversalAdmissionReason reason)
 			return "default_candidate_admission_validation_only";
 		case HNSW_TRAVERSAL_ADMISSION_ADMITTED:
 			return "planner_proven_guidance_and_explicit_guc";
+		case HNSW_TRAVERSAL_ADMISSION_STALE_RELATION:
+			return "stale_relation";
 	}
 	return "unknown";
 }
@@ -733,14 +756,8 @@ HnswTraversalFallbackReasonName(HnswTraversalFallbackReason reason)
 			return "none";
 		case HNSW_TRAVERSAL_FALLBACK_INSUFFICIENT_MATCHES:
 			return "insufficient_guided_matches";
-		case HNSW_TRAVERSAL_FALLBACK_BRIDGE_HOPS:
-			return "bridge_hop_budget";
-		case HNSW_TRAVERSAL_FALLBACK_BRIDGE_WORK:
-			return "bridge_work_budget";
 		case HNSW_TRAVERSAL_FALLBACK_MAX_SCAN_TUPLES:
 			return "max_scan_tuples";
-		case HNSW_TRAVERSAL_FALLBACK_MEMORY_LIMIT:
-			return "memory_limit";
 		case HNSW_TRAVERSAL_FALLBACK_INVALID_NEIGHBOR:
 			return "invalid_neighbor_version";
 	}
@@ -804,8 +821,8 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 {
 	appendStringInfo(output,
 					"{\"valid\":%s,"
-					"\"profile_semantics_version\":7,"
-					"\"traversal_prioritization_semantics_version\":1,"
+					"\"profile_semantics_version\":13,"
+					"\"traversal_prioritization_semantics_version\":2,"
 					"\"total_scan_ms\":%.6f,"
 					"\"hnsw_search_ms\":%.6f,"
 					"\"heap_fetch_ms\":%.6f,"
@@ -820,6 +837,9 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					"\"distance_compute_count\":" INT64_FORMAT ","
 					"\"expanded_nodes\":" INT64_FORMAT ","
 					"\"distance_computations\":" INT64_FORMAT ","
+					"\"traversal_result_target\":%d,"
+					"\"traversal_guided_result_count\":" INT64_FORMAT ","
+					"\"traversal_max_scan_reached\":%s,"
 					"\"expanded_nodes_scope\":\"layer0_total_including_fresh_fallback\","
 					"\"distance_computations_scope\":\"all_hnsw_layers_total_including_fresh_fallback\","
 					"\"page_access_batches\":" INT64_FORMAT ","
@@ -843,6 +863,7 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						"\"match_frontier_pops\":" INT64_FORMAT ","
 						"\"no_bridge_frontier_pops\":" INT64_FORMAT ","
 						"\"no_bridge_deferred\":" INT64_FORMAT ","
+						"\"priority_reorders\":" INT64_FORMAT ","
 						"\"max_no_bridge_debt\":" INT64_FORMAT ","
 						"\"no_bridge_expansions\":" INT64_FORMAT ","
 						"\"no_bridge_expansions_scope\":\"approximate_prioritization_layer0_predicate_no_frontier_pops\","
@@ -850,6 +871,9 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						"\"dual_frontier_termination_checks_with_both\":" INT64_FORMAT ","
 						"\"dual_frontier_terminations\":" INT64_FORMAT ","
 						"\"dual_frontier_terminations_with_both\":" INT64_FORMAT ","
+						"\"traversal_guided_early_stop_enabled\":%s,"
+						"\"traversal_guided_early_stop_distance_ratio\":%.6f,"
+						"\"traversal_guided_early_stop_terminations\":" INT64_FORMAT ","
 						"\"traversal_candidate_admissions\":" INT64_FORMAT ","
 						"\"traversal_result_admissions\":" INT64_FORMAT ","
 						"\"traversal_guided_admissions\":" INT64_FORMAT ","
@@ -901,6 +925,9 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 					profile->distanceComputations,
 					profile->traversal.expandedNodes,
 					profile->distanceComputations,
+					profile->traversalResultTarget,
+					profile->traversalGuidedResultCount,
+					profile->traversalMaxScanReached ? "true" : "false",
 					profile->pageAccessBatches,
 					profile->pageAccessCandidates,
 					profile->pageAccessPrefetches,
@@ -922,12 +949,16 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						profile->traversal.matchFrontierPops,
 						profile->traversal.noBridgeFrontierPops,
 						profile->traversal.noBridgeDeferred,
+						profile->traversal.priorityReorders,
 						profile->traversal.maxNoBridgeDebt,
 						profile->traversal.noBridgeExpansions,
 						profile->traversal.dualFrontierTerminationChecks,
 						profile->traversal.dualFrontierTerminationChecksWithBoth,
 						profile->traversal.dualFrontierTerminations,
 						profile->traversal.dualFrontierTerminationsWithBoth,
+						hnsw_traversal_guided_early_stop ? "true" : "false",
+						hnsw_traversal_guided_early_stop_distance_ratio,
+						profile->traversal.guidedEarlyStopTerminations,
 						profile->traversal.candidateAdmissions,
 						profile->traversal.resultAdmissions,
 						profile->traversal.guidedAdmissions,
@@ -973,6 +1004,40 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 	}
 
 	appendStringInfo(output,
+					"],\"index_page_transition_count\":" INT64_FORMAT
+					",\"index_page_same_block_transitions\":" INT64_FORMAT
+					",\"index_page_within_1_page_transitions\":" INT64_FORMAT
+					",\"index_page_within_4_pages_transitions\":" INT64_FORMAT
+					",\"index_page_within_16_pages_transitions\":" INT64_FORMAT
+					",\"index_page_backward_transitions\":" INT64_FORMAT
+					",\"index_page_total_abs_block_delta\":" UINT64_FORMAT
+					",\"index_page_max_abs_block_delta\":" UINT64_FORMAT
+					",\"index_page_trace_statistics_scope\":\"all_actual_search_readbuffer_transitions_excluding_cross_scan_boundaries\""
+					",\"index_page_trace_sample_limit\":%d"
+					",\"index_page_trace_sample_count\":%d"
+					",\"index_page_trace_sample_truncated\":%s"
+					",\"index_page_trace_sample_scope\":\"concatenated_prefix_of_actual_search_readbuffer_blocks\""
+					",\"index_page_trace_sample\":[",
+					profile->indexPageTransitions,
+					profile->indexPageSameBlockTransitions,
+					profile->indexPageWithinOneTransitions,
+					profile->indexPageWithinFourTransitions,
+					profile->indexPageWithinSixteenTransitions,
+					profile->indexPageBackwardTransitions,
+					profile->indexPageTotalAbsBlockDelta,
+					profile->indexPageMaxAbsBlockDelta,
+					HNSW_INDEX_PAGE_TRACE_SAMPLE_LIMIT,
+					profile->indexPageTraceSampleCount,
+					profile->indexPageTraceSampleTruncated ? "true" : "false");
+	for (int i = 0; i < profile->indexPageTraceSampleCount; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(output, ',');
+		appendStringInfo(output, "%u",
+						 (uint32) profile->indexPageTraceSample[i]);
+	}
+
+	appendStringInfo(output,
 					"],\"index_page_loads\":" INT64_FORMAT
 					",\"index_page_runs\":" INT64_FORMAT
 					",\"index_page_distinct_pages\":" INT64_FORMAT
@@ -1015,6 +1080,8 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						",\"traversal_estimated_skip_rate\":%.6f"
 						",\"traversal_prioritization_burst\":%d"
 						",\"iterative_scan\":\"%s\""
+						",\"effective_iterative_scan\":\"%s\""
+						",\"fallback_iterative_scan_enabled\":%s"
 						",\"filter_strategy\":\"%s\""
 						",\"traversal_guidance_scope\":\"%s\""
 						",\"graph_expansion_pruned\":false"
@@ -1080,14 +1147,17 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						profile->traversalEstimatedSkipRate,
 						profile->traversalPrioritizationBurst,
 						HnswIterativeScanModeName(profile->iterativeScan),
+						HnswIterativeScanModeName(profile->effectiveIterativeScan),
+						profile->traversalFinalPath ==
+							HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK ?
+							"true" : "false",
 						HnswFilterStrategyModeName(profile->filterStrategy),
 						HnswTraversalGuidanceScopeName(
 							profile->traversalFinalPath),
-						(profile->traversal.matchFrontierPops > 0 ||
-						 profile->traversal.noBridgeFrontierPops > 0) ?
-							"true" : "false",
-						profile->traversalFinalPath ==
-							HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION ?
+					(profile->traversal.matchFrontierPops > 0 ||
+					 profile->traversal.noBridgeFrontierPops > 0) ?
+						"true" : "false",
+					profile->traversal.priorityReorders > 0 ?
 							"true" : "false",
 						profile->traversalFinalPath ==
 							HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION ?
@@ -1124,7 +1194,35 @@ VectorHnswLastProfileToText(StringInfo output, const HnswScanProfile *profile)
 						 (int64) proof->guideGeneration);
 	}
 
-	appendStringInfoString(output, "]}");
+	appendStringInfo(output,
+					 "],\"index_readbuffer_calls\":" INT64_FORMAT
+					 ",\"index_readbuffer_ms\":%.6f"
+					 ",\"index_readbuffer_shared_read_calls\":" INT64_FORMAT
+					 ",\"index_readbuffer_shared_read_ms\":%.6f"
+					 ",\"index_readbuffer_shared_hit_calls\":" INT64_FORMAT
+					 ",\"index_readbuffer_shared_hit_ms\":%.6f"
+					 ",\"index_readbuffer_unclassified_calls\":" INT64_FORMAT
+					 ",\"index_readbuffer_unclassified_ms\":%.6f"
+					 ",\"index_readbuffer_timing_scope\":\"actual_search_path_readbuffer_calls\""
+					 ",\"index_readbuffer_classification_scope\":\"pgBufferUsage_delta_per_readbuffer_call\""
+					 ",\"distance_compute_timed_calls\":" INT64_FORMAT
+					 ",\"distance_compute_ms\":%.6f"
+					 ",\"distance_compute_timing_scope\":\"distance_support_function_call_only\""
+					 ",\"hnsw_remaining_ms\":%.6f"
+					 ",\"hnsw_remaining_ms_is_residual\":true"
+					 ",\"hnsw_remaining_scope\":\"hnsw_callback_minus_readbuffer_minus_distance\""
+					 ",\"profile_timer_overhead_scope\":\"unmeasured_clock_and_non_readbuffer_non_distance_hnsw_callback_work\"}",
+					 profile->indexReadBufferCalls,
+					 profile->indexReadBufferMs,
+					 profile->indexReadBufferSharedReadCalls,
+					 profile->indexReadBufferSharedReadMs,
+					 profile->indexReadBufferSharedHitCalls,
+					 profile->indexReadBufferSharedHitMs,
+					 profile->indexReadBufferUnclassifiedCalls,
+					 profile->indexReadBufferUnclassifiedMs,
+					 profile->distanceComputeTimedCalls,
+					 profile->distanceComputeMs,
+					 profile->hnswRemainingMs);
 }
 
 static void
@@ -1435,7 +1533,10 @@ HnswMetadataEvictIfNeeded(HnswMetadataCacheEntry *protected)
 			break;
 
 		if (victim->adaptiveManaged)
+		{
 			hnsw_adaptive_profile.evictions++;
+			hnsw_adaptive_profile.eventSequence++;
+		}
 		HnswMetadataFreeCacheEntry(victim);
 		hnsw_metadata_cache_evictions++;
 	}
@@ -1841,6 +1942,8 @@ HnswAdaptiveStateName(HnswAdaptiveState state)
 			return "bloom";
 		case HNSW_ADAPTIVE_EXACT:
 			return "exact";
+		case HNSW_ADAPTIVE_REJECTED:
+			return "rejected";
 		case HNSW_ADAPTIVE_STALE:
 			return "stale";
 	}
@@ -1888,6 +1991,7 @@ HnswAdaptiveMarkStale(HnswGuidanceDescriptorEntry *descriptor)
 	descriptor->adaptiveState = HNSW_ADAPTIVE_STALE;
 	descriptor->adaptiveRefinePending = false;
 	hnsw_adaptive_profile.staleBypasses++;
+	hnsw_adaptive_profile.eventSequence++;
 }
 
 static int64
@@ -1915,6 +2019,16 @@ HnswAdaptiveEstimateBloomSkipRate(Oid heapOid, int64 matchingRows,
 
 static const char *
 HnswGuidanceKindName(HnswGuidanceKind kind);
+
+static char *
+HnswMetadataFragmentStoreKey(const char *filterName)
+{
+	if (hnsw_fragment_store_namespace == NULL ||
+		hnsw_fragment_store_namespace[0] == '\0')
+		return pstrdup(filterName);
+
+	return psprintf("%s%c%s", hnsw_fragment_store_namespace, 0x1f, filterName);
+}
 
 static void
 HnswMetadataEnsureFragmentStore(void)
@@ -1989,8 +2103,10 @@ HnswMetadataGetRelationVersion(Oid heapOid, int64 *epoch, Oid *relFileNode)
 	if (spiStatus != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed: %d", spiStatus);
 
-	spiStatus = SPI_execute_with_args(
-				"SELECT e.epoch, pg_catalog.pg_relation_filenode($1), "
+	if (hnsw_relation_version_plan == NULL)
+	{
+		hnsw_relation_version_plan = SPI_prepare(
+			"SELECT e.epoch, pg_catalog.pg_relation_filenode($1), "
 				"EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t "
 				"WHERE t.tgrelid = $1 "
 				"AND t.tgname = 'pgvector_hnsw_fragment_epoch' "
@@ -2014,8 +2130,16 @@ HnswMetadataGetRelationVersion(Oid heapOid, int64 *epoch, Oid *relFileNode)
 				"AND t.tgattr::text = '' "
 				"AND t.tgtype = 60) "
 				"FROM (SELECT 1) AS singleton "
-			"LEFT JOIN public.pgvector_hnsw_fragment_epoch AS e ON e.heap_oid = $1",
-			1, argTypes, values, nulls, true, 1);
+				"LEFT JOIN public.pgvector_hnsw_fragment_epoch AS e ON e.heap_oid = $1",
+			1, argTypes);
+		if (hnsw_relation_version_plan == NULL)
+			elog(ERROR, "SPI_prepare failed: %d", SPI_result);
+		if (SPI_keepplan(hnsw_relation_version_plan) != 0)
+			elog(ERROR, "SPI_keepplan failed");
+	}
+
+	spiStatus = SPI_execute_plan(hnsw_relation_version_plan,
+			values, nulls, true, 1);
 	if (spiStatus != SPI_OK_SELECT)
 		elog(ERROR, "SPI_execute_with_args failed: %d", spiStatus);
 
@@ -2331,11 +2455,12 @@ HnswMetadataLoadFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 	bool		isnull;
 	bool		loaded = false;
 	const char *kindName = HnswGuidanceKindName(kind);
+	char	   *storeKey = HnswMetadataFragmentStoreKey(filterName);
 
 	HnswMetadataEnsureFragmentStore();
 
 	values[0] = ObjectIdGetDatum(heapOid);
-	values[1] = CStringGetTextDatum(filterName);
+	values[1] = CStringGetTextDatum(storeKey);
 	values[2] = CStringGetTextDatum(kindName);
 	values[3] = Int64GetDatum(epoch);
 	values[4] = ObjectIdGetDatum(relFileNode);
@@ -2398,6 +2523,7 @@ HnswMetadataLoadFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 	}
 
 	SPI_finish();
+	pfree(storeKey);
 	if (loaded)
 	{
 		HnswMetadataStampCacheVersion(cache, tracked, epoch, relFileNode);
@@ -2406,7 +2532,7 @@ HnswMetadataLoadFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 	return loaded;
 }
 
-static void
+static double
 HnswMetadataSaveFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceKind kind, HnswMetadataCacheEntry *cache)
 {
 	int			spiStatus;
@@ -2420,6 +2546,9 @@ HnswMetadataSaveFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 	int64		pages = 0;
 	int64		bloomBitCount = 0;
 	bytea	   *payload;
+	char	   *storeKey;
+	instr_time	start;
+	instr_time	elapsed;
 
 	if (kind == HNSW_GUIDANCE_KIND_PAGE)
 	{
@@ -2437,16 +2566,18 @@ HnswMetadataSaveFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 	}
 
 	if (bits == NULL || bytes == 0)
-		return;
+		return 0;
 
+	INSTR_TIME_SET_CURRENT(start);
 	HnswMetadataEnsureFragmentStore();
+	storeKey = HnswMetadataFragmentStoreKey(filterName);
 
 	payload = (bytea *) palloc(VARHDRSZ + bytes);
 	SET_VARSIZE(payload, VARHDRSZ + bytes);
 	memcpy(VARDATA(payload), bits, bytes);
 
 	values[0] = ObjectIdGetDatum(heapOid);
-	values[1] = CStringGetTextDatum(filterName);
+	values[1] = CStringGetTextDatum(storeKey);
 	values[2] = CStringGetTextDatum(kindName);
 	values[3] = Int64GetDatum(rows);
 	values[4] = Int64GetDatum(pages);
@@ -2485,6 +2616,10 @@ HnswMetadataSaveFragmentStore(Oid heapOid, const char *filterName, HnswGuidanceK
 
 	SPI_finish();
 	pfree(payload);
+	pfree(storeKey);
+	INSTR_TIME_SET_CURRENT(elapsed);
+	INSTR_TIME_SUBTRACT(elapsed, start);
+	return INSTR_TIME_GET_MILLISEC(elapsed);
 }
 
 static HnswMetadataCacheEntry *
@@ -2877,7 +3012,8 @@ GetHnswMetadataPageCache(Oid heapOid, const char *filterName, bool buildIfMissin
 	HnswMetadataVerifyBuildVersion(heapOid, cache, tracked, epoch, relFileNode);
 	HnswMetadataStampCacheVersion(cache, tracked, epoch, relFileNode);
 	HnswMetadataTouchCache(cache);
-	HnswMetadataSaveFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_PAGE, cache);
+	cache->pageBuildMs += HnswMetadataSaveFragmentStore(
+		heapOid, filterName, HNSW_GUIDANCE_KIND_PAGE, cache);
 	if (evictIfNeeded)
 		HnswMetadataEvictIfNeeded(cache);
 	return cache;
@@ -2930,7 +3066,8 @@ GetHnswMetadataBloomCache(Oid heapOid, const char *filterName, bool buildIfMissi
 	HnswMetadataVerifyBuildVersion(heapOid, cache, tracked, epoch, relFileNode);
 	HnswMetadataStampCacheVersion(cache, tracked, epoch, relFileNode);
 	HnswMetadataTouchCache(cache);
-	HnswMetadataSaveFragmentStore(heapOid, filterName, HNSW_GUIDANCE_KIND_BLOOM, cache);
+	cache->bloomBuildMs += HnswMetadataSaveFragmentStore(
+		heapOid, filterName, HNSW_GUIDANCE_KIND_BLOOM, cache);
 	if (evictIfNeeded)
 		HnswMetadataEvictIfNeeded(cache);
 	return cache;
@@ -3306,17 +3443,19 @@ HnswGuidanceBuildComposedExactOr(HnswActiveGuidance *guidance, HnswGuidanceDescr
 	}
 }
 
-static void
+static HnswGuidanceKind
 HnswGuidanceValidateAdaptiveAtoms(Datum *filterDatums, bool *filterNulls, int filterCount)
 {
 	int		groups = 1;
 	int		atoms = 0;
 	int		lastGroup = -1;
+	bool		exactAtoms = false;
+	bool		approximateAtoms = false;
 
 	for (int i = 0; i < filterCount; i++)
 	{
 		char	   *filterName;
-		HnswGuidanceKind ignoredKind;
+		HnswGuidanceKind atomKind;
 
 		if (filterNulls[i])
 			ereport(ERROR,
@@ -3341,12 +3480,16 @@ HnswGuidanceValidateAdaptiveAtoms(Datum *filterDatums, bool *filterNulls, int fi
 					 errhint("Page and Bloom fragments are approximate supersets, so NOT would be unsafe.")));
 
 		filterName = (char *) HnswGuidanceParseAtomKind(filterName,
-				HNSW_GUIDANCE_KIND_PAGE, &ignoredKind);
-		if (ignoredKind == HNSW_GUIDANCE_KIND_EXACT)
+				HNSW_GUIDANCE_KIND_PAGE, &atomKind);
+		if (atomKind == HNSW_GUIDANCE_KIND_EXACT)
+			exactAtoms = true;
+		else
+			approximateAtoms = true;
+		if (exactAtoms && approximateAtoms)
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("adaptive HNSW guidance does not admit exact fragments"),
-					 errhint("Composed exact in-memory guidance is intentionally disabled for adaptive admission.")));
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("adaptive HNSW guidance cannot mix exact and approximate atoms"),
+					 errhint("Prefix every atom with exact: when exact admission is required.")));
 
 		/* This validates the row-local predicate without constructing a payload. */
 		(void) HnswMetadataPredicateSql(filterName);
@@ -3358,6 +3501,114 @@ HnswGuidanceValidateAdaptiveAtoms(Datum *filterDatums, bool *filterNulls, int fi
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("empty HNSW guidance OR group")));
+
+	return exactAtoms ? HNSW_GUIDANCE_KIND_EXACT : HNSW_GUIDANCE_KIND_PAGE;
+}
+
+static bool
+HnswGuidanceAdaptivePreflight(Oid heapOid, Datum *filterDatums, bool *filterNulls,
+								 int filterCount, HnswGuidanceDescriptorEntry *descriptor,
+								 HnswGuidanceKind stage, int64 *estimatedFragmentBytes,
+								 double *estimatedScore)
+{
+	int64		fragmentBytes = 0;
+	int64		mostSelectiveRows = 0;
+	int			atoms = 0;
+
+	*estimatedFragmentBytes = 0;
+	*estimatedScore = 0;
+
+	if (stage == HNSW_GUIDANCE_KIND_PAGE)
+	{
+		Relation	heapRel = table_open(heapOid, AccessShareLock);
+		BlockNumber blocks = RelationGetNumberOfBlocks(heapRel);
+		int64		perAtomBytes = 0;
+
+		table_close(heapRel, AccessShareLock);
+		if (blocks > 0)
+		{
+			uint64		lastByte = ((uint64) blocks - 1) / 8;
+			uint64		allocatedBytes = 1024;
+
+			while (lastByte >= allocatedBytes)
+				allocatedBytes *= 2;
+			perAtomBytes = (int64) allocatedBytes;
+		}
+
+		for (int i = 0; i < filterCount; i++)
+		{
+			char	   *filterName;
+
+			if (filterNulls[i])
+				continue;
+			filterName = text_to_cstring(DatumGetTextPP(filterDatums[i]));
+			if (strcmp(filterName, "|") == 0 || pg_strcasecmp(filterName, "OR") == 0)
+				continue;
+			atoms++;
+		}
+		fragmentBytes = perAtomBytes * atoms;
+	}
+	else
+	{
+		Assert(stage == HNSW_GUIDANCE_KIND_BLOOM);
+		for (int i = 0; i < filterCount; i++)
+		{
+			char	   *filterName;
+			HnswGuidanceKind ignoredKind;
+			HnswMetadataCacheEntry *pageCache;
+			bool		cacheHit = false;
+			bool		storeHit = false;
+			uint64		bloomBits;
+
+			if (filterNulls[i])
+				continue;
+			filterName = text_to_cstring(DatumGetTextPP(filterDatums[i]));
+			if (strcmp(filterName, "|") == 0 || pg_strcasecmp(filterName, "OR") == 0)
+				continue;
+			filterName = (char *) HnswGuidanceParseAtomKind(filterName,
+					HNSW_GUIDANCE_KIND_PAGE, &ignoredKind);
+			pageCache = GetHnswMetadataPageCache(heapOid, filterName, true, false,
+												 &cacheHit, &storeHit);
+			bloomBits = Max((uint64) 1024, (uint64) pageCache->pageRows * 10);
+			fragmentBytes += (int64) ((bloomBits + 7) / 8);
+			if (mostSelectiveRows == 0 || pageCache->pageRows < mostSelectiveRows)
+				mostSelectiveRows = pageCache->pageRows;
+			atoms++;
+		}
+
+		if (fragmentBytes > 0)
+		{
+			double		averageProbeHeapFetchMs = descriptor->adaptiveCycleProbes > 0 ?
+				descriptor->adaptiveProbeHeapFetchMs / descriptor->adaptiveCycleProbes : 0;
+			double		averageProbeTotalMs = descriptor->adaptiveCycleProbes > 0 ?
+				descriptor->adaptiveProbeTotalMs / descriptor->adaptiveCycleProbes : 0;
+			double		estimatedSkipRate = HnswAdaptiveEstimateBloomSkipRate(heapOid,
+				mostSelectiveRows, descriptor->adaptivePageSkipRate);
+
+			*estimatedScore =
+				(averageProbeHeapFetchMs > 0 ? averageProbeHeapFetchMs : averageProbeTotalMs) *
+				estimatedSkipRate / fragmentBytes;
+		}
+	}
+
+	*estimatedFragmentBytes = fragmentBytes;
+	if (atoms == 0 || fragmentBytes <= 0 ||
+		fragmentBytes > HnswAdaptiveFragmentLimitBytes() ||
+		(stage == HNSW_GUIDANCE_KIND_BLOOM &&
+		 (*estimatedScore <= 0 || *estimatedScore < hnsw_d3_min_benefit_per_byte)))
+	{
+		hnsw_adaptive_profile.rejections++;
+		hnsw_adaptive_profile.eventSequence++;
+		descriptor->adaptiveBytes = fragmentBytes;
+		descriptor->adaptiveBenefitPerByte = *estimatedScore;
+		descriptor->adaptiveState = stage == HNSW_GUIDANCE_KIND_PAGE ?
+			HNSW_ADAPTIVE_REJECTED : HNSW_ADAPTIVE_PAGE;
+		descriptor->adaptiveRefinePending = false;
+		hnsw_last_adaptive_descriptor = descriptor;
+		return false;
+	}
+
+	return true;
 }
 
 static int
@@ -3373,8 +3624,21 @@ HnswGuidanceActivateAdaptive(Oid indexOid, Oid heapOid, Datum *filterDatums, boo
 	Oid			finalRelationRelFileNode;
 	int64		fragmentBytes = 0;
 	int64		mostSelectiveRows = 0;
+	int64		estimatedFragmentBytes = 0;
+	double		preflightScore = 0;
+	bool		refinement = stage == HNSW_GUIDANCE_KIND_BLOOM &&
+		descriptor->adaptiveState == HNSW_ADAPTIVE_PAGE &&
+		descriptor->adaptiveRefinePending;
+	bool		reactivation = descriptor->adaptiveAdmissions > 0 && !refinement &&
+		((stage == HNSW_GUIDANCE_KIND_EXACT &&
+		  descriptor->adaptiveState == HNSW_ADAPTIVE_EXACT) ||
+		 (stage == HNSW_GUIDANCE_KIND_PAGE &&
+		  descriptor->adaptiveState == HNSW_ADAPTIVE_PAGE) ||
+		 (stage == HNSW_GUIDANCE_KIND_BLOOM &&
+		  descriptor->adaptiveState == HNSW_ADAPTIVE_BLOOM));
 
-	Assert(stage == HNSW_GUIDANCE_KIND_PAGE || stage == HNSW_GUIDANCE_KIND_BLOOM);
+	Assert(stage == HNSW_GUIDANCE_KIND_PAGE || stage == HNSW_GUIDANCE_KIND_BLOOM ||
+		stage == HNSW_GUIDANCE_KIND_EXACT);
 	MemSet(&nextGuidance, 0, sizeof(nextGuidance));
 	nextGuidance.kind = stage;
 	nextGuidance.indexOid = indexOid;
@@ -3388,6 +3652,10 @@ HnswGuidanceActivateAdaptive(Oid indexOid, Oid heapOid, Datum *filterDatums, boo
 	nextGuidance.relationRelFileNode = relationRelFileNode;
 	nextGuidance.adaptive = true;
 	nextGuidance.adaptiveDescriptor = descriptor;
+	if (stage != HNSW_GUIDANCE_KIND_EXACT &&
+		!HnswGuidanceAdaptivePreflight(heapOid, filterDatums, filterNulls,
+			filterCount, descriptor, stage, &estimatedFragmentBytes, &preflightScore))
+		return 0;
 
 	for (int i = 0; i < filterCount; i++)
 	{
@@ -3407,9 +3675,12 @@ HnswGuidanceActivateAdaptive(Oid indexOid, Oid heapOid, Datum *filterDatums, boo
 
 		filterName = (char *) HnswGuidanceParseAtomKind(filterName,
 				HNSW_GUIDANCE_KIND_PAGE, &ignoredKind);
-		if (stage == HNSW_GUIDANCE_KIND_PAGE)
+		if (stage == HNSW_GUIDANCE_KIND_EXACT)
+			cache = GetHnswMetadataCache(heapOid, filterName, true, false,
+									 &cacheHit, &storeHit);
+		else if (stage == HNSW_GUIDANCE_KIND_PAGE)
 			cache = GetHnswMetadataPageCache(heapOid, filterName, true, false,
-											 &cacheHit, &storeHit);
+										 &cacheHit, &storeHit);
 		else
 			cache = GetHnswMetadataBloomCache(heapOid, filterName, true, false,
 											  &cacheHit, &storeHit);
@@ -3428,24 +3699,40 @@ HnswGuidanceActivateAdaptive(Oid indexOid, Oid heapOid, Datum *filterDatums, boo
 		if (stage == HNSW_GUIDANCE_KIND_BLOOM &&
 			(mostSelectiveRows == 0 || cache->bloomRows < mostSelectiveRows))
 			mostSelectiveRows = cache->bloomRows;
-		nextGuidance.lastCacheRows += stage == HNSW_GUIDANCE_KIND_PAGE ?
-			cache->pageRows : cache->bloomRows;
+		nextGuidance.lastCacheRows += stage == HNSW_GUIDANCE_KIND_EXACT ?
+			cache->rows : (stage == HNSW_GUIDANCE_KIND_PAGE ? cache->pageRows : cache->bloomRows);
 		if (stage == HNSW_GUIDANCE_KIND_PAGE)
 			nextGuidance.lastCachePages += cache->pages;
 		nextGuidance.lastCacheMemoryBytes += HnswMetadataCacheMemoryBytes(cache, stage);
 		nextGuidance.lastBuildMs += (cacheHit || storeHit) ? 0 :
-			(stage == HNSW_GUIDANCE_KIND_PAGE ? cache->pageBuildMs : cache->bloomBuildMs);
-		if (cacheHit)
-			nextGuidance.fragmentCacheHits++;
+			(stage == HNSW_GUIDANCE_KIND_EXACT ? cache->buildMs :
+			 (stage == HNSW_GUIDANCE_KIND_PAGE ? cache->pageBuildMs : cache->bloomBuildMs));
+			if (cacheHit)
+			{
+				nextGuidance.fragmentCacheHits++;
+				hnsw_adaptive_profile.fragmentCacheHits++;
+				hnsw_adaptive_profile.eventSequence++;
+		}
 		else
 		{
 			nextGuidance.fragmentCacheMisses++;
-			if (storeHit)
-				nextGuidance.fragmentStoreHits++;
+				if (storeHit)
+				{
+					nextGuidance.fragmentStoreHits++;
+					hnsw_adaptive_profile.fragmentStoreHits++;
+					hnsw_adaptive_profile.eventSequence++;
+			}
 			else
 			{
-				nextGuidance.fragmentBuilds++;
-				if (stage == HNSW_GUIDANCE_KIND_PAGE)
+					nextGuidance.fragmentBuilds++;
+					hnsw_adaptive_profile.fragmentBuilds++;
+					hnsw_adaptive_profile.fragmentBuildMs +=
+						stage == HNSW_GUIDANCE_KIND_EXACT ? cache->buildMs :
+						(stage == HNSW_GUIDANCE_KIND_PAGE ? cache->pageBuildMs : cache->bloomBuildMs);
+					hnsw_adaptive_profile.eventSequence++;
+				if (stage == HNSW_GUIDANCE_KIND_EXACT)
+					hnsw_adaptive_profile.exactBuilds++;
+				else if (stage == HNSW_GUIDANCE_KIND_PAGE)
 					hnsw_adaptive_profile.pageBuilds++;
 				else
 					hnsw_adaptive_profile.bloomBuilds++;
@@ -3456,9 +3743,12 @@ HnswGuidanceActivateAdaptive(Oid indexOid, Oid heapOid, Datum *filterDatums, boo
 	if (fragmentBytes <= 0 || fragmentBytes > HnswAdaptiveFragmentLimitBytes())
 	{
 		hnsw_adaptive_profile.rejections++;
+		hnsw_adaptive_profile.eventSequence++;
 		descriptor->adaptiveBytes = fragmentBytes;
-		if (stage == HNSW_GUIDANCE_KIND_PAGE)
-			descriptor->adaptiveState = HNSW_ADAPTIVE_PROBING;
+		if (stage == HNSW_GUIDANCE_KIND_EXACT)
+			descriptor->adaptiveState = HNSW_ADAPTIVE_REJECTED;
+		else if (stage == HNSW_GUIDANCE_KIND_PAGE)
+			descriptor->adaptiveState = HNSW_ADAPTIVE_REJECTED;
 		else
 			descriptor->adaptiveState = HNSW_ADAPTIVE_PAGE;
 		descriptor->adaptiveRefinePending = false;
@@ -3481,17 +3771,18 @@ HnswGuidanceActivateAdaptive(Oid indexOid, Oid heapOid, Datum *filterDatums, boo
 		if (estimatedScore <= 0 || estimatedScore < hnsw_d3_min_benefit_per_byte)
 		{
 			hnsw_adaptive_profile.rejections++;
+			hnsw_adaptive_profile.eventSequence++;
 			descriptor->adaptiveState = HNSW_ADAPTIVE_PAGE;
 			descriptor->adaptiveRefinePending = false;
 			descriptor->adaptiveBenefitPerByte = estimatedScore;
 			hnsw_last_adaptive_descriptor = descriptor;
 			return 0;
 		}
-		descriptor->adaptiveBenefitPerByte = estimatedScore;
+		descriptor->adaptiveBenefitPerByte = preflightScore;
 	}
 	else
 	{
-		/* The first page fragment is the explicitly documented score-free probe
+		/* The first page or explicitly requested exact fragment is the documented score-free probe
 		 * exception. It is still gated by repeated requests and the size cap. */
 		descriptor->adaptiveBenefitPerByte = 0;
 	}
@@ -3506,17 +3797,32 @@ HnswGuidanceActivateAdaptive(Oid indexOid, Oid heapOid, Datum *filterDatums, boo
 				 errmsg("relation changed while adaptive HNSW guidance was being activated"),
 				 errhint("Retry vector_hnsw_guidance_activate().")));
 
-	descriptor->adaptiveState = stage == HNSW_GUIDANCE_KIND_PAGE ?
-		HNSW_ADAPTIVE_PAGE : HNSW_ADAPTIVE_BLOOM;
+	descriptor->adaptiveState = stage == HNSW_GUIDANCE_KIND_EXACT ?
+		HNSW_ADAPTIVE_EXACT : (stage == HNSW_GUIDANCE_KIND_PAGE ?
+		HNSW_ADAPTIVE_PAGE : HNSW_ADAPTIVE_BLOOM);
 	descriptor->adaptiveRefinePending = false;
 	descriptor->adaptiveBytes = fragmentBytes;
-	descriptor->adaptiveAdmissions++;
 	HnswGuidancePersistPredicate(&nextGuidance, predicate);
 	nextGuidance.generation = HnswGuidanceNextGeneration();
 	nextGuidance.active = true;
 	hnsw_active_guidance = nextGuidance;
 	hnsw_last_adaptive_descriptor = descriptor;
-	hnsw_adaptive_profile.admissions++;
+	if (refinement)
+	{
+		hnsw_adaptive_profile.refinements++;
+		hnsw_adaptive_profile.eventSequence++;
+	}
+	if (reactivation)
+	{
+		hnsw_active_guidance.fastReactivationHits++;
+		hnsw_adaptive_profile.fastReactivationHits++;
+	}
+	else
+	{
+		descriptor->adaptiveAdmissions++;
+		hnsw_adaptive_profile.admissions++;
+	}
+	hnsw_adaptive_profile.eventSequence++;
 	hnsw_adaptive_profile.bytes = fragmentBytes;
 	hnsw_adaptive_profile.score = descriptor->adaptiveBenefitPerByte;
 	HnswMetadataEvictIfNeeded(NULL);
@@ -3860,11 +4166,239 @@ HnswGuidanceStructuralSubset(List *predicateClauses, List *actualClauses)
 	return true;
 }
 
+static Node *
+HnswGuidanceStripRelabel(Node *node)
+{
+	while (node != NULL && (IsA(node, RelabelType) || IsA(node, CoerceViaIO)))
+	{
+		if (IsA(node, RelabelType))
+			node = (Node *) ((RelabelType *) node)->arg;
+		else
+			node = (Node *) ((CoerceViaIO *) node)->arg;
+	}
+
+	return node;
+}
+
+static bool
+HnswGuidanceInt4ArrayConst(Node *node, int32 **values, int *count)
+{
+	Const	   *constant;
+	ArrayType  *array;
+	Datum	   *datums;
+	bool	   *nulls;
+	int			items;
+	int32	   *result;
+
+	node = HnswGuidanceStripRelabel(node);
+	if (node == NULL || !IsA(node, Const))
+		return false;
+	constant = (Const *) node;
+	if (constant->constisnull || constant->consttype != INT4ARRAYOID)
+		return false;
+
+	array = DatumGetArrayTypeP(constant->constvalue);
+	if (ARR_ELEMTYPE(array) != INT4OID)
+		return false;
+	deconstruct_array(array, INT4OID, sizeof(int32), true, TYPALIGN_INT,
+					  &datums, &nulls, &items);
+	if (items <= 0)
+		return false;
+
+	result = (int32 *) palloc(sizeof(int32) * items);
+	for (int i = 0; i < items; i++)
+	{
+		if (nulls[i])
+			return false;
+		result[i] = DatumGetInt32(datums[i]);
+	}
+
+	*values = result;
+	*count = items;
+	return true;
+}
+
+static bool
+HnswGuidanceInt4ArrayOperator(Node *node, Oid functionOid,
+							  Node **left, int32 **values, int *count)
+{
+	OpExpr	   *operator;
+	Node	   *leftArg;
+	Node	   *rightArg;
+
+	node = HnswGuidanceStripRelabel(node);
+	if (node == NULL || !IsA(node, OpExpr))
+		return false;
+	operator = (OpExpr *) node;
+	if (list_length(operator->args) != 2 ||
+		get_opcode(operator->opno) != functionOid)
+		return false;
+
+	leftArg = HnswGuidanceStripRelabel((Node *) linitial(operator->args));
+	rightArg = HnswGuidanceStripRelabel((Node *) lsecond(operator->args));
+	if (leftArg == NULL || !IsA(leftArg, Var) ||
+		exprType(leftArg) != INT4ARRAYOID ||
+		!HnswGuidanceInt4ArrayConst(rightArg, values, count))
+		return false;
+
+	*left = leftArg;
+	return true;
+}
+
+static bool
+HnswGuidanceSameTargetVar(Node *left, Node *right)
+{
+	Var		   *leftVar;
+	Var		   *rightVar;
+
+	left = HnswGuidanceStripRelabel(left);
+	right = HnswGuidanceStripRelabel(right);
+	if (left == NULL || right == NULL || !IsA(left, Var) || !IsA(right, Var))
+		return false;
+	leftVar = (Var *) left;
+	rightVar = (Var *) right;
+
+	/*
+	 * varnosyn/varattnosyn may differ between a cached generic plan and the
+	 * independently parsed metadata predicate.  NormalizeQual has already
+	 * established that both Vars belong to this scan's sole target relation,
+	 * so semantic column identity is the physical attribute and its type.
+	 */
+	return leftVar->varno == 1 && rightVar->varno == 1 &&
+		leftVar->varlevelsup == 0 && rightVar->varlevelsup == 0 &&
+		bms_is_empty(leftVar->varnullingrels) &&
+		bms_is_empty(rightVar->varnullingrels) &&
+		leftVar->varattno == rightVar->varattno &&
+		leftVar->vartype == rightVar->vartype &&
+		leftVar->vartypmod == rightVar->vartypmod &&
+		leftVar->varcollid == rightVar->varcollid;
+}
+
+static bool
+HnswGuidanceCollectInt4ContainmentAtoms(Node *node, Node **left,
+										int32 **values, int *count, int capacity)
+{
+	node = HnswGuidanceStripRelabel(node);
+	if (node != NULL && IsA(node, BoolExpr) &&
+		((BoolExpr *) node)->boolop == OR_EXPR)
+	{
+		ListCell   *cell;
+
+		foreach(cell, ((BoolExpr *) node)->args)
+		{
+			if (!HnswGuidanceCollectInt4ContainmentAtoms((Node *) lfirst(cell),
+												 left, values, count, capacity))
+				return false;
+		}
+		return true;
+	}
+	else
+	{
+		Node	   *atomLeft;
+		int32	   *atomValues;
+		int			atomCount;
+
+		if (!HnswGuidanceInt4ArrayOperator(node, F_ARRAYCONTAINS,
+										&atomLeft, &atomValues, &atomCount) ||
+			atomCount != 1 || *count >= capacity)
+			return false;
+		if (*left == NULL)
+			*left = atomLeft;
+		else if (!HnswGuidanceSameTargetVar(*left, atomLeft))
+			return false;
+		(*values)[(*count)++] = atomValues[0];
+		return true;
+	}
+}
+
+static bool
+HnswGuidanceSameInt4Set(const int32 *left, int leftCount,
+						const int32 *right, int rightCount)
+{
+	for (int i = 0; i < leftCount; i++)
+	{
+		bool		found = false;
+
+		for (int j = 0; j < rightCount; j++)
+		{
+			if (left[i] == right[j])
+			{
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			return false;
+	}
+	for (int i = 0; i < rightCount; i++)
+	{
+		bool		found = false;
+
+		for (int j = 0; j < leftCount; j++)
+		{
+			if (right[i] == left[j])
+			{
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * PostgreSQL's generic implication prover does not recognize the exact
+ * int4[] identity
+ *
+ *     column && ARRAY[a,b]  <=>
+ *     column @> ARRAY[a] OR column @> ARRAY[b].
+ *
+ * Accept only that closed form: one target Var, immutable built-in array
+ * operators, non-null constants, singleton containment atoms, and identical
+ * value sets.  Anything less specific continues to fail open to stock HNSW.
+ */
+static bool
+HnswGuidanceInt4OverlapEquivalent(List *predicateClauses, List *actualClauses)
+{
+	Node	   *guideLeft = NULL;
+	Node	   *actualLeft;
+	int32	   *guideValues;
+	int			guideCount = 0;
+	ListCell   *cell;
+
+	if (list_length(predicateClauses) != 1)
+		return false;
+	guideValues = (int32 *) palloc(sizeof(int32) * HNSW_GUIDANCE_MAX_ATOMS);
+	if (!HnswGuidanceCollectInt4ContainmentAtoms(
+			(Node *) linitial(predicateClauses), &guideLeft,
+			&guideValues, &guideCount, HNSW_GUIDANCE_MAX_ATOMS) ||
+		guideCount <= 0)
+		return false;
+
+	foreach(cell, actualClauses)
+	{
+		int32	   *actualValues;
+		int			actualCount;
+
+		if (HnswGuidanceInt4ArrayOperator((Node *) lfirst(cell), F_ARRAYOVERLAP,
+										 &actualLeft, &actualValues, &actualCount) &&
+			HnswGuidanceSameTargetVar(guideLeft, actualLeft) &&
+			HnswGuidanceSameInt4Set(guideValues, guideCount,
+								 actualValues, actualCount))
+			return true;
+	}
+
+	return false;
+}
+
 static bool
 HnswGuidanceEstimateSkipRate(HnswActiveGuidance *guide, double totalRows,
-							 double *skipRate)
+								 double *skipRate)
 {
 	double		matchingUpperBound = 0;
+	double		heapBlocks = 0;
 
 	if (guide == NULL || skipRate == NULL || totalRows <= 0 ||
 		guide->atoms <= 0 || guide->groups <= 0)
@@ -3892,7 +4426,7 @@ HnswGuidanceEstimateSkipRate(HnswActiveGuidance *guide, double totalRows,
 					return false;
 				if (atom->kind == HNSW_GUIDANCE_KIND_EXACT)
 					atomUpperBound = atom->cache->rows;
-				else if (atom->kind == HNSW_GUIDANCE_KIND_BLOOM &&
+					else if (atom->kind == HNSW_GUIDANCE_KIND_BLOOM &&
 						 atom->cache->bloomBits != NULL &&
 						 atom->cache->bloomBitCount > 0)
 				{
@@ -3904,11 +4438,29 @@ HnswGuidanceEstimateSkipRate(HnswActiveGuidance *guide, double totalRows,
 						(double) atom->cache->bloomBitCount);
 					double		falsePositiveRate = pow(fill, 7.0);
 
-					atomUpperBound = items +
-						(totalRows - items) * falsePositiveRate;
-				}
-				else
-					return false;
+						atomUpperBound = items +
+							(totalRows - items) * falsePositiveRate;
+					}
+					else if (atom->kind == HNSW_GUIDANCE_KIND_PAGE &&
+							 atom->cache->pageBits != NULL)
+					{
+						if (heapBlocks <= 0)
+						{
+							Relation	heapRel = table_open(guide->heapOid, AccessShareLock);
+
+							heapBlocks = RelationGetNumberOfBlocks(heapRel);
+							table_close(heapRel, AccessShareLock);
+						}
+						if (heapBlocks <= 0)
+							return false;
+						/* Page occupancy is a performance estimate, never a
+						 * correctness decision: the page bitmap itself has no
+						 * false negatives and residual SQL quals remain active. */
+						atomUpperBound = totalRows * Min(1.0,
+							(double) atom->cache->pages / heapBlocks);
+					}
+					else
+						return false;
 				groupHasAtom = true;
 				groupUpperBound = Min(groupUpperBound,
 										 atomUpperBound);
@@ -4088,9 +4640,17 @@ HnswGuidancePrepareForScan(IndexScanDesc scan, void *planBinding,
 	if (actualClauses == NIL)
 		return HnswGuidanceProofFailure(scan, binding, proof, HNSW_PROOF_BYPASS_NO_ACTUAL_QUALS);
 	predicateClauses = make_ands_implicit((Expr *) copyObject(hnsw_active_guidance.predicateExpr));
-	implied = predicate_implied_by(predicateClauses, actualClauses, false);
+	/*
+	 * Exact workload atoms normally survive planning as clauses already present
+	 * in the scan qual.  Check that sound structural subset first; the generic
+	 * implication prover remains the fallback for equivalent range forms and
+	 * other planner rewrites.
+	 */
+	implied = HnswGuidanceStructuralSubset(predicateClauses, actualClauses);
 	if (!implied)
-		implied = HnswGuidanceStructuralSubset(predicateClauses, actualClauses);
+		implied = predicate_implied_by(predicateClauses, actualClauses, false);
+	if (!implied)
+		implied = HnswGuidanceInt4OverlapEquivalent(predicateClauses, actualClauses);
 	if (!implied)
 		return HnswGuidanceProofFailure(scan, binding, proof, HNSW_PROOF_BYPASS_PREDICATE_NOT_IMPLIED);
 	/*
@@ -4153,6 +4713,22 @@ HnswGuidanceGetEstimatedSkipRate(HnswScanGuidance *guidance, double *skipRate)
 
 	*skipRate = guidance->estimatedSkipRate;
 	return true;
+}
+
+bool
+HnswGuidanceRequiresIterativeScan(HnswScanGuidance *guidance)
+{
+	HnswActiveGuidance *snapshot;
+
+	if (!HnswGuidanceIsActiveForScan(guidance))
+		return false;
+	snapshot = &guidance->guide;
+	for (int i = 0; i < snapshot->atoms; i++)
+	{
+		if (snapshot->atom[i].kind == HNSW_GUIDANCE_KIND_PAGE)
+			return true;
+	}
+	return false;
 }
 
 bool
@@ -4244,6 +4820,7 @@ HnswGuidanceRecordScan(Oid heapOid, int64 candidates, int64 guidanceChecks,
 		descriptor->adaptiveProbeHeapFetchMs += heapFetchMs;
 		descriptor->adaptiveProbeTotalMs += totalScanMs;
 		hnsw_adaptive_profile.probes++;
+		hnsw_adaptive_profile.eventSequence++;
 		hnsw_last_adaptive_descriptor = descriptor;
 		MemSet(&hnsw_adaptive_probe, 0, sizeof(hnsw_adaptive_probe));
 		return;
@@ -4344,6 +4921,10 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 	Oid			relationRelFileNode;
 	Oid			finalRelationRelFileNode;
 	Expr	   *guidancePredicate;
+	uint32		signatureBytes;
+	uint64		signatureHash1;
+	uint64		signatureHash2;
+	HnswGuidanceKind adaptiveTargetKind = HNSW_GUIDANCE_KIND_PAGE;
 
 	deconstruct_array(filterArray, TEXTOID, -1, false, 'i', &filterDatums, &filterNulls, &filterCount);
 	if (filterCount < 1)
@@ -4351,9 +4932,6 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("at least one guidance atom is required")));
 
-	/* A failed replacement must leave guidance disabled, never pointing at a
-	 * cache entry that stale-version handling may free below. */
-	HnswGuidanceDeactivate();
 	initStringInfo(&signature);
 	appendStringInfo(&signature, "kind=%s", adaptive ? "adaptive" : HnswGuidanceKindName(kind));
 	for (int i = 0; i < filterCount; i++)
@@ -4367,8 +4945,29 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 		rawName = text_to_cstring(DatumGetTextPP(filterDatums[i]));
 		appendStringInfo(&signature, "|%s", rawName);
 	}
-	guidancePredicate = HnswGuidanceBuildPredicate(heapOid, filterDatums,
-												 filterNulls, filterCount, kind);
+	signatureBytes = signature.len;
+	signatureHash1 = hash_any_extended((const unsigned char *) signature.data,
+									 signature.len, UINT64CONST(0x534c656e735f4433));
+	signatureHash2 = hash_any_extended((const unsigned char *) signature.data,
+									 signature.len, UINT64CONST(0xa91763f24b08d5ce));
+	/* Repeated prepared predicates are the common hot path. Reuse is permitted
+	 * only while the complete guide identity matches. Relation version checking
+	 * is deliberately deferred to HnswGuidanceBeginScan, where it runs under the
+	 * actual query snapshot; a stale guide is deactivated and fails open to stock
+	 * HNSW before it can affect candidate admission. */
+	if (!adaptive &&
+		hnsw_active_guidance.active &&
+		hnsw_active_guidance.indexOid == indexOid &&
+		hnsw_active_guidance.heapOid == heapOid &&
+		hnsw_active_guidance.kind == kind &&
+		hnsw_active_guidance.signatureBytes == signatureBytes &&
+		hnsw_active_guidance.signatureHash1 == signatureHash1 &&
+		hnsw_active_guidance.signatureHash2 == signatureHash2)
+	{
+		hnsw_active_guidance.fastReactivationHits++;
+		PG_RETURN_INT32(hnsw_active_guidance.atoms);
+	}
+
 	HnswMetadataCurrentCacheVersion(heapOid, &epochTracked, &relationEpoch, &relationRelFileNode);
 	if (!epochTracked)
 		ereport(ERROR,
@@ -4381,11 +4980,9 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 	InitHnswGuidanceDescriptors();
 	MemSet(&descriptorKey, 0, sizeof(descriptorKey));
 	descriptorKey.heapOid = heapOid;
-	descriptorKey.signatureBytes = signature.len;
-	descriptorKey.signatureHash1 = hash_any_extended((const unsigned char *) signature.data,
-											 signature.len, UINT64CONST(0x534c656e735f4433));
-	descriptorKey.signatureHash2 = hash_any_extended((const unsigned char *) signature.data,
-											 signature.len, UINT64CONST(0xa91763f24b08d5ce));
+	descriptorKey.signatureBytes = signatureBytes;
+	descriptorKey.signatureHash1 = signatureHash1;
+	descriptorKey.signatureHash2 = signatureHash2;
 	descriptor = (HnswGuidanceDescriptorEntry *) hash_search(hnsw_guidance_descriptors, &descriptorKey, HASH_ENTER, &descriptorFound);
 	if (!descriptorFound)
 	{
@@ -4400,7 +4997,8 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 
 	if (adaptive)
 	{
-		HnswGuidanceValidateAdaptiveAtoms(filterDatums, filterNulls, filterCount);
+		adaptiveTargetKind = HnswGuidanceValidateAdaptiveAtoms(filterDatums, filterNulls, filterCount);
+		descriptor->adaptiveTargetKind = adaptiveTargetKind;
 		hnsw_adaptive_profile.requests++;
 		descriptor->adaptiveRequests++;
 		if (!HnswAdaptiveDescriptorVersionMatches(descriptor, epochTracked,
@@ -4414,8 +5012,40 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 
 		descriptor->adaptiveCycleRequests++;
 		hnsw_last_adaptive_descriptor = descriptor;
+		if (descriptor->adaptiveState == HNSW_ADAPTIVE_REJECTED)
+		{
+			/* A conservative admission rejection is sticky for the current
+			 * relation epoch. Rebuilding the same oversized or unprofitable
+			 * fragment every probe cycle only adds latency and memory churn. */
+			HnswGuidanceDeactivate();
+			PG_RETURN_INT32(0);
+		}
+		if ((descriptor->adaptiveState == HNSW_ADAPTIVE_PAGE ||
+			 descriptor->adaptiveState == HNSW_ADAPTIVE_BLOOM ||
+			 descriptor->adaptiveState == HNSW_ADAPTIVE_EXACT) &&
+			!descriptor->adaptiveRefinePending &&
+			hnsw_active_guidance.active && hnsw_active_guidance.adaptive &&
+			hnsw_active_guidance.adaptiveDescriptor == descriptor &&
+			hnsw_active_guidance.indexOid == indexOid &&
+			hnsw_active_guidance.heapOid == heapOid &&
+			hnsw_active_guidance.signatureBytes == signatureBytes &&
+			hnsw_active_guidance.signatureHash1 == signatureHash1 &&
+			hnsw_active_guidance.signatureHash2 == signatureHash2 &&
+			HnswAdaptiveDescriptorVersionMatches(descriptor, epochTracked,
+				relationEpoch, relationRelFileNode))
+			{
+				/* Keep the predicate expression and active cache references intact on
+			 * the hot path. The scan-snapshot gate still revalidates relation epoch
+			 * and relfilenode before the guide can suppress any TID. */
+				hnsw_active_guidance.fastReactivationHits++;
+				hnsw_adaptive_profile.fastReactivationHits++;
+				hnsw_adaptive_profile.eventSequence++;
+				PG_RETURN_INT32(hnsw_active_guidance.atoms);
+		}
 		if (descriptor->adaptiveCycleRequests <= hnsw_d3_probe_requests)
 		{
+			/* A probe must not accidentally retain a different predicate's guide. */
+			HnswGuidanceDeactivate();
 			hnsw_adaptive_probe.descriptor = descriptor;
 			hnsw_adaptive_probe.heapOid = heapOid;
 			hnsw_adaptive_probe.epochTracked = epochTracked;
@@ -4423,27 +5053,37 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 			hnsw_adaptive_probe.relFileNode = relationRelFileNode;
 			PG_RETURN_INT32(0);
 		}
+	}
 
+	/* A failed replacement must leave guidance disabled, never pointing at a
+	 * cache entry that stale-version handling may free below. */
+	HnswGuidanceDeactivate();
+	guidancePredicate = HnswGuidanceBuildPredicate(heapOid, filterDatums,
+											 filterNulls, filterCount, kind);
+
+	if (adaptive)
+	{
 		if (descriptor->adaptiveState == HNSW_ADAPTIVE_PROBING)
 			PG_RETURN_INT32(HnswGuidanceActivateAdaptive(indexOid, heapOid, filterDatums,
-				filterNulls, filterCount, descriptor, HNSW_GUIDANCE_KIND_PAGE,
+				filterNulls, filterCount, descriptor, descriptor->adaptiveTargetKind,
 				epochTracked, relationEpoch, relationRelFileNode, guidancePredicate));
 
 		if (descriptor->adaptiveState == HNSW_ADAPTIVE_PAGE &&
 			descriptor->adaptiveRefinePending)
 		{
-			hnsw_adaptive_profile.refinements++;
 			PG_RETURN_INT32(HnswGuidanceActivateAdaptive(indexOid, heapOid, filterDatums,
 				filterNulls, filterCount, descriptor, HNSW_GUIDANCE_KIND_BLOOM,
 				epochTracked, relationEpoch, relationRelFileNode, guidancePredicate));
 		}
 
 		if (descriptor->adaptiveState == HNSW_ADAPTIVE_PAGE ||
-			descriptor->adaptiveState == HNSW_ADAPTIVE_BLOOM)
+			descriptor->adaptiveState == HNSW_ADAPTIVE_BLOOM ||
+			descriptor->adaptiveState == HNSW_ADAPTIVE_EXACT)
 			PG_RETURN_INT32(HnswGuidanceActivateAdaptive(indexOid, heapOid, filterDatums,
 				filterNulls, filterCount, descriptor,
-				descriptor->adaptiveState == HNSW_ADAPTIVE_PAGE ?
-				HNSW_GUIDANCE_KIND_PAGE : HNSW_GUIDANCE_KIND_BLOOM,
+				descriptor->adaptiveState == HNSW_ADAPTIVE_EXACT ?
+				HNSW_GUIDANCE_KIND_EXACT : (descriptor->adaptiveState == HNSW_ADAPTIVE_PAGE ?
+				HNSW_GUIDANCE_KIND_PAGE : HNSW_GUIDANCE_KIND_BLOOM),
 				epochTracked, relationEpoch, relationRelFileNode, guidancePredicate));
 
 		/* STALE is observable until the next request starts its probe cycle. */
@@ -4774,6 +5414,7 @@ vector_hnsw_guidance_profile(PG_FUNCTION_ARGS)
 						 "\"composed_guide_hit\":%s,"
 						 "\"composed_guide_hits\":" INT64_FORMAT ","
 						 "\"composed_guide_misses\":" INT64_FORMAT ","
+						 "\"fast_reactivation_hits\":" INT64_FORMAT ","
 						 "\"composed_exact_active\":%s,"
 						 "\"composed_exact_hit\":%s,"
 						 "\"composed_exact_rows\":" INT64_FORMAT ","
@@ -4786,14 +5427,21 @@ vector_hnsw_guidance_profile(PG_FUNCTION_ARGS)
 						 "\"adaptive_rejections\":" INT64_FORMAT ","
 						 "\"adaptive_page_builds\":" INT64_FORMAT ","
 						 "\"adaptive_bloom_builds\":" INT64_FORMAT ","
+						 "\"adaptive_exact_builds\":" INT64_FORMAT ","
 						 "\"adaptive_refinements\":" INT64_FORMAT ","
 						 "\"adaptive_stale_bypasses\":" INT64_FORMAT ","
 						 "\"adaptive_evictions\":" INT64_FORMAT ","
 						 "\"adaptive_bytes\":" INT64_FORMAT ","
 						 "\"adaptive_score\":%.12g,"
-						 "\"adaptive_checks\":" INT64_FORMAT ","
-						 "\"adaptive_skips\":" INT64_FORMAT ","
-						 "\"adaptive_uses\":" INT64_FORMAT ","
+							 "\"adaptive_checks\":" INT64_FORMAT ","
+							 "\"adaptive_skips\":" INT64_FORMAT ","
+							 "\"adaptive_fragment_cache_hits\":" INT64_FORMAT ","
+							 "\"adaptive_fragment_store_hits\":" INT64_FORMAT ","
+							 "\"adaptive_fragment_builds\":" INT64_FORMAT ","
+							 "\"adaptive_fast_reactivation_hits\":" INT64_FORMAT ","
+							 "\"adaptive_event_sequence\":" INT64_FORMAT ","
+							 "\"adaptive_fragment_build_ms\":%.6f,"
+							 "\"adaptive_uses\":" INT64_FORMAT ","
 						 "\"adaptive_refine_pending\":%s}",
 						 hnsw_active_guidance.active ? "true" : "false",
 						 hnsw_active_guidance.statementBound ? "true" : "false",
@@ -4834,6 +5482,7 @@ vector_hnsw_guidance_profile(PG_FUNCTION_ARGS)
 						 hnsw_active_guidance.composedGuideHit ? "true" : "false",
 						 hnsw_active_guidance.composedGuideHits,
 						 hnsw_active_guidance.composedGuideMisses,
+						 hnsw_active_guidance.fastReactivationHits,
 						 hnsw_active_guidance.composedExactActive ? "true" : "false",
 						 hnsw_active_guidance.composedExactHit ? "true" : "false",
 						 hnsw_active_guidance.composedExactRows,
@@ -4846,14 +5495,21 @@ vector_hnsw_guidance_profile(PG_FUNCTION_ARGS)
 						 hnsw_adaptive_profile.rejections,
 						 hnsw_adaptive_profile.pageBuilds,
 						 hnsw_adaptive_profile.bloomBuilds,
+						 hnsw_adaptive_profile.exactBuilds,
 						 hnsw_adaptive_profile.refinements,
 						 hnsw_adaptive_profile.staleBypasses,
 						 hnsw_adaptive_profile.evictions,
 						 adaptiveDescriptor != NULL ? adaptiveDescriptor->adaptiveBytes : 0,
 						 adaptiveDescriptor != NULL ? adaptiveDescriptor->adaptiveBenefitPerByte : 0,
-						 hnsw_adaptive_profile.checks,
-						 hnsw_adaptive_profile.skips,
-						 adaptiveDescriptor != NULL ? (int64) adaptiveDescriptor->adaptiveUses : 0,
+							 hnsw_adaptive_profile.checks,
+							 hnsw_adaptive_profile.skips,
+							 hnsw_adaptive_profile.fragmentCacheHits,
+							 hnsw_adaptive_profile.fragmentStoreHits,
+							 hnsw_adaptive_profile.fragmentBuilds,
+							 hnsw_adaptive_profile.fastReactivationHits,
+							 hnsw_adaptive_profile.eventSequence,
+							 hnsw_adaptive_profile.fragmentBuildMs,
+							 adaptiveDescriptor != NULL ? (int64) adaptiveDescriptor->adaptiveUses : 0,
 						 adaptiveDescriptor != NULL && adaptiveDescriptor->adaptiveRefinePending ? "true" : "false");
 
 	PG_RETURN_TEXT_P(cstring_to_text(output.data));
@@ -5110,14 +5766,21 @@ vector_hnsw_metadata_cache_profile(PG_FUNCTION_ARGS)
 						 "\"adaptive_probes\":" INT64_FORMAT ","
 						 "\"adaptive_admissions\":" INT64_FORMAT ","
 						 "\"adaptive_rejections\":" INT64_FORMAT ","
-						 "\"adaptive_page_builds\":" INT64_FORMAT ","
-						 "\"adaptive_bloom_builds\":" INT64_FORMAT ","
+					 "\"adaptive_page_builds\":" INT64_FORMAT ","
+					 "\"adaptive_bloom_builds\":" INT64_FORMAT ","
+					 "\"adaptive_exact_builds\":" INT64_FORMAT ","
 						 "\"adaptive_refinements\":" INT64_FORMAT ","
 						 "\"adaptive_stale_bypasses\":" INT64_FORMAT ","
 						 "\"adaptive_evictions\":" INT64_FORMAT ","
-						 "\"adaptive_checks\":" INT64_FORMAT ","
-						 "\"adaptive_skips\":" INT64_FORMAT ","
-						 "\"budget_mb\":%d,"
+							 "\"adaptive_checks\":" INT64_FORMAT ","
+							 "\"adaptive_skips\":" INT64_FORMAT ","
+							 "\"adaptive_fragment_cache_hits\":" INT64_FORMAT ","
+							 "\"adaptive_fragment_store_hits\":" INT64_FORMAT ","
+							 "\"adaptive_fragment_builds\":" INT64_FORMAT ","
+							 "\"adaptive_fast_reactivation_hits\":" INT64_FORMAT ","
+							 "\"adaptive_event_sequence\":" INT64_FORMAT ","
+							 "\"adaptive_fragment_build_ms\":%.6f,"
+							 "\"budget_mb\":%d,"
 						 "\"budget_bytes\":" INT64_FORMAT "}",
 					 entries,
 					 residentEntries,
@@ -5138,14 +5801,21 @@ vector_hnsw_metadata_cache_profile(PG_FUNCTION_ARGS)
 						 hnsw_adaptive_profile.probes,
 						 hnsw_adaptive_profile.admissions,
 						 hnsw_adaptive_profile.rejections,
-						 hnsw_adaptive_profile.pageBuilds,
-						 hnsw_adaptive_profile.bloomBuilds,
+					 hnsw_adaptive_profile.pageBuilds,
+					 hnsw_adaptive_profile.bloomBuilds,
+					 hnsw_adaptive_profile.exactBuilds,
 						 hnsw_adaptive_profile.refinements,
 						 hnsw_adaptive_profile.staleBypasses,
 						 hnsw_adaptive_profile.evictions,
-						 hnsw_adaptive_profile.checks,
-						 hnsw_adaptive_profile.skips,
-						 hnsw_metadata_cache_max_mb,
+							 hnsw_adaptive_profile.checks,
+							 hnsw_adaptive_profile.skips,
+							 hnsw_adaptive_profile.fragmentCacheHits,
+							 hnsw_adaptive_profile.fragmentStoreHits,
+							 hnsw_adaptive_profile.fragmentBuilds,
+							 hnsw_adaptive_profile.fastReactivationHits,
+							 hnsw_adaptive_profile.eventSequence,
+							 hnsw_adaptive_profile.fragmentBuildMs,
+							 hnsw_metadata_cache_max_mb,
 						 budgetBytes);
 
 	PG_RETURN_TEXT_P(cstring_to_text(output.data));

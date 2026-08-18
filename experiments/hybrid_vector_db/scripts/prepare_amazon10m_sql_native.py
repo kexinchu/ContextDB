@@ -453,6 +453,11 @@ SECONDARY_INDEXES = (
         "ON public.amazon_product_dim (main_category, item_rating_number, parent_asin)",
     ),
     (
+        "amazon_product_dim_rating_count_asin_idx",
+        "CREATE INDEX amazon_product_dim_rating_count_asin_idx "
+        "ON public.amazon_product_dim (item_rating_number, parent_asin)",
+    ),
+    (
         "amazon_principal_tenant_grants_tenant_idx",
         "CREATE INDEX amazon_principal_tenant_grants_tenant_idx "
         "ON public.amazon_principal_tenant_grants (tenant_id, principal_name)",
@@ -510,6 +515,10 @@ def print_dry_run(args: argparse.Namespace) -> None:
     print(f"acl_coverage_pct={args.acl_coverage_pct} policy=real-store-else-real-asin")
     print("valid_from=real-csv-timestamp valid_to=NULL(no-real-end)")
     print("temporal_target_pct=" + ",".join(str(value) for value in TEMPORAL_TARGET_PCTS))
+    print(
+        "boolean_complex=wide2,medium2,narrow2; "
+        "indexes=product_rating,facts_user_time,facts_parent_time"
+    )
 
 
 def ensure_principal(cur, sql, principal: str) -> None:

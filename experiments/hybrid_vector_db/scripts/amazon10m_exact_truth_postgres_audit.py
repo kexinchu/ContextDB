@@ -23,8 +23,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_TRUTH_CSV = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"
-DEFAULT_TRUTH_MANIFEST = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal_manifest.json"
+DEFAULT_TRUTH_CSV = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_unique_embeddings_formal.csv"
+DEFAULT_TRUTH_MANIFEST = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_unique_embeddings_formal_manifest.json"
 DEFAULT_FILTERS_CSV = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
 DEFAULT_OUT = ROOT / "results/hybrid_vector_db/amazon10m_exact_truth_postgres_audit.csv"
 DEFAULT_MANIFEST = ROOT / "results/hybrid_vector_db/amazon10m_exact_truth_postgres_audit_manifest.json"
@@ -93,6 +93,17 @@ def safe_sql_predicate(value: str) -> str:
     if re.search(r"\b(?:select|insert|update|delete|merge|drop|alter|create|grant|revoke|copy|call|execute)\b", predicate, re.I):
         raise ValueError("SQL predicate must be an expression, not a SQL statement")
     return predicate
+
+
+def parse_query_nos(value: str) -> tuple[int, ...]:
+    query_nos = tuple(int(part.strip()) for part in str(value).split(",") if part.strip())
+    if not query_nos:
+        raise argparse.ArgumentTypeError("query sample must not be empty")
+    if any(query_no < 0 for query_no in query_nos):
+        raise argparse.ArgumentTypeError("query numbers must be non-negative")
+    if len(set(query_nos)) != len(query_nos):
+        raise argparse.ArgumentTypeError("query sample contains duplicates")
+    return query_nos
 
 
 def qualified_identifier(value: str) -> str:
@@ -674,6 +685,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", dest="manifest_path", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--table", default=DEFAULT_TABLE)
     parser.add_argument("--candidate-validity-predicate", default=DEFAULT_VALIDITY_PREDICATE)
+    parser.add_argument(
+        "--query-nos",
+        type=parse_query_nos,
+        default=DEFAULT_QUERY_NOS,
+        help="comma-separated exact-truth query numbers to audit",
+    )
     parser.add_argument("--execute", action="store_true", help="connect to PostgreSQL and run the audit")
     return parser
 
@@ -688,6 +705,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             truth_csv=args.truth_csv, truth_manifest=args.truth_manifest, filters_csv=args.filters_csv,
             out=args.out, manifest_path=args.manifest_path, table=args.table,
             candidate_validity_predicate=args.candidate_validity_predicate,
+            query_nos=args.query_nos,
         )
     except Exception as exc:
         print(f"audit failed closed: {exc}")

@@ -42,6 +42,9 @@ SUMMARY_FIELDS = [
     "latency_p99_ms", "latency_ci95_low_ms", "latency_ci95_high_ms",
     "single_client_service_qps", "target_recall", "target_status", "target_outcome",
     "comparison_status", "selected_ef", "selected_flat_search_cutoff",
+    "calibration_recall_mean", "calibration_recall_lcb95",
+    "calibration_selection_policy", "selection_mode",
+    "calibration_lcb95_qualified", "fallback_used", "qps_measured",
 ]
 SHARD_FILTERS = [
     ["filter_00", "filter_01", "filter_02"],
@@ -70,13 +73,13 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def raw_row(phase, name, query_no, repeat):
+def raw_row(phase, name, query_no, repeat, *, strategy="acorn", cutoff=0):
     return {
         "phase": phase,
-        "configured_filter_strategy": "acorn" if phase == "calibration" else "sweeping",
+        "configured_filter_strategy": strategy,
         "filter_name": name,
         "ef": 100,
-        "flat_search_cutoff": 0 if phase == "calibration" else 100_000,
+        "flat_search_cutoff": cutoff,
         "query_no": query_no,
         "query_id": query_no + 1000,
         "repeat": repeat,
@@ -91,7 +94,9 @@ def raw_row(phase, name, query_no, repeat):
     }
 
 
-def summary_row(phase, name, target="N/A"):
+def summary_row(
+    phase, name, target="N/A", *, strategy="acorn", cutoff=0, latency=1.25,
+):
     final = phase == "final"
     expected_queries = (
         len(combiner.EXPECTED_FINAL_QUERY_NOS)
@@ -101,10 +106,10 @@ def summary_row(phase, name, target="N/A"):
     expected_repeats = 5 if final else 2
     row = {
         "phase": phase,
-        "configured_filter_strategy": "sweeping" if final else "acorn",
+        "configured_filter_strategy": strategy,
         "filter_name": name,
         "ef": 100,
-        "flat_search_cutoff": 100_000 if final else 0,
+        "flat_search_cutoff": cutoff,
         "expected_queries": expected_queries,
         "expected_repeats": expected_repeats,
         "expected_samples": expected_queries * expected_repeats,
@@ -119,19 +124,28 @@ def summary_row(phase, name, target="N/A"):
         "recall_lcb95": 1.0,
         "recall_ci95_low": 1.0,
         "recall_ci95_high": 1.0,
-        "latency_mean_ms": 1.25,
-        "latency_p50_ms": 1.25,
+        "latency_mean_ms": latency,
+        "latency_p50_ms": latency,
         "latency_p95_ms": 1.5,
         "latency_p99_ms": 1.5,
         "latency_ci95_low_ms": 1.0,
         "latency_ci95_high_ms": 1.5,
-        "single_client_service_qps": 800.0,
+        "single_client_service_qps": "N/A",
+        "qps_measured": False,
         "target_recall": target,
         "target_status": "selected" if final else "",
         "target_outcome": "selected_and_confirmed" if final else "",
         "comparison_status": "confirmed" if final else "",
         "selected_ef": 100 if final else "",
-        "selected_flat_search_cutoff": 100_000 if final else "",
+        "selected_flat_search_cutoff": cutoff if final else "",
+        "calibration_recall_mean": 1.0 if final else "",
+        "calibration_recall_lcb95": 1.0 if final else "",
+        "calibration_selection_policy": (
+            combiner.CALIBRATION_SELECTION_POLICY if final else ""
+        ),
+        "selection_mode": combiner.LCB_SELECTION_MODE if final else "",
+        "calibration_lcb95_qualified": True if final else "",
+        "fallback_used": False if final else "",
     }
     return row
 
@@ -163,7 +177,53 @@ class Fixture:
             "baseline_runner": digest("baseline"),
             "filters_csv": self.filter_sha,
             "truth_csv": digest("truth"),
+            "truth_manifest": digest("truth-manifest"),
             "fbin": digest("fbin"),
+            "import_manifest": digest("import-manifest"),
+            "query_cohort_csv": digest("query-cohort"),
+            "query_cohort_manifest": digest("query-cohort-manifest"),
+            "import_attributes_csv": digest("attributes"),
+        }
+        input_provenance = {
+            "protocol": combiner.LEGACY_CURRENT_PROTOCOL,
+            "truth_manifest": {
+                "path": str(self.root / "truth-manifest.json"),
+                "sha256": source_hashes["truth_manifest"],
+            },
+            "import_manifest": {
+                "path": str(self.root / "import-manifest.json"),
+                "sha256": source_hashes["import_manifest"],
+            },
+            "truth_csv": {
+                "path": str(self.root / "truth.csv"),
+                "sha256": source_hashes["truth_csv"],
+            },
+            "filters_csv": {
+                "path": str(self.filters_csv),
+                "sha256": source_hashes["filters_csv"],
+            },
+            "vectors_fbin": {
+                "path": str(self.root / "vectors.fbin"),
+                "sha256": source_hashes["fbin"],
+            },
+            "query_cohort_csv": {
+                "path": str(self.root / "queries.csv"),
+                "sha256": source_hashes["query_cohort_csv"],
+            },
+            "query_cohort_manifest": {
+                "path": str(self.root / "queries.manifest.json"),
+                "sha256": source_hashes["query_cohort_manifest"],
+            },
+            "import_attributes_csv": {
+                "path": str(self.root / "attributes.csv"),
+                "sha256": source_hashes["import_attributes_csv"],
+            },
+            "corpus_gates": {
+                "rows": 10_000_000,
+                "candidate_rows": 9_979_556,
+                "filter_count_coverage": 14,
+                "complete_filter_matrix": 14,
+            },
         }
         run_spec_hash = digest(f"run-spec-{index}")
         image_digest = "registry/weaviate@sha256:" + digest("image")
@@ -180,6 +240,8 @@ class Fixture:
             "class": "AmazonGroceryReview",
             "git_revision": "a" * 40,
             "source_hashes": source_hashes,
+            "current_protocol": combiner.LEGACY_CURRENT_PROTOCOL,
+            "input_provenance": input_provenance,
             "run_spec_hash": run_spec_hash,
             "vector_rows": 10_000_000,
             "dimensions": 128,
@@ -201,12 +263,29 @@ class Fixture:
                 "service_image_digest": image_digest,
             },
             "measurement_mode": "single_client_sequential",
+            "timed_graphql_response": {
+                "fields": list(combiner.TIMED_RESPONSE_FIELDS),
+                "all_scalar_properties_requested": False,
+            },
+            "throughput": {
+                "qps_measured": False,
+                "definition": combiner.QPS_DEFINITION,
+                "latency_reciprocal_is_not_measured_qps": True,
+            },
             "calibration": {
                 "query_nos": list(combiner.EXPECTED_CALIBRATION_QUERY_NOS),
                 "queries": len(combiner.EXPECTED_CALIBRATION_QUERY_NOS),
                 "repeats": 2,
                 "schedule_order": "all flat representatives before HNSW",
-                "selection_rule": "fastest measured LCB-qualified configuration",
+                "selection_rule": combiner.CALIBRATION_SELECTION_RULE,
+                "selection_policy": combiner.CALIBRATION_SELECTION_POLICY,
+                "qualification_metric": combiner.CALIBRATION_STOP_METRIC,
+                "qualification_operator": ">= target",
+                "bootstrap_ci_lcb": "qualification_and_early_stop",
+                "fallback": combiner.CALIBRATION_FALLBACK,
+                "fallback_requires_full_hnsw_grid": True,
+                "early_stop_metric": combiner.CALIBRATION_STOP_METRIC,
+                "early_stop_target": 0.99,
             },
             "final": {
                 "query_nos": list(combiner.EXPECTED_FINAL_QUERY_NOS),
@@ -242,52 +321,68 @@ class Fixture:
         summary_rows = []
         target_records = []
         selected_and_confirmed = 0
-        unattainable = 0
         for name in filters:
-            raw_rows.extend(
-                raw_row("calibration", name, query_no, repeat)
-                for query_no in combiner.EXPECTED_CALIBRATION_QUERY_NOS
-                for repeat in range(2)
+            calibration_configs = (
+                ("sweeping", 100_000, 0.75),
+                ("acorn", 0, 1.25),
+                ("sweeping", 0, 1.0),
             )
-            raw_rows.extend(
-                raw_row("final", name, query_no, repeat)
-                for query_no in range(100, 200)
-                for repeat in range(5)
-            )
-            summary_rows.append(summary_row("calibration", name))
+            for strategy, cutoff, latency in calibration_configs:
+                raw_rows.extend(
+                    raw_row(
+                        "calibration", name, query_no, repeat,
+                        strategy=strategy, cutoff=cutoff,
+                    )
+                    for query_no in combiner.EXPECTED_CALIBRATION_QUERY_NOS
+                    for repeat in range(2)
+                )
+                summary_rows.append(summary_row(
+                    "calibration", name, strategy=strategy, cutoff=cutoff,
+                    latency=latency,
+                ))
+            for strategy, cutoff in (("sweeping", 0), ("sweeping", 100_000)):
+                raw_rows.extend(
+                    raw_row(
+                        "final", name, query_no, repeat,
+                        strategy=strategy, cutoff=cutoff,
+                    )
+                    for query_no in range(100, 200)
+                    for repeat in range(5)
+                )
             for target in combiner.EXPECTED_TARGETS:
-                is_unattainable = index == 3 and name == filters[-1] and target == 0.99
-                if is_unattainable:
-                    target_records.append({
-                        "filter_name": name,
-                        "target_recall": target,
-                        "status": "unattainable_on_grid",
-                        "selected_filter_strategy": "N/A",
-                        "selected_ef": "N/A",
-                        "selected_flat_search_cutoff": "N/A",
-                    })
-                    unattainable += 1
-                else:
-                    target_records.append({
-                        "filter_name": name,
-                        "target_recall": target,
-                        "status": "selected",
-                        "selected_filter_strategy": "sweeping",
-                        "selected_ef": 100,
-                        "selected_flat_search_cutoff": 100_000,
-                    })
-                    summary_rows.append(summary_row("final", name, target))
-                    selected_and_confirmed += 1
+                target_records.append({
+                    "filter_name": name,
+                    "target_recall": target,
+                    "status": "selected",
+                    "selected_filter_strategy": "sweeping",
+                    "selected_ef": 100,
+                    "selected_flat_search_cutoff": 0,
+                    "selection_mode": combiner.LCB_SELECTION_MODE,
+                    "calibration_selection_policy": combiner.CALIBRATION_SELECTION_POLICY,
+                    "calibration_target_recall": target,
+                    "calibration_recall_mean": 1.0,
+                    "calibration_recall_lcb95": 1.0,
+                    "calibration_lcb95_qualified": True,
+                    "fallback_used": False,
+                })
+                summary_rows.append(summary_row(
+                    "final", name, target, strategy="sweeping", cutoff=0, latency=1.0,
+                ))
+                selected_and_confirmed += 1
         write_csv(paths["raw_csv"], RAW_FIELDS, raw_rows)
         write_csv(paths["summary_csv"], SUMMARY_FIELDS, summary_rows)
         write_json(paths["config_json"], config)
         write_json(paths["schema_json"], schema)
         manifest = {
             "artifact_valid": True,
+            "paper_eligible": True,
             "status": "complete",
             "manifest_commit": "atomic_last",
+            "publication_errors": [],
             "git_revision": "a" * 40,
             "source_hashes": source_hashes,
+            "current_protocol": combiner.LEGACY_CURRENT_PROTOCOL,
+            "input_provenance": input_provenance,
             "run_spec_hash": run_spec_hash,
             "service": {
                 "meta": {"version": "1.38.0"},
@@ -310,11 +405,23 @@ class Fixture:
                 "original_definition_restored": True,
             },
             "checkpoint": {"original_schema_persisted_before_schema_put": True},
-            "calibration_selection": {"targets": target_records},
+            "calibration_selection": {
+                "rule": combiner.CALIBRATION_SELECTION_RULE,
+                "selection_policy": combiner.CALIBRATION_SELECTION_POLICY,
+                "qualification_metric": combiner.CALIBRATION_STOP_METRIC,
+                "qualification_operator": ">= target",
+                "bootstrap_ci_lcb": "qualification_and_early_stop",
+                "lcb_is_report_only": False,
+                "fallback": combiner.CALIBRATION_FALLBACK,
+                "fallback_requires_full_hnsw_grid": True,
+                "early_stop_metric": combiner.CALIBRATION_STOP_METRIC,
+                "early_stop_target": 0.99,
+                "targets": target_records,
+            },
             "target_outcomes": {
                 "selected_and_confirmed": selected_and_confirmed,
                 "selected_but_final_unconfirmed": 0,
-                "unattainable_on_grid": unattainable,
+                "unattainable_on_grid": 0,
             },
             "flat_held_out_exactness_gate": {
                 "required_recall_mean": 1.0,
@@ -373,13 +480,14 @@ class Fixture:
 
 
 class CombineWeaviateProductionShardsTests(unittest.TestCase):
-    def test_combines_four_valid_shards_and_preserves_explicit_unattainable_target(self):
+    def test_combines_four_valid_lcb95_protocol_shards(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = Fixture(tmp)
             outputs = combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
             self.assertEqual(outputs, fixture.output_paths())
             manifest = read_json(outputs["manifest_json"])
             self.assertTrue(manifest["artifact_valid"])
+            self.assertTrue(manifest["paper_eligible"])
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(len(manifest["input_shards"]), 4)
             self.assertEqual(len(manifest["filter_names"]), 14)
@@ -410,7 +518,18 @@ class CombineWeaviateProductionShardsTests(unittest.TestCase):
             provenance = finalizer._provenance(manifest, "weaviate_production")
             self.assertEqual(provenance["runner_sha256"], digest("runner"))
             self.assertEqual(len(manifest["calibration_selection"]["targets"]), 42)
-            self.assertEqual(manifest["target_outcomes"]["unattainable_on_grid"], 1)
+            self.assertEqual(manifest["target_outcomes"]["unattainable_on_grid"], 0)
+            self.assertTrue(manifest["coverage"]["zero_missing"])
+            self.assertTrue(manifest["coverage"]["zero_duplicate"])
+            self.assertTrue(all(
+                manifest["coverage"]["source_hash_coverage"].values()
+            ))
+            self.assertFalse(manifest["throughput"]["qps_measured"])
+            self.assertFalse(manifest["calibration_selection"]["lcb_is_report_only"])
+            self.assertEqual(
+                manifest["calibration_selection"]["qualification_metric"],
+                "recall_lcb95",
+            )
             self.assertEqual(
                 manifest["raw_rows"], sum(read_json(path)["raw_rows"] for path in fixture.manifests)
             )
@@ -423,6 +542,30 @@ class CombineWeaviateProductionShardsTests(unittest.TestCase):
             self.assertTrue(schema["original_definition_restored"])
             self.assertEqual(len(schema["shards"]), 4)
 
+    def test_rejects_unconfirmed_target_even_if_shard_claims_paper_eligible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp)
+            manifest = fixture.manifest(0)
+            _, rows = combiner._read_csv(
+                Path(manifest["outputs"]["summary_csv"]), "summary"
+            )
+            final = next(row for row in rows if row["phase"] == "final")
+            final["target_outcome"] = "selected_but_final_unconfirmed"
+            final["comparison_status"] = "unconfirmed"
+            fixture.rewrite_output(0, "summary_csv", rows)
+            manifest = fixture.manifest(0)
+            manifest["target_outcomes"]["selected_and_confirmed"] -= 1
+            manifest["target_outcomes"]["selected_but_final_unconfirmed"] = 1
+            manifest["paper_eligible"] = True
+            manifest["publication_errors"] = []
+            fixture.rewrite_manifest(0, manifest)
+            with self.assertRaisesRegex(
+                combiner.ValidationFailure,
+                "invalid outcome|selected_but_final_unconfirmed",
+            ):
+                combiner.combine(
+                    fixture.manifests, fixture.filters_csv, fixture.out_prefix
+                )
     def test_rejects_manifest_service_and_immutable_identity_failures(self):
         mutations = {
             "artifact_valid": lambda manifest: manifest.update({"artifact_valid": False}),
@@ -538,7 +681,9 @@ class CombineWeaviateProductionShardsTests(unittest.TestCase):
                 manifest = fixture.manifest(1)
                 manifest["source_hashes"][source_name] = changed
                 fixture.rewrite_manifest(1, manifest)
-                with self.assertRaisesRegex(combiner.ValidationFailure, "run contract"):
+                with self.assertRaisesRegex(
+                    combiner.ValidationFailure, "hash|run contract"
+                ):
                     combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -567,57 +712,122 @@ class CombineWeaviateProductionShardsTests(unittest.TestCase):
             with self.assertRaisesRegex(combiner.ValidationFailure, "timing contract"):
                 combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
 
-    def test_accepts_uniform_conservative_policy_and_records_provenance(self):
+    def test_records_uniform_lcb95_policy_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = Fixture(tmp)
-            for shard in range(4):
-                manifest = fixture.manifest(shard)
-                config = read_json(Path(manifest["outputs"]["config_json"]))
-                config["calibration"].update({
-                    "conservative_lcb_margin": 0.03,
-                    "selection_policy": "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1",
-                    "fallback": "complete_calibration_exact_flat_representative",
-                })
-                fixture.rewrite_output(shard, "config_json", config)
             outputs = combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
             combined = read_json(outputs["manifest_json"])
             evidence = combined["input_shards"][0]
-            self.assertEqual(evidence["calibration_lcb_margin"], 0.03)
             self.assertEqual(
                 evidence["calibration_selection_policy"],
-                "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1",
+                combiner.CALIBRATION_SELECTION_POLICY,
             )
             self.assertEqual(
-                combined["calibration_selection"]["minimum_calibration_lcb_margin"], 0.03
+                evidence["calibration_qualification_metric"], "recall_lcb95"
             )
 
-    def test_rejects_mixed_selection_policies_across_shards(self):
+    def test_rejects_report_only_or_mixed_selection_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = Fixture(tmp)
             manifest = fixture.manifest(0)
             config = read_json(Path(manifest["outputs"]["config_json"]))
             config["calibration"].update({
-                "conservative_lcb_margin": 0.03,
-                "selection_policy": "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1",
-                "fallback": "complete_calibration_exact_flat_representative",
+                "bootstrap_ci_lcb": "reported_only",
             })
             fixture.rewrite_output(0, "config_json", config)
-            with self.assertRaisesRegex(combiner.ValidationFailure, "run contract"):
+            with self.assertRaisesRegex(combiner.ValidationFailure, "formal LCB95"):
                 combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
 
-    def test_rejects_conservative_policy_below_publication_minimum(self):
+    def test_rejects_fallback_claim_while_an_lcb_qualified_config_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = Fixture(tmp)
             manifest = fixture.manifest(0)
-            config = read_json(Path(manifest["outputs"]["config_json"]))
-            config["calibration"].update({
-                "conservative_lcb_margin": 0.02,
-                "selection_policy": "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1",
-                "fallback": "complete_calibration_exact_flat_representative",
+            _, rows = combiner._read_csv(
+                Path(manifest["outputs"]["summary_csv"]), "summary"
+            )
+            final = next(
+                row for row in rows
+                if row["phase"] == "final" and row["filter_name"] == "filter_00"
+                and float(row["target_recall"]) == 0.90
+            )
+            final.update({
+                "selection_mode": combiner.FALLBACK_SELECTION_MODE,
+                "calibration_recall_lcb95": 0.80,
+                "calibration_lcb95_qualified": False,
+                "fallback_used": True,
             })
-            fixture.rewrite_output(0, "config_json", config)
-            with self.assertRaisesRegex(combiner.ValidationFailure, "publication minimum"):
+            fixture.rewrite_output(0, "summary_csv", rows)
+            manifest = fixture.manifest(0)
+            record = manifest["calibration_selection"]["targets"][0]
+            record.update({
+                "selection_mode": combiner.FALLBACK_SELECTION_MODE,
+                "calibration_recall_lcb95": 0.80,
+                "calibration_lcb95_qualified": False,
+                "fallback_used": True,
+            })
+            fixture.rewrite_manifest(0, manifest)
+            with self.assertRaisesRegex(combiner.ValidationFailure, "recomputed LCB95"):
                 combiner.combine(fixture.manifests, fixture.filters_csv, fixture.out_prefix)
+
+    def test_auditor_accepts_max_recall_fallback_only_after_full_grid(self):
+        calibration = [
+            summary_row("calibration", "f", strategy="sweeping", cutoff=100_000, latency=0.5),
+            summary_row("calibration", "f", strategy="acorn", latency=1.2),
+            summary_row("calibration", "f", strategy="acorn", latency=2.0),
+            summary_row("calibration", "f", strategy="sweeping", latency=1.0),
+            summary_row("calibration", "f", strategy="sweeping", latency=2.2),
+        ]
+        values = (
+            (calibration[1], 100, 0.94, 0.92),
+            (calibration[2], 250, 0.97, 0.95),
+            (calibration[3], 100, 0.96, 0.95),
+            (calibration[4], 250, 0.98, 0.97),
+        )
+        for row, ef, mean, lcb in values:
+            row.update({
+                "ef": ef, "recall_mean": mean, "recall_lcb95": lcb,
+                "recall_ci95_low": lcb, "recall_ci95_high": mean,
+            })
+
+        targets = {}
+        final_rows = []
+        for target in combiner.EXPECTED_TARGETS:
+            fallback = target == 0.99
+            ef, mean, lcb = (250, 0.98, 0.97) if fallback else (100, 0.96, 0.95)
+            mode = (
+                combiner.FALLBACK_SELECTION_MODE if fallback
+                else combiner.LCB_SELECTION_MODE
+            )
+            targets[("f", target)] = {
+                "filter_name": "f", "target_recall": target, "status": "selected",
+                "selected_filter_strategy": "sweeping", "selected_ef": ef,
+                "selected_flat_search_cutoff": 0, "selection_mode": mode,
+                "calibration_selection_policy": combiner.CALIBRATION_SELECTION_POLICY,
+                "calibration_recall_mean": mean, "calibration_recall_lcb95": lcb,
+                "calibration_lcb95_qualified": not fallback,
+                "fallback_used": fallback,
+            }
+            final = summary_row(
+                "final", "f", target, strategy="sweeping", cutoff=0, latency=3.0,
+            )
+            final.update({
+                "ef": ef, "selected_ef": ef, "selection_mode": mode,
+                "calibration_recall_mean": mean,
+                "calibration_recall_lcb95": lcb,
+                "calibration_lcb95_qualified": not fallback,
+                "fallback_used": fallback,
+            })
+            final_rows.append(final)
+
+        outcomes = combiner._validate_summary_rows(
+            Path("formal_manifest.json"), calibration + final_rows, {"f"}, targets,
+            {"ef_values": [100, 250], "configured_filter_strategies": ["acorn", "sweeping"]},
+        )
+        self.assertEqual(outcomes, {
+            "selected_and_confirmed": 3,
+            "selected_but_final_unconfirmed": 0,
+            "unattainable_on_grid": 0,
+        })
 
     def test_rejects_missing_duplicate_or_error_pairs_and_schema_restore_gaps(self):
         mutations = {
@@ -702,6 +912,103 @@ class CombineWeaviateProductionShardsTests(unittest.TestCase):
                     combiner._commit_bundle(staged, destinations)
             for name, path in destinations.items():
                 self.assertEqual(path.read_text(encoding="utf-8"), f"old-{name}")
+
+    def test_formal_raw_gate_requires_target_specific_request_trace_coverage(self):
+        contract = {
+            "execution_protocol": combiner.FORMAL_EXECUTION_PROTOCOL,
+            "calibration": {"repeats": 2},
+            "final": {"repeats": 3},
+            "workloads": {
+                "calibration": {
+                    "requests": [
+                        {
+                            "request_no": 0, "query_no": 0, "query_id": 100,
+                            "filter_name": "f",
+                        }
+                    ]
+                },
+                "measurement": {
+                    "requests": [
+                        {
+                            "request_no": 0, "query_no": 200, "query_id": 300,
+                            "filter_name": "f",
+                        }
+                    ]
+                },
+            },
+        }
+        rows = []
+        for repeat in range(2):
+            row = raw_row("calibration", "f", 0, repeat)
+            row.update({"request_no": 0, "query_id": 100, "target_recall": "N/A"})
+            rows.append(row)
+        for target in combiner.EXPECTED_TARGETS:
+            for repeat in range(3):
+                row = raw_row("final", "f", 200, repeat)
+                row.update({
+                    "request_no": 0,
+                    "query_id": 300,
+                    "target_recall": target,
+                })
+                rows.append(row)
+        final_blocks, query_ids = combiner._validate_raw_rows(
+            Path("formal_manifest.json"), rows, {"f"}, contract
+        )
+        self.assertEqual(query_ids, {0: 100, 200: 300})
+        self.assertEqual(
+            {block[-1] for block in final_blocks},
+            {str(target) for target in combiner.EXPECTED_TARGETS},
+        )
+        rows.pop()
+        with self.assertRaisesRegex(combiner.ValidationFailure, "missing/duplicate"):
+            combiner._validate_raw_rows(
+                Path("formal_manifest.json"), rows, {"f"}, contract
+            )
+
+    def test_formal_workload_contract_binds_file_hash_and_complete_assignment(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(combiner, "EXPECTED_FILTERS", 2):
+            root = Path(tmp)
+            workload = root / "measurement.csv"
+            write_csv(
+                workload,
+                ["request_no", "query_no", "query_id", "filter_name", "split"],
+                [
+                    {
+                        "request_no": 1, "query_no": 11, "query_id": 111,
+                        "filter_name": "f2", "split": "measurement",
+                    },
+                    {
+                        "request_no": 0, "query_no": 10, "query_id": 110,
+                        "filter_name": "f1", "split": "measurement",
+                    },
+                ],
+            )
+            digest_value = combiner.sha256_file(workload)
+            contract = combiner._frozen_workload_contract(
+                root / "formal_manifest.json",
+                {"path": str(workload), "sha256": digest_value},
+                label="measurement workload",
+                expected_split="measurement",
+                expected_requests=2,
+                expected_query_nos=(10, 11),
+                expected_sha256=digest_value,
+            )
+            self.assertEqual(
+                contract["request_counts_by_filter"], {"f1": 1, "f2": 1}
+            )
+            with self.assertRaisesRegex(
+                combiner.ValidationFailure, "SHA256 mismatch"
+            ):
+                combiner._frozen_workload_contract(
+                    root / "formal_manifest.json",
+                    {"path": str(workload), "sha256": "0" * 64},
+                    label="measurement workload",
+                    expected_split="measurement",
+                    expected_requests=2,
+                    expected_query_nos=(10, 11),
+                    expected_sha256="0" * 64,
+                )
 
     def test_requires_exactly_four_distinct_production_manifests(self):
         with tempfile.TemporaryDirectory() as tmp:

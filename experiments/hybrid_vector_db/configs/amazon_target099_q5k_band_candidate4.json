@@ -1,0 +1,18 @@
+{
+  "amazon": {
+    "grocery_rating5": {
+      "stock": {
+        "ef_search": 180,
+        "iterative_scan": "strict_order",
+        "max_scan_tuples": 350000
+      },
+      "sqlens": {
+        "ef_search": 80,
+        "max_scan_tuples": 40000,
+        "traversal_guided_target": 30,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.99
+      }
+    }
+  }
+}

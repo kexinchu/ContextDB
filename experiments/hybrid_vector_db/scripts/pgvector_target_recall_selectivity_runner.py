@@ -50,6 +50,9 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[3]
 RESULTS = ROOT / "results" / "hybrid_vector_db"
+DEFAULT_P0_RELEASE_CONTRACT = (
+    ROOT / "experiments/hybrid_vector_db/configs/p0_release_contract.json"
+)
 FILTER_ORDER = [
     "popular_ge1000",
     "popular_ge1340",
@@ -66,23 +69,60 @@ FILTER_ORDER = [
     "helpful_ge20",
     "grocery_long500",
 ]
-DEFAULT_MODES = [
+STATIC_FORMAL_MODES = [
     "original",
     "design1_bloom",
     "design1_bloom_bfs_layout",
-    "design1_bloom_bfs_layout_d3",
 ]
+FORMAL_D1_MODES = STATIC_FORMAL_MODES[:2]
+DEFAULT_MODES = list(STATIC_FORMAL_MODES)
 DEFAULT_INSERTION_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
-DEFAULT_INSERTION_INDEX = "public.amazon_grocery_reviews_10m_pgvector_embedding_hnsw_idx"
+DEFAULT_CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
+DEFAULT_CALIBRATION_QUERY_OFFSET = 20
+DEFAULT_CALIBRATION_QUERIES = 80
+DEFAULT_FINAL_QUERIES = 100
+DEFAULT_FINAL_REPEATS = 5
+DEFAULT_INSERTION_INDEX = "public.amazon10m_hnsw_m32ef200_dupbridge_r29_source_idx"
 DEFAULT_BFS_TABLE = DEFAULT_INSERTION_TABLE
-DEFAULT_BFS_INDEX = "public.amazon_grocery_reviews_10m_pgvector_hnsw_bfs_clone_idx"
-DEFAULT_FILTERS_CSV = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
-DEFAULT_TRUTH_CSV = RESULTS / "amazon_selectivity14_exact_truth_q200_formal.csv"
-DENSE_12_EF_SEARCH = "250,500,750,1000,1500,2000,3000,4000,5000,7000,8500,10000"
+DEFAULT_BFS_INDEX = "public.amazon10m_embedding_valid_hnsw_m32ef200_fullmem_bfs_idx"
+DEFAULT_FILTERS_CSV = (
+    ROOT
+    / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_valid_embeddings_filters.csv"
+)
+DEFAULT_TRUTH_CSV = RESULTS / "amazon_selectivity14_exact_truth_q200_unique_embeddings_formal.csv"
+DENSE_22_EF_SEARCH = (
+    "20,40,60,80,100,150,200,250,500,750,1000,1500,2000,3000,4000,5000,7000,8500,10000,20000,50000,100000"
+)
+FORMAL_BASE_GRID_MAX_EF = 10_000
 FORMAL_TARGETS = (0.90, 0.95, 0.99)
+FORMAL_FILTERS_SHA256 = "ae07c4d94450958f2071bf54f5db48d26c55328538087629cb1375c09bd4bcec"
+FORMAL_TRUTH_SHA256 = "9c457ca6bc178c66e112f1f72bd94f23178e110311c2d3aa8418a5c3eced887f"
+FORMAL_CALIBRATION_GRID_POLICY = (
+    "complete_base_grid_target_gated_high_recall_extension"
+)
 TIE_AWARE_RECALL_CONTRACT = "distance_squared_threshold_tie_aware_v1"
 SQLENS_V11_BUILD_PREFIX = "sqlens-v11-"
-SQLENS_MIN_PROFILE_SEMANTICS = 7.0
+SQLENS_V12_BUILD_PREFIX = "sqlens-v12-"
+SQLENS_V13_BUILD_PREFIX = "sqlens-v13-"
+SQLENS_V14_BUILD_PREFIX = "sqlens-v14-"
+SQLENS_V15_BUILD_PREFIX = "sqlens-v15-"
+SQLENS_V16_BUILD_PREFIX = "sqlens-v16-"
+FORMAL_SQLENS_BUILD_PREFIX = (
+    "sqlens-v16-d3-full-materialization-persisted-reuse-"
+)
+FORMAL_SQLENS_BUILD_PREFIXES = (
+    FORMAL_SQLENS_BUILD_PREFIX,
+    "sqlens-v16-d3-representation-preserving-exact-d2-edge-trace-",
+)
+SQLENS_SUPPORTED_BUILD_PREFIXES = (
+    SQLENS_V11_BUILD_PREFIX,
+    SQLENS_V12_BUILD_PREFIX,
+    SQLENS_V13_BUILD_PREFIX,
+    SQLENS_V14_BUILD_PREFIX,
+    SQLENS_V15_BUILD_PREFIX,
+    SQLENS_V16_BUILD_PREFIX,
+)
+SQLENS_MIN_PROFILE_SEMANTICS = 9.0
 SQLENS_PROFILE_REQUIRED_FIELDS = (
     "graph_elements_visited",
     "raw_index_tids_returned",
@@ -101,6 +141,9 @@ SQLENS_PROFILE_REQUIRED_FIELDS = (
     "heap_blks_are_exact_heap_io",
 )
 SQLENS_TRAVERSAL_PROFILE_REQUIRED_FIELDS = (
+    "traversal_result_target",
+    "traversal_guided_result_count",
+    "traversal_max_scan_reached",
     "final_path",
     "planner_proof_attempted",
     "planner_proof_succeeded",
@@ -121,6 +164,12 @@ SQLENS_TRAVERSAL_PROFILE_REQUIRED_FIELDS = (
     "fallback_requests",
     "traversal_estimated_skip_rate_valid",
     "traversal_estimated_skip_rate",
+    "approximate_prioritization_attempted",
+    "traversal_order_changed",
+    "approximate_ann_path",
+    "priority_reorders",
+    "match_frontier_pops",
+    "no_bridge_frontier_pops",
 )
 
 
@@ -131,18 +180,38 @@ class Config:
     scan_mem_multiplier: float
     iterative_scan: str
     guided_collect_target: int
+    traversal_guided_target: int
 
     @property
     def label(self) -> str:
         mem = str(self.scan_mem_multiplier).replace(".", "p")
         return (
             f"ef{self.ef_search}_target{self.guided_collect_target}_"
+            f"traverse{self.traversal_guided_target}_"
             f"max{self.max_scan_tuples}_mem{mem}_{self.iterative_scan}"
         )
 
 
 def parse_ints(value: str) -> list[int]:
     return [int(x) for x in value.split(",") if x.strip()]
+
+
+def parse_positive_ints(value: str, *, allow_ef: bool = False) -> list[int | str]:
+    parsed: list[int | str] = []
+    for token in (part.strip() for part in value.split(",") if part.strip()):
+        if token == "ef" and allow_ef:
+            parsed.append("ef")
+            continue
+        try:
+            value_ = int(token)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid integer token: {token!r}") from exc
+        if value_ <= 0:
+            raise argparse.ArgumentTypeError(
+                f"integer token must be positive: {token!r}"
+            )
+        parsed.append(value_)
+    return parsed
 
 
 def parse_floats(value: str) -> list[float]:
@@ -382,6 +451,7 @@ def required_csv_bool(value: object, field: str) -> bool:
 def validate_tie_aware_raw_row(
     row: dict[str, str],
     expected_truth_self_excluded: bool = True,
+    allow_fresh_stock_fallback: bool = False,
 ) -> float:
     if row.get("recall_contract") != TIE_AWARE_RECALL_CONTRACT:
         raise ValueError("raw row does not use the tie-aware recall contract")
@@ -389,7 +459,7 @@ def validate_tie_aware_raw_row(
         raise ValueError(
             "raw row truth self_excluded does not match the expected query contract"
         )
-    if not row.get("sqlens_build_id", "").startswith(SQLENS_V11_BUILD_PREFIX):
+    if not str(row.get("sqlens_build_id", "")).startswith(SQLENS_SUPPORTED_BUILD_PREFIXES):
         raise ValueError("raw row is missing the exact SQLens build ID")
     vector_sha = row.get("vector_so_sha256", "")
     if len(vector_sha) != 64 or any(char not in "0123456789abcdef" for char in vector_sha):
@@ -404,15 +474,67 @@ def validate_tie_aware_raw_row(
         raise ValueError("raw row claims unsafe in-runner backend pinning")
     if row.get("mode") == "design1_bloom_bfs_layout_d3" and not row.get("error"):
         phase = row.get("d3_phase")
-        if phase not in {"cold", "admission", "warm"}:
+        if phase not in {"probe", "admission", "warm", "bypass"}:
             raise ValueError("D3 raw row is missing an explicit lifecycle phase")
-        if phase == "admission" and not csv_bool(row.get("d3_admitted_after", "")):
+        route = row.get("guidance_route", "")
+        if phase == "probe" and (
+            route != "d3_stock_probe"
+            or csv_bool(row.get("guidance_enabled", ""))
+            or csv_bool(row.get("d3_active_after", ""))
+            or csv_bool(row.get("d3_admitted_after", ""))
+        ):
+            raise ValueError("D3 probe row lacks an inactive stock-probe proof")
+        if phase == "bypass" and (
+            route == "d3_stock_probe"
+            or csv_bool(row.get("guidance_enabled", ""))
+            or csv_bool(row.get("d3_active_after", ""))
+        ):
+            raise ValueError("D3 bypass row lacks an inactive policy-bypass proof")
+        if phase == "admission" and (
+            route != "enabled"
+            or not csv_bool(row.get("d3_admitted_after", ""))
+            or int(row.get("d3_adaptive_admissions_delta") or 0) <= 0
+        ):
             raise ValueError("D3 admission row lacks post-request admission proof")
         if phase == "warm" and (
-            not csv_bool(row.get("d3_admitted_before", ""))
+            route != "enabled"
+            or not csv_bool(row.get("d3_same_predicate_before", ""))
+            or not csv_bool(row.get("d3_admitted_before", ""))
             or not csv_bool(row.get("d3_active_guidance_reused", ""))
         ):
             raise ValueError("D3 warm row lacks pre-request admission/reuse proof")
+    if (
+        row.get("guidance_filter_strategy") == "safe_guided"
+        and row.get("mode") in {"design1_bloom", "design1_bloom_bfs_layout"}
+        and not row.get("error")
+    ):
+        expected_contract = (
+            "sql_residual_id_not_equal"
+            if expected_truth_self_excluded
+            else "none_external_query_source"
+        )
+        if row.get("self_exclusion_contract") != expected_contract:
+            raise ValueError("formal safe-guided row has the wrong self-exclusion contract")
+        if not csv_bool(row.get("guidance_enabled", "")):
+            raise ValueError("formal safe-guided D1 row did not enable guidance")
+        if not csv_bool(row.get("guidance_scan_verified", "")):
+            raise ValueError("formal safe-guided D1 row was not scan-verified")
+        if not csv_bool(row.get("planner_proof_succeeded", "")):
+            raise ValueError("formal safe-guided D1 row lacks a successful planner proof")
+        if row.get("final_path") != "validation_only":
+            raise ValueError("formal safe-guided D1 row did not use validation_only")
+        if row.get("traversal_guidance_scope") != "pre_heap_tid_validation":
+            raise ValueError("formal safe-guided D1 row has the wrong guidance scope")
+        if csv_bool(row.get("graph_expansion_pruned", "")):
+            raise ValueError("safe-guided D1 falsely claimed graph-expansion pruning")
+        if csv_bool(row.get("distance_computations_pruned", "")):
+            raise ValueError("safe-guided D1 falsely claimed distance pruning")
+        if int(row.get("guidance_checks") or 0) <= 0:
+            raise ValueError("safe-guided D1 recorded no pre-heap validation checks")
+        if int(row.get("stock_bypass_requests") or 0) != 0:
+            raise ValueError("safe-guided D1 used stock bypass")
+        if int(row.get("fallback_requests") or 0) != 0:
+            raise ValueError("safe-guided D1 used fresh-stock fallback")
     if row.get("guidance_filter_strategy") == "traversal_guided" and not row.get("error"):
         k = int(row.get("k") or 0)
         expected_contract = (
@@ -439,15 +561,100 @@ def validate_tie_aware_raw_row(
         if guidance_enabled:
             if not csv_bool(row.get("guidance_scan_verified", "")):
                 raise ValueError("formal traversal raw row was not scan-verified")
-            if row.get("final_path") != "guided":
-                raise ValueError("formal traversal raw row did not finish on the guided path")
+            prioritized_build = str(row.get("sqlens_build_id", "")).startswith(
+                (
+                    SQLENS_V12_BUILD_PREFIX,
+                    SQLENS_V13_BUILD_PREFIX,
+                    SQLENS_V14_BUILD_PREFIX,
+                    SQLENS_V15_BUILD_PREFIX,
+                )
+            )
+            final_path = row.get("final_path")
+            if final_path == "fresh_stock_fallback":
+                if not allow_fresh_stock_fallback:
+                    raise ValueError(
+                        "formal traversal raw row used fresh-stock fallback"
+                    )
+                if (
+                    not csv_bool(row.get("planner_proof_succeeded", ""))
+                    or not csv_bool(
+                        row.get("approximate_prioritization_attempted", "")
+                    )
+                    or not csv_bool(
+                        row.get("fallback_iterative_scan_enabled", "")
+                    )
+                    or int(row.get("fallback_requests") or 0) <= 0
+                    or row.get("fallback_reason") in {None, "", "none"}
+                    or int(row.get("guidance_checks") or 0) != 0
+                    or row.get("traversal_guidance_scope") != "none"
+                    or csv_bool(row.get("graph_expansion_pruned", ""))
+                    or csv_bool(row.get("distance_computations_pruned", ""))
+                    or not csv_bool(
+                        row.get("traversal_estimated_skip_rate_valid", "")
+                    )
+                ):
+                    raise ValueError(
+                        "calibration fallback row lacks a complete fresh-stock proof"
+                    )
+                guided_expanded = int(row.get("guided_expanded_nodes") or 0)
+                guided_distances = int(
+                    row.get("guided_phase_distance_computations") or 0
+                )
+                stock_expanded = int(row.get("stock_phase_expanded_nodes") or 0)
+                stock_distances = int(
+                    row.get("stock_phase_distance_computations") or 0
+                )
+                if min(
+                    guided_expanded,
+                    guided_distances,
+                    stock_expanded,
+                    stock_distances,
+                ) <= 0 or (
+                    stock_expanded,
+                    stock_distances,
+                ) != (
+                    int(row.get("fallback_stock_expanded_nodes") or 0),
+                    int(row.get("fallback_stock_distance_computations") or 0),
+                ):
+                    raise ValueError(
+                        "calibration fallback row has invalid guided/stock work counters"
+                    )
+                neighbor_checks = int(
+                    row.get("neighbor_expansion_guidance_checks") or 0
+                )
+                if neighbor_checks <= 0 or neighbor_checks != int(
+                    row.get("neighbor_expansion_guidance_matches") or 0
+                ) + int(row.get("neighbor_expansion_guidance_misses") or 0):
+                    raise ValueError(
+                        "calibration fallback row has invalid neighbor accounting"
+                    )
+            else:
+                expected_path = (
+                "approximate_traversal_prioritization"
+                if prioritized_build
+                else "guided"
+                )
+                if final_path != expected_path:
+                    raise ValueError(
+                        "formal traversal raw row finished on the wrong path: "
+                        f"observed={final_path!r} expected={expected_path!r}"
+                    )
+            if final_path == "fresh_stock_fallback":
+                return _validated_tie_aware_recall(
+                    row, row.get("result_distances")
+                )
             if not csv_bool(row.get("planner_proof_succeeded", "")):
                 raise ValueError("formal traversal raw row lacks a successful planner proof")
             if int(row.get("stock_bypass_requests") or 0) != 0:
                 raise ValueError("formal traversal raw row used stock bypass")
             if int(row.get("fallback_requests") or 0) != 0:
                 raise ValueError("formal traversal raw row used fresh-stock fallback")
-            if row.get("traversal_guidance_scope") != "candidate_admission_and_validation":
+            expected_scope = (
+                "approximate_traversal_prioritization_and_candidate_admission"
+                if prioritized_build
+                else "candidate_admission_and_validation"
+            )
+            if row.get("traversal_guidance_scope") != expected_scope:
                 raise ValueError("formal traversal raw row has the wrong guidance scope")
             if csv_bool(row.get("graph_expansion_pruned", "")):
                 raise ValueError("formal candidate admission claimed graph-expansion pruning")
@@ -457,6 +664,26 @@ def validate_tie_aware_raw_row(
                 raise ValueError("formal candidate admission recorded pre-distance checks")
             if int(row.get("distance_computations_avoided") or 0) != 0:
                 raise ValueError("formal candidate admission recorded avoided distance work")
+            if prioritized_build:
+                if not csv_bool(row.get("approximate_ann_path", "")) or not csv_bool(
+                    row.get("approximate_prioritization_attempted", "")
+                ):
+                    raise ValueError(
+                        "formal prioritized traversal row lacks approximate dual-frontier proof"
+                    )
+                priority_reorders = int(row.get("priority_reorders") or 0)
+                if csv_bool(row.get("traversal_order_changed", "")) != (
+                    priority_reorders > 0
+                ):
+                    raise ValueError(
+                        "formal prioritized traversal order flag disagrees with priority_reorders"
+                    )
+                if int(row.get("match_frontier_pops") or 0) + int(
+                    row.get("no_bridge_frontier_pops") or 0
+                ) <= 0:
+                    raise ValueError("formal prioritized traversal row has no dual-frontier work")
+                if not 1 <= int(row.get("traversal_prioritization_burst") or 0) <= 1024:
+                    raise ValueError("formal prioritized traversal row has an invalid burst")
             neighbor_checks = int(row.get("neighbor_expansion_guidance_checks") or 0)
             guided_admissions = int(row.get("traversal_guided_admissions") or 0)
             guided_suppressions = int(row.get("traversal_guided_suppressions") or 0)
@@ -472,6 +699,12 @@ def validate_tie_aware_raw_row(
             estimated_skip_rate = float(row.get("traversal_estimated_skip_rate") or -1)
             if not math.isfinite(estimated_skip_rate) or not 0.0 <= estimated_skip_rate <= 1.0:
                 raise ValueError("formal traversal raw row has an invalid skip-rate estimate")
+    return _validated_tie_aware_recall(row, row.get("result_distances"))
+
+
+def _validated_tie_aware_recall(
+    row: dict[str, str], raw_distances: object
+) -> float:
     for field in (
         "truth_filtered_rows",
         "truth_kth_distance_sq",
@@ -481,8 +714,13 @@ def validate_tie_aware_raw_row(
     ):
         if field not in row:
             raise ValueError(f"raw row is missing {field}")
-    distances = json.loads(row["result_distances"])
-    if not isinstance(distances, list) or any(not isinstance(value, (int, float)) for value in distances):
+    try:
+        distances = json.loads(str(raw_distances))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("result_distances must be valid JSON") from exc
+    if not isinstance(distances, list) or any(
+        not isinstance(value, (int, float)) for value in distances
+    ):
         raise ValueError("result_distances must be a JSON number array")
     if len(distances) != int(row.get("returned", len(distances))):
         raise ValueError("result_distances length does not match returned")
@@ -500,7 +738,8 @@ def validate_tie_aware_raw_row(
             denominator,
             k,
             sum(
-                float(distance) * float(distance) <= kth_distance_sq + tie_tolerance
+                float(distance) * float(distance)
+                <= kth_distance_sq + tie_tolerance
                 for distance in distances[:k]
             ),
         )
@@ -520,12 +759,17 @@ def summarize_raw(
     expected_queries: int | None = None,
     expected_repeats: int | None = None,
     expected_truth_self_excluded: bool = True,
+    allow_fresh_stock_fallback: bool = False,
 ) -> list[dict[str, object]]:
     with path.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     for row in rows:
         row["recall"] = str(
-            validate_tie_aware_raw_row(row, expected_truth_self_excluded)
+            validate_tie_aware_raw_row(
+                row,
+                expected_truth_self_excluded,
+                allow_fresh_stock_fallback,
+            )
         )
     groups: dict[tuple[str, str], list[dict[str, str]]] = {}
     for row in rows:
@@ -564,8 +808,7 @@ def summarize_raw(
             bootstrap_samples,
             seed + group_no,
         )
-        out.append(
-            {
+        summary: dict[str, object] = {
                 "filter_name": filter_name,
                 "mode": mode,
                 "queries": len(latency_query_means),
@@ -582,11 +825,11 @@ def summarize_raw(
                 "complete_queries": complete_queries,
                 "rows_complete": rows_complete,
                 "recall_contract": TIE_AWARE_RECALL_CONTRACT,
-                "truth_self_excluded": all(
-                    required_csv_bool(row.get("truth_self_excluded", ""), "truth_self_excluded")
-                    == expected_truth_self_excluded
-                    for row in items
-                ),
+                # validate_tie_aware_raw_row has already rejected any row whose
+                # truth contract differs from the requested query protocol.
+                # Preserve the contract value here; do not encode the result of
+                # that validation as though it were the contract itself.
+                "truth_self_excluded": expected_truth_self_excluded,
                 "tie_aware_rows": len(items),
                 "latency_mean_ms": statistics.fmean(latencies) if latencies else 0.0,
                 "latency_p50_ms": statistics.median(latencies) if latencies else 0.0,
@@ -637,7 +880,34 @@ def summarize_raw(
                     else 0.0
                 ),
             }
-        )
+        for phase in ("probe", "admission", "warm", "bypass"):
+            phase_rows = [row for row in ok if row.get("d3_phase") == phase]
+            phase_latencies = [float(row["end_to_end_ms"]) for row in phase_rows]
+            summary[f"d3_{phase}_count"] = len(phase_rows)
+            summary[f"d3_{phase}_recall_mean"] = (
+                statistics.fmean(float(row["recall"]) for row in phase_rows)
+                if phase_rows
+                else 0.0
+            )
+            summary[f"d3_{phase}_latency_mean_ms"] = (
+                statistics.fmean(phase_latencies) if phase_latencies else 0.0
+            )
+            summary[f"d3_{phase}_latency_p95_ms"] = percentile(
+                phase_latencies, 0.95
+            )
+            summary[f"d3_{phase}_activation_mean_ms"] = (
+                statistics.fmean(float(row["activation_ms"]) for row in phase_rows)
+                if phase_rows
+                else 0.0
+            )
+            summary[f"d3_{phase}_query_latency_mean_ms"] = (
+                statistics.fmean(
+                    float(row["query_latency_ms"]) for row in phase_rows
+                )
+                if phase_rows
+                else 0.0
+            )
+        out.append(summary)
     return out
 
 
@@ -970,6 +1240,51 @@ def sha256_tree(paths: list[Path]) -> str:
     return digest.hexdigest()
 
 
+def load_p0_release_contract(path: Path) -> dict[str, object]:
+    """Load the immutable P0 runtime identity contract without contacting PostgreSQL."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load P0 release contract {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("P0 release contract root must be an object")
+    contract_id = str(payload.get("contract_id") or "")
+    build_id = str(payload.get("expected_sqlens_build_id") or "")
+    vector_sha = str(payload.get("expected_vector_so_sha256") or "")
+    if (
+        int(payload.get("schema_version") or 0) != 1
+        or not contract_id
+        or not build_id
+        or len(vector_sha) != 64
+        or any(char not in "0123456789abcdef" for char in vector_sha)
+    ):
+        raise RuntimeError("P0 release contract is malformed")
+    return {
+        "contract_id": contract_id,
+        "path": str(path.resolve()),
+        "sha256": sha256_file(path),
+        "expected_sqlens_build_id": build_id,
+        "expected_vector_so_sha256": vector_sha,
+    }
+
+
+def bind_p0_release_contract(args: argparse.Namespace) -> dict[str, object]:
+    """Fail closed on a runtime identity that differs from the preregistered r33 release."""
+    contract = load_p0_release_contract(Path(args.release_contract))
+    expected_build = str(contract["expected_sqlens_build_id"])
+    expected_sha = str(contract["expected_vector_so_sha256"])
+    supplied_build = str(getattr(args, "expected_sqlens_build_id", "") or "")
+    supplied_sha = str(getattr(args, "expected_vector_so_sha256", "") or "")
+    if supplied_build and supplied_build != expected_build:
+        raise SystemExit("--expected-sqlens-build-id differs from the immutable P0 release contract")
+    if supplied_sha and supplied_sha != expected_sha:
+        raise SystemExit("--expected-vector-so-sha256 differs from the immutable P0 release contract")
+    args.expected_sqlens_build_id = expected_build
+    args.expected_vector_so_sha256 = expected_sha
+    args.release_contract_provenance = contract
+    return contract
+
+
 def sqlens_runtime_provenance() -> dict[str, object]:
     """Read and validate the loaded SQLens ABI/profile contract without mutating the DB."""
     try:
@@ -993,10 +1308,11 @@ def sqlens_runtime_provenance() -> dict[str, object]:
             "SQLens v11 runtime provenance gate failed: required SQLens functions are unavailable"
         ) from exc
 
-    if not build_id.startswith(SQLENS_V11_BUILD_PREFIX):
+    if not build_id.startswith(FORMAL_SQLENS_BUILD_PREFIXES):
         raise RuntimeError(
-            "SQLens v11 runtime provenance gate failed: "
-            f"loaded vector_sqlens_build_id is {build_id!r}, expected {SQLENS_V11_BUILD_PREFIX!r}"
+            "formal SQLens runtime provenance gate failed: "
+            f"loaded vector_sqlens_build_id is {build_id!r}, expected one of "
+            f"{FORMAL_SQLENS_BUILD_PREFIXES!r}"
         )
     if (
         not binary_path.endswith("/vector.so")
@@ -1031,11 +1347,17 @@ def sqlens_runtime_provenance() -> dict[str, object]:
             f"version={profile.get('profile_semantics_version')!r}, "
             f"minimum_version={SQLENS_MIN_PROFILE_SEMANTICS:g}, missing_fields={missing!r}"
         )
+    matched_build_prefix = next(
+        prefix for prefix in FORMAL_SQLENS_BUILD_PREFIXES
+        if build_id.startswith(prefix)
+    )
     return {
         "loaded_vector_sqlens_build_id": build_id,
         "loaded_vector_so_path": binary_path,
         "loaded_vector_so_sha256": binary_sha256,
-        "required_build_prefix": SQLENS_V11_BUILD_PREFIX,
+        "required_build_prefix": matched_build_prefix,
+        "required_build_prefixes": list(FORMAL_SQLENS_BUILD_PREFIXES),
+        "supported_build_prefixes": list(SQLENS_SUPPORTED_BUILD_PREFIXES),
         "minimum_profile_semantics_version": SQLENS_MIN_PROFILE_SEMANTICS,
         "profile_semantics_version": profile["profile_semantics_version"],
         "required_profile_fields": {
@@ -1044,13 +1366,31 @@ def sqlens_runtime_provenance() -> dict[str, object]:
     }
 
 
+def requested_benchmark_tables(args: argparse.Namespace) -> list[str]:
+    modes = set(getattr(args, "modes", DEFAULT_MODES))
+    tables: list[str] = []
+    if modes.intersection({"original", "design1_bloom"}):
+        tables.append(str(args.insertion_table))
+    if modes.intersection({"design1_bloom_bfs_layout", "design1_bloom_bfs_layout_d3"}):
+        tables.append(str(args.bfs_table))
+    return list(dict.fromkeys(tables))
+
+
+def requested_table_index_pairs(args: argparse.Namespace) -> list[tuple[str, str]]:
+    modes = set(getattr(args, "modes", DEFAULT_MODES))
+    pairs: list[tuple[str, str]] = []
+    if modes.intersection({"original", "design1_bloom"}):
+        pairs.append((str(args.insertion_table), str(args.insertion_index)))
+    if modes.intersection({"design1_bloom_bfs_layout", "design1_bloom_bfs_layout_d3"}):
+        pairs.append((str(args.bfs_table), str(args.bfs_index)))
+    return list(dict.fromkeys(pairs))
+
+
 def database_fingerprint(args: argparse.Namespace, sqlens_build_id: str) -> dict[str, object]:
-    relations = [
-        args.insertion_table,
-        args.insertion_index,
-        args.bfs_table,
-        args.bfs_index,
-    ]
+    pairs = requested_table_index_pairs(args)
+    if not pairs:
+        raise RuntimeError("database fingerprint has no requested benchmark relation")
+    relations = [relation for pair in pairs for relation in pair]
     validity = effective_candidate_validity_predicate(
         getattr(args, "candidate_validity_predicate", "")
     )
@@ -1062,7 +1402,7 @@ def database_fingerprint(args: argparse.Namespace, sqlens_build_id: str) -> dict
             getattr(args, "candidate_validity_predicate_explicit", False)
         ),
     }
-    index_relations = {str(args.insertion_index), str(args.bfs_index)}
+    index_relations = {index for _, index in pairs}
     with psycopg.connect(pg_config_from_env().conninfo, autocommit=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -1150,6 +1490,237 @@ def query_relation_provenance(cur: psycopg.Cursor, table: str) -> dict[str, obje
         "relfilenode": int(identity[2]),
         "row_count": int(count_row[0]),
         "columns": list(columns_row[0] or []),
+    }
+
+
+def plan_index_names(value: object) -> set[str]:
+    names: set[str] = set()
+    if isinstance(value, dict):
+        name = value.get("Index Name")
+        if isinstance(name, str):
+            names.add(name)
+        for child in value.values():
+            names.update(plan_index_names(child))
+    elif isinstance(value, list):
+        for child in value:
+            names.update(plan_index_names(child))
+    return names
+
+
+def validate_index_health_observations(
+    index: str,
+    observations: list[dict[str, object]],
+    *,
+    zero_distance_tolerance: float,
+    minimum_zero_distance_rate: float = 1.0,
+) -> dict[str, object]:
+    if (
+        not math.isfinite(minimum_zero_distance_rate)
+        or not 0.0 <= minimum_zero_distance_rate <= 1.0
+    ):
+        raise ValueError("minimum_zero_distance_rate must be within [0, 1]")
+    failures = [
+        observation
+        for observation in observations
+        if observation.get("returned_id") is None
+        or observation.get("distance") is None
+        or not math.isfinite(float(observation["distance"]))
+        or abs(float(observation["distance"])) > zero_distance_tolerance
+    ]
+    zero_distance_hits = len(observations) - len(failures)
+    zero_distance_rate = (
+        zero_distance_hits / len(observations) if observations else 0.0
+    )
+    proof = {
+        "contract": "hnsw_query_cohort_zero_distance_reachability_v2",
+        "index": index,
+        "queries": len(observations),
+        "zero_distance_tolerance": zero_distance_tolerance,
+        "minimum_zero_distance_rate": minimum_zero_distance_rate,
+        "zero_distance_hits": zero_distance_hits,
+        "zero_distance_rate": zero_distance_rate,
+        "self_id_hits": sum(
+            observation.get("returned_id") == observation.get("query_id")
+            for observation in observations
+        ),
+        "failures": failures[:10],
+        "passed": bool(observations)
+        and zero_distance_rate >= minimum_zero_distance_rate,
+    }
+    if not proof["passed"]:
+        raise RuntimeError(
+            "HNSW query-cohort health audit found a query vector that is not "
+            "zero-distance reachable at the required cohort rate through "
+            f"{index}: rate={zero_distance_rate:.6f}, "
+            f"required={minimum_zero_distance_rate:.6f}, failures={failures[:3]!r}"
+        )
+    return proof
+
+
+def hnsw_query_cohort_health(
+    args: argparse.Namespace,
+    query_ids: list[int],
+) -> dict[str, object]:
+    external_query_source = not args.expected_truth_self_excluded
+    if not query_ids and not external_query_source:
+        raise RuntimeError("HNSW query-cohort health audit received no query ids")
+
+    query_table = str(args.query_table or args.insertion_table)
+    pairs = requested_table_index_pairs(args)
+    if not pairs:
+        raise RuntimeError("HNSW query-cohort health audit has no index to inspect")
+
+    candidate_id = psycopg.sql.Identifier(args.query_id_column)
+    candidate_vector = psycopg.sql.Identifier(args.query_vector_column)
+    query_id = psycopg.sql.Identifier(args.query_id_column)
+    query_vector = psycopg.sql.Identifier(args.query_vector_column)
+    validity = psycopg.sql.SQL(
+        effective_candidate_validity_predicate(args.candidate_validity_predicate)
+    )
+    audit_ef = int(args.index_health_ef_search)
+    tolerance = float(args.index_health_zero_distance_tolerance)
+    minimum_rate = float(args.index_health_min_zero_distance_rate)
+    proofs: list[dict[str, object]] = []
+
+    with psycopg.connect(pg_config_from_env().conninfo, autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT vector_sqlens_build_id()")
+        build_row = cur.fetchone()
+        build_id = "" if build_row is None else str(build_row[0] or "")
+        if not build_id.startswith(SQLENS_SUPPORTED_BUILD_PREFIXES):
+            raise RuntimeError(
+                "HNSW query-cohort health audit did not load the expected SQLens "
+                f"extension build: observed={build_id!r}"
+            )
+        cur.execute(
+            "SELECT set_config('statement_timeout', %s, false)",
+            (str(int(args.statement_timeout_ms)),),
+        )
+        cur.execute("SET hnsw.filter_strategy = off")
+        cur.execute("SET hnsw.iterative_scan = off")
+        cur.execute(
+            "SELECT set_config('hnsw.ef_search', %s, false)",
+            (str(audit_ef),),
+        )
+        cur.execute("SET enable_sort = off")
+        for table, index in pairs:
+            prewarm_evidence: dict[str, object] = {
+                "enabled": bool(args.prewarm_index_health),
+                "relation": index,
+                "fork": "main",
+                "mode": "buffer",
+            }
+            if args.prewarm_index_health:
+                prewarm_started = time.perf_counter()
+                cur.execute(
+                    "SELECT pg_prewarm(%s::regclass, 'buffer', 'main')",
+                    (index,),
+                )
+                prewarm_row = cur.fetchone()
+                prewarm_evidence.update(
+                    {
+                        "blocks": int(prewarm_row[0]) if prewarm_row else 0,
+                        "elapsed_ms": (time.perf_counter() - prewarm_started) * 1000.0,
+                    }
+                )
+            if external_query_source:
+                proofs.append(
+                    {
+                        "contract": "external_query_source_index_prewarm_v1",
+                        "index": index,
+                        "table": table,
+                        "query_table": query_table,
+                        "passed": True,
+                        "skipped": True,
+                        "reason": "external_query_source_has_no_candidate_self_id",
+                        "prewarm": prewarm_evidence,
+                    }
+                )
+                continue
+            cur.execute("SELECT current_setting(%s, true)", (args.preferred_index_guc,))
+            setting = cur.fetchone()
+            if setting is None or setting[0] is None:
+                raise RuntimeError(
+                    "HNSW query-cohort health audit requires preferred-index GUC "
+                    f"{args.preferred_index_guc!r}"
+                )
+            cur.execute(
+                "SELECT set_config(%s, %s, false)",
+                (args.preferred_index_guc, index),
+            )
+            statement = psycopg.sql.SQL(
+                "SELECT candidate.{candidate_id}, "
+                "candidate.{candidate_vector} <-> ("
+                "SELECT query_row.{query_vector} FROM {query_table} AS query_row "
+                "WHERE query_row.{query_id} = %s"
+                ") AS distance "
+                "FROM {candidate_table} AS candidate "
+                "WHERE ({validity}) "
+                "ORDER BY distance "
+                "LIMIT 1"
+            ).format(
+                candidate_id=candidate_id,
+                candidate_vector=candidate_vector,
+                candidate_table=relation_identifier(table),
+                query_vector=query_vector,
+                query_table=relation_identifier(query_table),
+                query_id=query_id,
+                validity=validity,
+            )
+            explain = psycopg.sql.SQL("EXPLAIN (FORMAT JSON) ") + statement
+            cur.execute(explain, (query_ids[0],))
+            plan_row = cur.fetchone()
+            observed_indexes = plan_index_names(plan_row[0] if plan_row else None)
+            expected_name = index.rsplit(".", 1)[-1]
+            if expected_name not in observed_indexes:
+                raise RuntimeError(
+                    "HNSW query-cohort health audit did not plan the expected index: "
+                    f"expected={index!r}, observed={sorted(observed_indexes)!r}"
+                )
+
+            observations: list[dict[str, object]] = []
+            for measured_query_id in query_ids:
+                cur.execute(statement, (measured_query_id,))
+                row = cur.fetchone()
+                observations.append(
+                    {
+                        "query_id": measured_query_id,
+                        "returned_id": None if row is None else int(row[0]),
+                        "distance": None if row is None else float(row[1]),
+                    }
+                )
+            proof = validate_index_health_observations(
+                index,
+                observations,
+                zero_distance_tolerance=tolerance,
+                minimum_zero_distance_rate=minimum_rate,
+            )
+            proof.update(
+                {
+                    "table": table,
+                    "query_table": query_table,
+                    "ef_search": audit_ef,
+                    "planned_indexes": sorted(observed_indexes),
+                    "prewarm": prewarm_evidence,
+                }
+            )
+            proofs.append(proof)
+
+    return {
+        "contract": "hnsw_query_cohort_zero_distance_reachability_v2",
+        "passed": all(bool(proof["passed"]) for proof in proofs),
+        "skipped": external_query_source,
+        "reason": (
+            "external_query_source_zero_distance_probe_not_applicable"
+            if external_query_source
+            else None
+        ),
+        "sqlens_build_id": build_id,
+        "query_ids_sha256": hashlib.sha256(
+            ",".join(str(query_id) for query_id in query_ids).encode("ascii")
+        ).hexdigest(),
+        "query_count": len(query_ids),
+        "indexes": proofs,
     }
 
 
@@ -1241,6 +1812,259 @@ def normalized_args(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+CALIBRATION_REUSE_ARG_KEYS = (
+    "backend_cpu_list",
+    "bfs_index",
+    "bfs_table",
+    "calibration_queries",
+    "calibration_query_offset",
+    "calibration_recall_margin",
+    "calibration_repeats",
+    "calibration_selection_policy",
+    "candidate_validity_predicate",
+    "candidate_validity_predicate_explicit",
+    "d1_cache_mb",
+    "d2_index_page_access",
+    "d2_page_access",
+    "d3_cache_mb",
+    "ef_search_values",
+    "expected_truth_self_excluded",
+    "filters",
+    "filters_csv",
+    "force_hnsw",
+    "guidance_filter_strategy",
+    "guidance_max_atoms",
+    "guidance_selectivity_max_pct",
+    "guided_collect_target_values",
+    "insertion_index",
+    "insertion_table",
+    "index_health_ef_search",
+    "index_health_min_zero_distance_rate",
+    "index_health_zero_distance_tolerance",
+    "iterative_scan_values",
+    "max_scan_tuples_values",
+    "modes",
+    "preferred_index_guc",
+    "prewarm_index_health",
+    "query_id_column",
+    "query_table",
+    "query_vector_column",
+    "require_preferred_index_guc",
+    "scan_mem_multiplier_values",
+    "schedule_seed",
+    "stock_iterative_scan_values",
+    "target_recall",
+    "target_recalls",
+    "traversal_guided_burst",
+    "traversal_guided_prioritization",
+    "traversal_guided_target_values",
+    "truth_csv",
+    "warmup_all_queries",
+)
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    with path.open(encoding="utf-8") as source:
+        payload = json.load(source)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"JSON root is not an object: {path}")
+    return payload
+
+
+def _artifact_path(entry: object, field: str) -> Path:
+    if not isinstance(entry, dict) or not entry.get("path"):
+        raise RuntimeError(f"calibration reuse manifest has no {field} artifact")
+    return Path(str(entry["path"])).resolve()
+
+
+def _typed_calibration_rows(path: Path) -> list[dict[str, object]]:
+    with path.open(newline="", encoding="utf-8") as source:
+        rows: list[dict[str, object]] = [dict(row) for row in csv.DictReader(source)]
+    bool_fields = {
+        "rows_complete",
+        "plan_gate_passed",
+        "stopped_early",
+        "grid_exhausted",
+        "calibration_failed",
+        "global_target_reached",
+        "family_stopped_early",
+        "family_stopped_by_cross_family_target",
+        "family_grid_exhausted",
+        "family_target_reached",
+    }
+    int_fields = {
+        "queries",
+        "samples",
+        "ok",
+        "errors",
+        "expected_queries",
+        "expected_repeats",
+        "complete_queries",
+        "ef_search",
+        "max_scan_tuples",
+        "guided_collect_target",
+        "traversal_guided_target",
+        "raw_rows",
+        "plan_checks",
+        "configs_planned",
+        "configs_executed",
+        "configs_run",
+        "configs_reused",
+        "max_ef_evaluated",
+        "max_ef_on_grid",
+        "global_stop_round",
+        "family_configs_planned",
+        "family_configs_executed",
+        "family_errors",
+    }
+    float_fields = {
+        "scan_mem_multiplier",
+        "recall_mean",
+        "recall_lcb95",
+        "latency_mean_ms",
+        "fallback_requests_mean",
+        "stock_bypass_requests_mean",
+    }
+    for row in rows:
+        for field in bool_fields:
+            if field in row and str(row[field]).strip():
+                row[field] = required_csv_bool(str(row[field]), field)
+        for field in int_fields:
+            if field in row and str(row[field]).strip():
+                row[field] = int(float(str(row[field])))
+        for field in float_fields:
+            if field in row and str(row[field]).strip():
+                row[field] = float(str(row[field]))
+    return rows
+
+
+def load_reused_calibration(
+    source_manifest_path: Path,
+    args: argparse.Namespace,
+    current_run_spec: dict[str, object],
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
+    source_manifest_path = source_manifest_path.resolve()
+    source = _read_json_object(source_manifest_path)
+    source_spec = source.get("run_spec")
+    current_args = current_run_spec.get("args")
+    if not isinstance(source_spec, dict) or not isinstance(current_args, dict):
+        raise RuntimeError("calibration reuse requires complete source/current run specs")
+    source_args = source_spec.get("args")
+    if not isinstance(source_args, dict):
+        raise RuntimeError("calibration reuse source run_spec.args is missing")
+    mismatches = [
+        key
+        for key in CALIBRATION_REUSE_ARG_KEYS
+        if source_args.get(key) != current_args.get(key)
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "calibration reuse protocol mismatch: " + ", ".join(mismatches)
+        )
+    source_policy = source.get("calibration_policy")
+    if (
+        not isinstance(source_policy, dict)
+        or source_policy.get("grid_policy") != FORMAL_CALIBRATION_GRID_POLICY
+        or source_policy.get("stop_metric") != "recall_lcb95"
+        or source_policy.get("base_grid_max_ef") != FORMAL_BASE_GRID_MAX_EF
+        or source_policy.get("base_grid_complete_required") is not True
+        or source_policy.get("extension_ef_search_values")
+        != [20_000, 50_000, 100_000]
+        or source_policy.get("extension_trigger")
+        != "max_target_lcb95_unmet_after_complete_base_grid"
+        or source_policy.get("extension_complete_required_when_triggered") is not True
+        or source_policy.get("early_stop_allowed") is not False
+        or source_policy.get("grid_exhaustion_semantics")
+        != "all_policy_required_configs_executed"
+    ):
+        raise RuntimeError(
+            "calibration reuse source uses a legacy or incomplete grid policy"
+        )
+    for field in (
+        "truth_sha256",
+        "filters_sha256",
+        "benchmark_sha256",
+        "sqlens_source_sha256",
+        "sqlens_runtime_provenance",
+        "database",
+        "query_contract",
+        "calibration_query_ids",
+    ):
+        if source_spec.get(field) != current_run_spec.get(field):
+            raise RuntimeError(f"calibration reuse provenance mismatch: {field}")
+
+    outputs = source.get("outputs")
+    if not isinstance(outputs, dict):
+        raise RuntimeError("calibration reuse source outputs are missing")
+    calibration_entry = outputs.get("calibration")
+    calibration_path = _artifact_path(calibration_entry, "calibration")
+    if not calibration_path.is_file():
+        raise RuntimeError(f"reused calibration CSV does not exist: {calibration_path}")
+    assert isinstance(calibration_entry, dict)
+    if calibration_entry.get("sha256") != sha256_file(calibration_path):
+        raise RuntimeError("reused calibration CSV SHA-256 mismatch")
+    if int(calibration_entry.get("row_count") or -1) != csv_row_count(calibration_path):
+        raise RuntimeError("reused calibration CSV row-count mismatch")
+
+    rows = _typed_calibration_rows(calibration_path)
+    expected_pairs = {
+        (str(filter_name), str(mode))
+        for filter_name in args.filters
+        for mode in args.modes
+    }
+    observed_pairs = {
+        (str(row.get("filter_name") or ""), str(row.get("mode") or ""))
+        for row in rows
+    }
+    if observed_pairs != expected_pairs:
+        raise RuntimeError("reused calibration CSV filter/mode matrix mismatch")
+
+    raw_paths: set[Path] = set()
+    for row in rows:
+        raw = Path(str(row.get("raw") or "")).resolve()
+        if not raw.is_file():
+            raise RuntimeError(f"reused calibration raw does not exist: {raw}")
+        if str(row.get("raw_sha256") or "") != sha256_file(raw):
+            raise RuntimeError(f"reused calibration raw SHA-256 mismatch: {raw}")
+        if int(row.get("raw_rows") or -1) != csv_row_count(raw):
+            raise RuntimeError(f"reused calibration raw row-count mismatch: {raw}")
+        require_plan_evidence(
+            raw,
+            explicit_candidate_validity_predicate(args),
+            getattr(args, "database_fingerprint", None),
+        )
+        row["truth_self_excluded"] = args.expected_truth_self_excluded
+        raw_paths.add(raw)
+
+    raw_pairs = source.get("calibration_pairs")
+    calibration_pairs = (
+        [dict(item) for item in raw_pairs if isinstance(item, dict)]
+        if isinstance(raw_pairs, list)
+        else []
+    )
+    if len(calibration_pairs) != len(expected_pairs) or any(
+        pair.get("calibration_grid_policy") != FORMAL_CALIBRATION_GRID_POLICY
+        or pair.get("grid_exhausted") is not True
+        or pair.get("stopped_early") is not False
+        for pair in calibration_pairs
+    ):
+        raise RuntimeError(
+            "calibration reuse source did not exhaust the canonical required grid"
+        )
+    return rows, calibration_pairs, {
+        "contract": "fail_closed_calibration_manifest_reuse_v1",
+        "source_manifest": str(source_manifest_path),
+        "source_manifest_sha256": sha256_file(source_manifest_path),
+        "source_status": source.get("status"),
+        "source_run_spec_hash": source.get("run_spec_hash"),
+        "calibration_csv": str(calibration_path),
+        "calibration_csv_sha256": sha256_file(calibration_path),
+        "calibration_rows": len(rows),
+        "calibration_raw_artifacts": len(raw_paths),
+        "protocol_fields_verified": list(CALIBRATION_REUSE_ARG_KEYS),
+    }
+
+
 def stable_fragment_tracking_evidence(args: argparse.Namespace) -> dict[str, object]:
     evidence = getattr(args, "fragment_tracking_evidence", None)
     if not isinstance(evidence, dict):
@@ -1271,7 +2095,7 @@ def formal_run_uses_d2(args: argparse.Namespace) -> bool:
 
 def prepare_fragment_tracking(args: argparse.Namespace) -> dict[str, object]:
     required = any(mode != "original" for mode in args.modes)
-    tables = list(dict.fromkeys((str(args.insertion_table), str(args.bfs_table))))
+    tables = requested_benchmark_tables(args)
     if not required:
         return {"required": False, "prepared": False, "tables": []}
 
@@ -1320,18 +2144,33 @@ def d2_graph_proof_from_env(args: argparse.Namespace) -> dict[str, object]:
     with psycopg.connect(pg_config_from_env().conninfo, autocommit=True) as conn:
         cur = conn.cursor()
         ensure_functions(cur)
-        return require_d2_graph_proof(
+        cur.execute(
+            "SELECT set_config('maintenance_work_mem', %s, false)",
+            (args.d2_graph_proof_maintenance_work_mem,),
+        )
+        configured_work_mem = str(cur.fetchone()[0])
+        proof_started = time.perf_counter()
+        proof = require_d2_graph_proof(
             cur,
             args.insertion_index,
             args.bfs_index,
         )
+        proof_elapsed_ms = (time.perf_counter() - proof_started) * 1000.0
+        return {
+            **proof,
+            "memory_contract": {
+                "maintenance_work_mem": configured_work_mem,
+                "scope": "live_vector_hnsw_graph_compare_session",
+                "elapsed_ms": proof_elapsed_ms,
+            },
+        }
 
 
 def acquire_formal_data_guard(
     args: argparse.Namespace,
 ) -> tuple[psycopg.Connection, dict[str, object]]:
     query_table = str(getattr(args, "query_table", None) or args.insertion_table)
-    tables = sorted({str(args.insertion_table), str(args.bfs_table), query_table})
+    tables = sorted(set(requested_benchmark_tables(args)) | {query_table})
     connection = psycopg.connect(pg_config_from_env().conninfo, autocommit=False)
     try:
         cur = connection.cursor()
@@ -1386,7 +2225,56 @@ def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
         expected_candidate_validity_predicate=explicit_candidate_validity_predicate(args),
     )
     sqlens_runtime = sqlens_runtime_provenance()
+    expected_build_id = str(
+        getattr(args, "expected_sqlens_build_id", "") or ""
+    )
+    expected_vector_sha = str(
+        getattr(args, "expected_vector_so_sha256", "") or ""
+    )
+    release_contract = getattr(args, "release_contract_provenance", None)
+    if not isinstance(release_contract, dict):
+        raise RuntimeError("P0 release contract was not bound before building the run spec")
+    if (
+        expected_build_id != release_contract.get("expected_sqlens_build_id")
+        or expected_vector_sha != release_contract.get("expected_vector_so_sha256")
+    ):
+        raise RuntimeError("run runtime binding differs from the immutable P0 release contract")
+    if bool(expected_build_id) != bool(expected_vector_sha):
+        raise RuntimeError(
+            "expected SQLens runtime binding requires both build ID and vector.so SHA256"
+        )
+    if expected_build_id and (
+        expected_build_id
+        != str(sqlens_runtime["loaded_vector_sqlens_build_id"])
+        or expected_vector_sha
+        != str(sqlens_runtime["loaded_vector_so_sha256"])
+    ):
+        raise RuntimeError(
+            "loaded SQLens runtime differs from the exact parent/wrapper binding: "
+            f"expected_build={expected_build_id!r}, "
+            f"observed_build={sqlens_runtime['loaded_vector_sqlens_build_id']!r}, "
+            f"expected_sha={expected_vector_sha!r}, "
+            f"observed_sha={sqlens_runtime['loaded_vector_so_sha256']!r}"
+        )
+    database = database_fingerprint(
+        args, str(sqlens_runtime["loaded_vector_sqlens_build_id"])
+    )
     d2_proof = d2_graph_proof_from_env(args)
+    calibration_query_ids = [
+        query_ids[query_no]
+        for query_no in range(
+            args.calibration_query_offset,
+            args.calibration_query_offset + args.calibration_queries,
+        )
+    ]
+    final_query_ids = [
+        query_ids[query_no]
+        for query_no in range(args.final_query_offset, args.final_query_offset + args.final_queries)
+    ]
+    index_query_health = hnsw_query_cohort_health(
+        args,
+        list(dict.fromkeys(calibration_query_ids + final_query_ids)),
+    )
     spec = {
         "args": normalized_args(args),
         "truth_sha256": sha256_file(args.truth_csv),
@@ -1398,7 +2286,23 @@ def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
         ),
         "sqlens_source_sha256": sha256_tree(source_files),
         "sqlens_runtime_provenance": sqlens_runtime,
+        "runtime_identity_binding": {
+            "required": True,
+            "expected_build_id": expected_build_id,
+            "expected_vector_so_sha256": expected_vector_sha,
+            "exact_match": (
+                not expected_build_id
+                or (
+                    expected_build_id
+                    == sqlens_runtime["loaded_vector_sqlens_build_id"]
+                    and expected_vector_sha
+                    == sqlens_runtime["loaded_vector_so_sha256"]
+                )
+            ),
+        },
+        "p0_release_contract": release_contract,
         "d2_graph_proof": d2_proof,
+        "index_query_health": index_query_health,
         "fragment_tracking_preparation": stable_fragment_tracking_evidence(args),
         "query_contract": {
             "query_table": args.query_table or args.insertion_table,
@@ -1418,10 +2322,17 @@ def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
                 "planner_partial_index_predicate_and_sql_candidate_qual_not_guidance_atom"
             ),
             "predicate_contract": (
-                "exact_activated_workload_predicate_plus_candidate_validity_sql_qual"
+                "dual_frontier_traversal_prioritization_plus_candidate_admission"
                 if args.guidance_filter_strategy == "traversal_guided"
-                else "diagnostic_workload_plus_candidate_validity_sql_quals"
+                else (
+                    "planner_proven_candidate_validation_guidance_with_stock_graph_traversal"
+                    if args.guidance_filter_strategy == "safe_guided"
+                    else "diagnostic_workload_plus_candidate_validity_sql_quals"
+                )
             ),
+            "traversal_order_prioritized": args.guidance_filter_strategy == "traversal_guided",
+            "graph_expansion_pruned": False,
+            "distance_computations_pruned": False,
             "self_exclusion": (
                 "limit_k_plus_1_client_remove_query_id"
                 if (
@@ -1440,18 +2351,9 @@ def build_run_spec(args: argparse.Namespace) -> dict[str, object]:
                 and args.expected_truth_self_excluded
             ),
         },
-        "database": database_fingerprint(args, str(sqlens_runtime["loaded_vector_sqlens_build_id"])),
-        "calibration_query_ids": [
-            query_ids[query_no]
-            for query_no in range(
-                args.calibration_query_offset,
-                args.calibration_query_offset + args.calibration_queries,
-            )
-        ],
-        "final_query_ids": [
-            query_ids[query_no]
-            for query_no in range(args.final_query_offset, args.final_query_offset + args.final_queries)
-        ],
+        "database": database,
+        "calibration_query_ids": calibration_query_ids,
+        "final_query_ids": final_query_ids,
     }
     hash_payload = dict(spec)
     if formal_run_uses_d2(args):
@@ -1468,6 +2370,7 @@ def reusable_summary(
     expected_queries: int,
     expected_repeats: int,
     expected_truth_self_excluded: bool = True,
+    allow_fresh_stock_fallback: bool = False,
 ) -> list[dict[str, object]] | None:
     if not path.is_file() or path.stat().st_size == 0:
         return None
@@ -1479,6 +2382,7 @@ def reusable_summary(
             expected_queries,
             expected_repeats,
             expected_truth_self_excluded,
+            allow_fresh_stock_fallback,
         )
     except (KeyError, TypeError, ValueError, csv.Error):
         return None
@@ -1488,6 +2392,17 @@ def reusable_summary(
 def append_option(cmd: list[str], name: str, value: object | None) -> None:
     if value is not None:
         cmd.extend([name, str(value)])
+
+
+def delegated_d2_graph_proof_argument(args: argparse.Namespace) -> str:
+    path = getattr(args, "d2_graph_proof_path", None)
+    if path is not None:
+        proof_path = Path(path)
+        expected_sha = str(getattr(args, "d2_graph_proof_path_sha256", ""))
+        if not proof_path.is_file() or sha256_file(proof_path) != expected_sha:
+            raise RuntimeError("delegated D2 graph proof file is missing or changed")
+        return str(proof_path)
+    return json.dumps(args.d2_graph_proof, sort_keys=True, separators=(",", ":"))
 
 
 def append_expected_runtime_identity(cmd: list[str], args: argparse.Namespace) -> None:
@@ -1534,6 +2449,8 @@ def run_d123(
         str(config.ef_search),
         "--guided-collect-target",
         str(config.guided_collect_target),
+        "--traversal-guided-target",
+        str(config.traversal_guided_target),
         "--max-scan-tuples",
         str(config.max_scan_tuples),
         "--scan-mem-multiplier",
@@ -1550,6 +2467,13 @@ def run_d123(
         mode,
         "--guidance-filter-strategy",
         args.guidance_filter_strategy,
+        "--traversal-guided-burst",
+        str(getattr(args, "traversal_guided_burst", 8)),
+        (
+            "--traversal-guided-prioritization"
+            if getattr(args, "traversal_guided_prioritization", False)
+            else "--no-traversal-guided-prioritization"
+        ),
         "--guidance-selectivity-max-pct",
         str(args.guidance_selectivity_max_pct),
         "--guidance-max-atoms",
@@ -1565,7 +2489,7 @@ def run_d123(
         "--preferred-index-guc",
         args.preferred_index_guc,
         "--d2-graph-proof-json",
-        json.dumps(args.d2_graph_proof, sort_keys=True, separators=(",", ":")),
+        delegated_d2_graph_proof_argument(args),
     ]
     append_option(cmd, "--filters-csv", args.filters_csv)
     append_option(cmd, "--truth-csv", args.truth_csv)
@@ -1630,6 +2554,8 @@ def run_d123_interleaved(
         str(first.ef_search),
         "--guided-collect-target",
         str(first.guided_collect_target),
+        "--traversal-guided-target",
+        str(first.traversal_guided_target),
         "--max-scan-tuples",
         str(first.max_scan_tuples),
         "--scan-mem-multiplier",
@@ -1652,6 +2578,13 @@ def run_d123_interleaved(
         *modes,
         "--guidance-filter-strategy",
         args.guidance_filter_strategy,
+        "--traversal-guided-burst",
+        str(getattr(args, "traversal_guided_burst", 8)),
+        (
+            "--traversal-guided-prioritization"
+            if getattr(args, "traversal_guided_prioritization", False)
+            else "--no-traversal-guided-prioritization"
+        ),
         "--guidance-selectivity-max-pct",
         str(args.guidance_selectivity_max_pct),
         "--guidance-max-atoms",
@@ -1667,7 +2600,7 @@ def run_d123_interleaved(
         "--preferred-index-guc",
         args.preferred_index_guc,
         "--d2-graph-proof-json",
-        json.dumps(args.d2_graph_proof, sort_keys=True, separators=(",", ":")),
+        delegated_d2_graph_proof_argument(args),
     ]
     append_option(cmd, "--filters-csv", args.filters_csv)
     append_option(cmd, "--truth-csv", args.truth_csv)
@@ -1741,6 +2674,7 @@ def configs_for_mode(
                     config.scan_mem_multiplier,
                     iterative_scan,
                     config.guided_collect_target,
+                    config.traversal_guided_target,
                 ),
             )
     return list(unique.values())
@@ -1750,14 +2684,40 @@ def calibration_row_is_complete(row: dict[str, object]) -> bool:
     return (
         int(row.get("ok", 0)) > 0
         and int(row.get("errors", 0)) == 0
-        and bool(row.get("rows_complete", False))
+        and bool(row.get("rows_complete", True))
     )
 
 
-def calibration_stop_reached(rows: list[dict[str, object]], target: float) -> bool:
-    return bool(rows) and all(calibration_row_is_complete(row) for row in rows) and any(
+def calibration_row_is_eligible(row: dict[str, object]) -> bool:
+    """Use one fail-closed eligibility contract for stopping and selection."""
+    return (
         calibration_row_is_complete(row)
-        and float(row["recall_mean"]) >= target
+        and float(row.get("fallback_requests_mean", 0) or 0) == 0
+        and (
+            row.get("mode") in {"original", "design1_bloom_bfs_layout_d3"}
+            or float(row.get("stock_bypass_requests_mean", 0) or 0) == 0
+        )
+    )
+
+
+def calibration_stop_metric(selection_policy: str) -> str:
+    if selection_policy == "mean_latency":
+        return "recall_mean"
+    if selection_policy == "lcb_then_max_recall":
+        return "recall_lcb95"
+    raise ValueError(f"unknown calibration selection policy: {selection_policy}")
+
+
+def calibration_stop_reached(
+    rows: list[dict[str, object]],
+    target: float,
+    selection_policy: str = "mean_latency",
+) -> bool:
+    metric = calibration_stop_metric(selection_policy)
+    return bool(rows) and all(calibration_row_is_complete(row) for row in rows) and any(
+        calibration_row_is_eligible(row)
+        and row.get(metric) is not None
+        and float(row[metric]) >= target
         for row in rows
     )
 
@@ -1817,7 +2777,7 @@ def calibrate_mode_filter(
     args: argparse.Namespace,
     targets: list[float],
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
-    """Interleave monotone family blocks while stopping each family independently."""
+    """Evaluate the complete policy-required grid for every iterative family."""
     rows: list[dict[str, object]] = []
     ordered_configs = sorted(
         configs_for_mode(
@@ -1827,7 +2787,12 @@ def calibrate_mode_filter(
         ),
         key=lambda config: (config.ef_search, config.iterative_scan, config.label),
     )
-    max_target = max(targets)
+    calibration_margin = float(getattr(args, "calibration_recall_margin", 0.0))
+    selection_policy = str(
+        getattr(args, "calibration_selection_policy", "mean_latency")
+    )
+    stop_metric = calibration_stop_metric(selection_policy)
+    max_target = max(targets) + calibration_margin
     reused_configs = 0
     run_configs = 0
     schedule_seed = int(getattr(args, "schedule_seed", 20260718))
@@ -1836,15 +2801,33 @@ def calibrate_mode_filter(
         family_configs.setdefault(config.iterative_scan, []).append(config)
     family_state: dict[str, dict[str, object]] = {}
     for family, items in family_configs.items():
+        ef_values = sorted({config.ef_search for config in items})
+        base_ef_values = [value for value in ef_values if value <= FORMAL_BASE_GRID_MAX_EF]
+        extension_ef_values = [value for value in ef_values if value > FORMAL_BASE_GRID_MAX_EF]
+        if not base_ef_values:
+            base_ef_values = list(ef_values)
+            extension_ef_values = []
+        base_configs = [config for config in items if config.ef_search in base_ef_values]
         family_state[family] = {
-            "ef_values": sorted({config.ef_search for config in items}),
+            "ef_values": ef_values,
+            "base_ef_values": base_ef_values,
+            "extension_ef_values": extension_ef_values,
+            "base_last_ef": max(base_ef_values),
             "next_ef": 0,
-            "configs_planned": len(items),
+            "configs_available": len(items),
+            "configs_planned": len(base_configs),
+            "base_configs_planned": len(base_configs),
+            "extension_configs_available": len(items) - len(base_configs),
+            "high_extension_required": False,
+            "high_extension_executed": False,
+            "high_extension_skip_reason": None,
             "configs_executed": 0,
             "configs_run": 0,
             "configs_reused": 0,
             "errors": 0,
             "stopped_early": False,
+            "stopped_by_cross_family_target": False,
+            "target_reached": False,
             "grid_exhausted": False,
             "max_ef_evaluated": None,
             "complete": False,
@@ -1895,6 +2878,7 @@ def calibrate_mode_filter(
                     args.calibration_queries,
                     args.calibration_repeats,
                     getattr(args, "expected_truth_self_excluded", True),
+                    True,
                 ) if args.resume else None
                 if summary is not None:
                     try:
@@ -1926,6 +2910,7 @@ def calibrate_mode_filter(
                         args.calibration_queries,
                         args.calibration_repeats,
                         getattr(args, "expected_truth_self_excluded", True),
+                        True,
                     )
                     if len(summary) != 1:
                         raise RuntimeError(
@@ -1969,19 +2954,59 @@ def calibrate_mode_filter(
                 block_rows.append(row)
                 state["configs_executed"] = int(state["configs_executed"]) + 1
                 state["errors"] = int(state["errors"]) + int(row.get("errors", 0))
-
             state["max_ef_evaluated"] = ef_search
             at_last_ef = ef_position == len(ef_values) - 1
-            if calibration_stop_reached(block_rows, max_target):
-                state["stopped_early"] = not at_last_ef
-                state["grid_exhausted"] = at_last_ef
-                state["complete"] = True
+            at_base_boundary = ef_search == int(state["base_last_ef"])
+            extension_available = bool(state["extension_ef_values"])
+            if at_base_boundary:
+                family_base_rows = [
+                    row
+                    for row in rows
+                    if row["calibration_family"] == family
+                    and int(row["ef_search"]) <= FORMAL_BASE_GRID_MAX_EF
+                ]
+                base_target_reached = calibration_stop_reached(
+                    family_base_rows,
+                    max_target,
+                    selection_policy,
+                )
+                state["target_reached"] = base_target_reached
+                if extension_available and not base_target_reached:
+                    state["high_extension_required"] = True
+                    state["configs_planned"] = int(state["configs_available"])
+                    state["next_ef"] = ef_position + 1
+                else:
+                    state["high_extension_required"] = False
+                    state["high_extension_executed"] = False
+                    state["high_extension_skip_reason"] = (
+                        "max_target_lcb_met_on_complete_base_grid"
+                        if base_target_reached and extension_available
+                        else "no_high_extension_configured"
+                    )
+                    state["grid_exhausted"] = True
+                    state["complete"] = True
             elif at_last_ef:
+                if bool(state["high_extension_required"]):
+                    state["high_extension_executed"] = True
+                family_rows = [
+                    row
+                    for row in rows
+                    if row["calibration_family"] == family
+                ]
+                state["target_reached"] = calibration_stop_reached(
+                    family_rows,
+                    max_target,
+                    selection_policy,
+                )
                 state["grid_exhausted"] = True
                 state["complete"] = True
             else:
                 state["next_ef"] = ef_position + 1
             calibration_block_no += 1
+
+        # Every iterative family completes all <=10K configurations. A family
+        # runs the complete 20K/50K/100K extension only when its completed base
+        # grid has no configuration whose LCB95 reaches the maximum target.
         family_round += 1
 
     max_ef = max(config.ef_search for config in ordered_configs)
@@ -1989,7 +3014,14 @@ def calibrate_mode_filter(
         family: {
             key: value
             for key, value in state.items()
-            if key not in {"ef_values", "next_ef", "complete"}
+            if key not in {
+                "ef_values",
+                "base_ef_values",
+                "extension_ef_values",
+                "base_last_ef",
+                "next_ef",
+                "complete",
+            }
         }
         for family, state in sorted(family_state.items())
     }
@@ -1997,7 +3029,10 @@ def calibrate_mode_filter(
     evidence = {
         "filter_name": filter_name,
         "mode": mode,
-        "configs_planned": len(ordered_configs),
+        "configs_available": len(ordered_configs),
+        "configs_planned": sum(
+            int(state["configs_planned"]) for state in family_state.values()
+        ),
         "configs_executed": len(rows),
         "configs_run": run_configs,
         "configs_reused": reused_configs,
@@ -2005,11 +3040,29 @@ def calibrate_mode_filter(
         "max_ef_evaluated": max((int(row["ef_search"]) for row in rows), default=None),
         "max_ef_on_grid": max_ef,
         "grid_exhausted": all(bool(state["grid_exhausted"]) for state in family_state.values()),
+        "calibration_complete": all(bool(state["complete"]) for state in family_state.values()),
+        "high_extension_families_required": sorted(
+            family
+            for family, state in family_state.items()
+            if bool(state["high_extension_required"])
+        ),
         "calibration_failed": calibration_failed,
         "families": family_evidence,
         "calibration_execution_order": "seeded_interleaved_family_ef_blocks",
         "calibration_schedule_seed": schedule_seed,
+        "calibration_grid_policy": FORMAL_CALIBRATION_GRID_POLICY,
+        "calibration_stop_scope": (
+            "per_family_complete_20_to_10000_base_then_conditional_complete_"
+            "20000_50000_100000_extension"
+        ),
+        "global_target_reached": any(
+            bool(state["target_reached"]) for state in family_state.values()
+        ),
+        "global_stop_round": None,
         "calibration_stop_target": max_target,
+        "calibration_stop_metric": stop_metric,
+        "calibration_selection_policy": selection_policy,
+        "calibration_recall_margin": calibration_margin,
     }
     for row in rows:
         row.update({key: value for key, value in evidence.items() if key != "families"})
@@ -2020,26 +3073,38 @@ def calibrate_mode_filter(
                 "family_configs_planned": family_values["configs_planned"],
                 "family_configs_executed": family_values["configs_executed"],
                 "family_stopped_early": family_values["stopped_early"],
+                "family_stopped_by_cross_family_target": family_values[
+                    "stopped_by_cross_family_target"
+                ],
                 "family_grid_exhausted": family_values["grid_exhausted"],
+                "family_target_reached": family_values["target_reached"],
                 "family_errors": family_values["errors"],
             }
         )
     return rows, evidence
 
 
-def select_row(rows: list[dict[str, object]], target: float) -> tuple[dict[str, object] | None, bool]:
-    valid = [
-        row
-        for row in rows
-        if int(row["ok"]) > 0
-        and int(row["errors"]) == 0
-        and bool(row.get("rows_complete", True))
-    ]
-    reached = [
-        row
-        for row in valid
-        if float(row["recall_mean"]) >= target
-    ]
+def select_row(
+    rows: list[dict[str, object]],
+    target: float,
+    selection_policy: str = "mean_latency",
+) -> tuple[dict[str, object] | None, bool]:
+    valid = [row for row in rows if calibration_row_is_eligible(row)]
+    if selection_policy == "lcb_then_max_recall":
+        reached = [
+            row
+            for row in valid
+            if float(row["recall_mean"]) >= target
+            and float(row.get("recall_lcb95", row["recall_mean"])) >= target
+        ]
+    elif selection_policy == "mean_latency":
+        reached = [
+            row
+            for row in valid
+            if float(row["recall_mean"]) >= target
+        ]
+    else:
+        raise ValueError(f"unknown calibration selection policy: {selection_policy}")
     if reached:
         return min(
             reached,
@@ -2052,6 +3117,22 @@ def select_row(rows: list[dict[str, object]], target: float) -> tuple[dict[str, 
     return None, False
 
 
+def calibration_selection_description(selection_policy: str) -> str:
+    if selection_policy == "mean_latency":
+        return (
+            "lowest mean latency among complete error-free configurations with mean "
+            "Recall@10 at or above target plus calibration_recall_margin; "
+            "bootstrap CI/LCB is report-only"
+        )
+    if selection_policy == "lcb_then_max_recall":
+        return (
+            "lowest mean latency among all policy-required, complete, error-free "
+            "configurations whose bootstrap Recall@10 LCB95 reaches the selection target; "
+            "if no configuration qualifies, mark the target unattainable on the required grid"
+        )
+    raise ValueError(f"unknown calibration selection policy: {selection_policy}")
+
+
 def config_from_row(row: dict[str, object]) -> Config:
     return Config(
         ef_search=int(row["ef_search"]),
@@ -2059,12 +3140,25 @@ def config_from_row(row: dict[str, object]) -> Config:
         scan_mem_multiplier=float(row["scan_mem_multiplier"]),
         iterative_scan=str(row["iterative_scan"]),
         guided_collect_target=int(row["guided_collect_target"]),
+        traversal_guided_target=int(row.get("traversal_guided_target", 40)),
     )
 
 
 def build_configs(args: argparse.Namespace) -> list[Config]:
     ef_values = parse_ints(args.ef_search_values)
-    target_tokens = [token.strip() for token in args.guided_collect_target_values.split(",") if token.strip()]
+    guided_collect_target_tokens = parse_positive_ints(
+        args.guided_collect_target_values,
+        allow_ef=True,
+    )  # "ef" support is handled below
+    traversal_target_tokens = parse_positive_ints(
+        args.traversal_guided_target_values,
+        allow_ef=False,
+    )
+    min_target = int(getattr(args, "k", 10)) + (
+        1
+        if args.guidance_filter_strategy == "traversal_guided" and args.expected_truth_self_excluded
+        else 0
+    )
     configs: list[Config] = []
     for iterative in [x for x in args.iterative_scan_values.split(",") if x]:
         if args.guidance_filter_strategy == "traversal_guided" and iterative != "off":
@@ -2074,15 +3168,44 @@ def build_configs(args: argparse.Namespace) -> list[Config]:
             )
         for ef in ef_values:
             if args.guidance_filter_strategy == "safe_guided":
-                targets = [1]
+                guided_collect_targets = [1]
             else:
-                targets = [ef if token == "ef" else int(token) for token in target_tokens]
-                if args.guidance_filter_strategy == "traversal_guided":
-                    targets = [max(ef, target) for target in targets]
-            for target in sorted(set(targets)):
-                for max_scan in parse_ints(args.max_scan_tuples_values):
-                    for mem in parse_floats(args.scan_mem_multiplier_values):
-                        configs.append(Config(ef, max_scan, mem, iterative, target))
+                guided_collect_targets = [
+                    ef if token == "ef" else int(token)
+                    for token in guided_collect_target_tokens
+                ]
+            if args.guidance_filter_strategy == "traversal_guided":
+                guided_collect_targets = [
+                    max(ef, int(target) if target != "ef" else ef)
+                    for target in guided_collect_target_tokens
+                ]
+            traversal_guided_targets = [
+                int(target)
+                for target in traversal_target_tokens
+                if min_target <= int(target) <= ef
+            ]
+            if not traversal_guided_targets:
+                raise SystemExit(
+                    f"no valid traversal_guided_target values remain for ef_search={ef}"
+                )
+            if args.guidance_filter_strategy == "safe_guided":
+                # The child safe-guided scan ignores this knob. Keep a single
+                # provenance value instead of timing duplicate configurations.
+                traversal_guided_targets = [min(traversal_guided_targets)]
+            for guided_collect_target in sorted(set(guided_collect_targets)):
+                for traversal_target in sorted(set(traversal_guided_targets)):
+                    for max_scan in parse_ints(args.max_scan_tuples_values):
+                        for mem in parse_floats(args.scan_mem_multiplier_values):
+                            configs.append(
+                                Config(
+                                    ef,
+                                    max_scan,
+                                    mem,
+                                    iterative,
+                                    guided_collect_target,
+                                    traversal_target,
+                                )
+                            )
     if not configs:
         raise SystemExit("empty calibration configuration space")
     return configs
@@ -2093,6 +3216,8 @@ def selected_rows(
     filters: list[str],
     modes: list[str],
     targets: list[float],
+    calibration_recall_margin: float = 0.0,
+    calibration_selection_policy: str = "mean_latency",
 ) -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     for filter_name in filters:
@@ -2109,20 +3234,37 @@ def selected_rows(
                 selected, met = (
                     (None, False)
                     if calibration_failed
-                    else select_row(candidates, target)
+                    else select_row(
+                        candidates,
+                        target + calibration_recall_margin,
+                        calibration_selection_policy,
+                    )
                 )
                 if selected is not None:
+                    lcb_qualified = (
+                        calibration_selection_policy != "lcb_then_max_recall"
+                        or float(selected.get("recall_lcb95", selected["recall_mean"]))
+                        >= target + calibration_recall_margin
+                    )
                     out.append(
                         {
                             "target_recall": target,
+                            "calibration_selection_recall": target
+                            + calibration_recall_margin,
+                            "calibration_recall_margin": calibration_recall_margin,
+                            "calibration_selection_policy": calibration_selection_policy,
                             "target_met_in_calibration": True,
-                            "target_confirmed_in_calibration": True,
+                            "target_confirmed_in_calibration": lcb_qualified,
                             "target_lcb95_met_in_calibration": (
                                 float(selected.get("recall_lcb95", selected["recall_mean"]))
                                 >= target
                             ),
-                            "selection_status": "selected",
-                            "feasibility_status": "selected",
+                            "selection_status": (
+                                "selected" if lcb_qualified else "mean_only_fallback"
+                            ),
+                            "feasibility_status": (
+                                "selected" if lcb_qualified else "mean_only_fallback"
+                            ),
                             **selected,
                         }
                     )
@@ -2140,6 +3282,10 @@ def selected_rows(
                 out.append(
                     {
                         "target_recall": target,
+                        "calibration_selection_recall": target
+                        + calibration_recall_margin,
+                        "calibration_recall_margin": calibration_recall_margin,
+                        "calibration_selection_policy": calibration_selection_policy,
                         "target_met_in_calibration": False,
                         "target_confirmed_in_calibration": False,
                         "target_lcb95_met_in_calibration": False,
@@ -2149,6 +3295,7 @@ def selected_rows(
                         "mode": mode,
                         "config": "",
                         "ef_search": None,
+                        "traversal_guided_target": None,
                         "guided_collect_target": None,
                         "max_scan_tuples": None,
                         "scan_mem_multiplier": None,
@@ -2170,23 +3317,63 @@ def formal_completion_gate(
     selected: list[dict[str, object]],
     final_rows: list[dict[str, object]],
     skip_final: bool,
+    protocol_args: argparse.Namespace | None = None,
 ) -> dict[str, object]:
     expected_filters = list(filters)
-    expected_modes = set(DEFAULT_MODES)
+    expected_modes = set(FORMAL_D1_MODES)
     expected_targets = set(FORMAL_TARGETS)
-    requested_formal_matrix = (
-        len(expected_filters) == 14
-        and len(set(expected_filters)) == 14
-        and len(modes) == len(expected_modes)
-        and set(modes) == expected_modes
-        and len(targets) == len(expected_targets)
-        and set(float(target) for target in targets) == expected_targets
-    )
-    expected_keys = {
+    formal_protocol_errors: list[str] = []
+    if expected_filters != FILTER_ORDER:
+        formal_protocol_errors.append("filters_not_preregistered_amazon14")
+    if list(modes) != FORMAL_D1_MODES:
+        formal_protocol_errors.append("formal_d1_modes_mismatch")
+    if tuple(float(target) for target in targets) != FORMAL_TARGETS:
+        formal_protocol_errors.append("formal_targets_mismatch")
+    if protocol_args is None:
+        formal_protocol_errors.append("formal_protocol_args_missing")
+    else:
+        protocol_checks = {
+            "calibration_q80": int(protocol_args.calibration_queries) == 80,
+            "calibration_r2": int(protocol_args.calibration_repeats) == 2,
+            "calibration_offset20": int(protocol_args.calibration_query_offset) == 20,
+            "final_q100": int(protocol_args.final_queries) == 100,
+            "final_r5": int(protocol_args.final_repeats) == 5,
+            "final_offset100": int(protocol_args.final_query_offset) == 100,
+            "final_interleaved": protocol_args.final_execution_order == "interleaved",
+            "lcb_selection": protocol_args.calibration_selection_policy == "lcb_then_max_recall",
+            "zero_calibration_margin": float(protocol_args.calibration_recall_margin) == 0.0,
+            "dense_22_ef_grid": parse_ints(protocol_args.ef_search_values) == parse_ints(DENSE_22_EF_SEARCH),
+            "sqlens_iterative_families": protocol_args.iterative_scan_values == "off,strict_order",
+            "stock_iterative_families": protocol_args.stock_iterative_scan_values == "off,strict_order",
+            "safe_guided": protocol_args.guidance_filter_strategy == "safe_guided",
+            "traversal_prioritization_disabled": protocol_args.traversal_guided_prioritization is False,
+            "nonbinding_scan_ceiling": parse_ints(protocol_args.max_scan_tuples_values) == [5_000_000],
+            "ample_scan_memory": parse_floats(protocol_args.scan_mem_multiplier_values) == [32.0],
+            "warmup_all_queries": protocol_args.warmup_all_queries is True,
+            "force_hnsw": protocol_args.force_hnsw is True,
+            "preferred_index_required": protocol_args.require_preferred_index_guc is True,
+            "candidate_universe": protocol_args.candidate_validity_predicate == DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+            "filters_sha256": sha256_file(protocol_args.filters_csv) == FORMAL_FILTERS_SHA256,
+            "truth_sha256": sha256_file(protocol_args.truth_csv) == FORMAL_TRUTH_SHA256,
+            "release_contract_bound": isinstance(
+                getattr(protocol_args, "release_contract_provenance", None), dict
+            ),
+        }
+        formal_protocol_errors.extend(
+            name for name, passed in protocol_checks.items() if not passed
+        )
+    requested_formal_matrix = not formal_protocol_errors
+    requested_keys = {
+        (filter_name, float(target), mode)
+        for filter_name in expected_filters
+        for target in targets
+        for mode in modes
+    }
+    formal_release_keys = {
         (filter_name, float(target), mode)
         for filter_name in expected_filters
         for target in FORMAL_TARGETS
-        for mode in DEFAULT_MODES
+        for mode in FORMAL_D1_MODES
     }
 
     def key_counts(rows: list[dict[str, object]]) -> Counter[tuple[str, float, str]]:
@@ -2202,14 +3389,13 @@ def formal_completion_gate(
     selected_counts = key_counts(selected)
     final_counts = key_counts(final_rows)
     matrix_complete = bool(
-        requested_formal_matrix
-        and set(selected_counts) == expected_keys
+        set(selected_counts) == requested_keys
         and all(count == 1 for count in selected_counts.values())
     )
     measurement_complete = bool(
         matrix_complete
         and not skip_final
-        and set(final_counts) == expected_keys
+        and set(final_counts) == requested_keys
         and all(count == 1 for count in final_counts.values())
         and all(
             row.get("final_status") == "complete"
@@ -2224,9 +3410,31 @@ def formal_completion_gate(
         measurement_complete
         and all(row.get("matched_recall_comparison_valid") is True for row in final_rows)
     )
+    formal_release_matrix_complete = bool(
+        requested_formal_matrix
+        and matrix_complete
+        and set(selected_counts) == formal_release_keys
+        and all(
+            row.get("selection_status") == "selected"
+            and row.get("target_lcb95_met_in_calibration") is True
+            and row.get("grid_exhausted") is True
+            and row.get("stopped_early") is False
+            and row.get("calibration_complete") is True
+            and row.get("calibration_grid_policy") == FORMAL_CALIBRATION_GRID_POLICY
+            for row in selected
+        )
+    )
+    formal_release_measurement_complete = bool(
+        formal_release_matrix_complete and measurement_complete
+    )
+    formal_release_comparison_valid = bool(
+        formal_release_measurement_complete and comparison_valid
+    )
     return {
-        "expected_cells": len(expected_keys),
+        "expected_cells": len(requested_keys),
+        "formal_release_expected_cells": len(formal_release_keys),
         "requested_formal_matrix": requested_formal_matrix,
+        "formal_protocol_errors": formal_protocol_errors,
         "selected_cells": len(selected),
         "selected_unique_cells": len(selected_counts),
         "final_cells": len(final_rows),
@@ -2234,6 +3442,19 @@ def formal_completion_gate(
         "matrix_complete": matrix_complete,
         "measurement_complete": measurement_complete,
         "comparison_valid": comparison_valid,
+        "requested_slice_matrix_complete": matrix_complete,
+        "requested_slice_measurement_complete": measurement_complete,
+        "requested_slice_comparison_valid": comparison_valid,
+        "requested_slice_complete": comparison_valid,
+        "formal_release_matrix_complete": formal_release_matrix_complete,
+        "formal_release_measurement_complete": formal_release_measurement_complete,
+        "formal_release_comparison_valid": formal_release_comparison_valid,
+        "formal_release_complete": formal_release_comparison_valid,
+        # A requested slice is useful for diagnosis, but only the preregistered
+        # full release matrix may be consumed by paper aggregation.
+        "diagnostic_valid": comparison_valid,
+        "artifact_valid": formal_release_comparison_valid,
+        "paper_eligible": formal_release_comparison_valid,
         "status": (
             "complete"
             if matrix_complete and measurement_complete and comparison_valid
@@ -2630,13 +3851,38 @@ def main() -> None:
     parser.add_argument("--tag", required=True)
     parser.add_argument("--target-recalls", default="0.90,0.95,0.99")
     parser.add_argument("--target-recall", type=float, help="Backward-compatible single recall target")
+    parser.add_argument(
+        "--calibration-recall-margin",
+        type=float,
+        default=0.0,
+        help=(
+            "Require calibration mean recall >= target + margin before selection; "
+            "the held-out final gate remains the requested target"
+        ),
+    )
+    parser.add_argument(
+        "--calibration-selection-policy",
+        choices=["mean_latency", "lcb_then_max_recall"],
+        default="lcb_then_max_recall",
+        help=(
+            "mean_latency selects the fastest calibration mean-recall hit. "
+            "lcb_then_max_recall requires the calibration LCB95 to reach the target "
+            "and selects the lowest mean-latency qualifying configuration."
+        ),
+    )
     parser.add_argument("--filters", nargs="*", default=FILTER_ORDER)
     parser.add_argument("--modes", nargs="*", default=DEFAULT_MODES)
-    parser.add_argument("--calibration-queries", type=int, default=100)
+    parser.add_argument(
+        "--calibration-queries", type=int, default=DEFAULT_CALIBRATION_QUERIES
+    )
     parser.add_argument("--calibration-repeats", type=int, default=2)
-    parser.add_argument("--calibration-query-offset", type=int, default=0)
-    parser.add_argument("--final-queries", type=int, default=100)
-    parser.add_argument("--final-repeats", type=int, default=5)
+    parser.add_argument(
+        "--calibration-query-offset",
+        type=int,
+        default=DEFAULT_CALIBRATION_QUERY_OFFSET,
+    )
+    parser.add_argument("--final-queries", type=int, default=DEFAULT_FINAL_QUERIES)
+    parser.add_argument("--final-repeats", type=int, default=DEFAULT_FINAL_REPEATS)
     parser.add_argument("--final-query-offset", type=int)
     parser.add_argument(
         "--final-execution-order",
@@ -2646,8 +3892,13 @@ def main() -> None:
     )
     parser.add_argument("--schedule-seed", type=int, default=20260718)
     parser.add_argument("--allow-overlapping-query-splits", action="store_true")
-    parser.add_argument("--ef-search-values", default=DENSE_12_EF_SEARCH)
+    parser.add_argument("--ef-search-values", default=DENSE_22_EF_SEARCH)
     parser.add_argument("--guided-collect-target-values", default="ef")
+    parser.add_argument(
+        "--traversal-guided-target-values",
+        default="11,20,40,80,160",
+        help="Explicit r14 traversal-guided target values (active for traversal-guided child runs).",
+    )
     parser.add_argument(
         "--max-scan-tuples-values",
         default="5000000",
@@ -2658,13 +3909,19 @@ def main() -> None:
         default="32",
         help="Use one ample main-experiment budget; evaluate memory sensitivity separately.",
     )
-    parser.add_argument("--iterative-scan-values", default="off")
+    parser.add_argument(
+        "--iterative-scan-values",
+        default="off,strict_order",
+        help=(
+            "Independent SQLens iterative-scan family grid. safe_guided may tune "
+            "off and strict_order; traversal_guided is restricted to off."
+        ),
+    )
     parser.add_argument(
         "--stock-iterative-scan-values",
         default="off,strict_order",
         help=(
-            "Independent stock-pgvector tuning grid. SQLens traversal-safe modes still use "
-            "--iterative-scan-values=off."
+            "Independent stock-pgvector iterative-scan family grid."
         ),
     )
     parser.add_argument("--filters-csv", type=Path, default=DEFAULT_FILTERS_CSV)
@@ -2678,6 +3935,14 @@ def main() -> None:
     parser.add_argument("--bfs-table", default=DEFAULT_BFS_TABLE)
     parser.add_argument("--bfs-index", default=DEFAULT_BFS_INDEX)
     parser.add_argument(
+        "--d2-graph-proof-maintenance-work-mem",
+        default="64GB",
+        help=(
+            "Session-local memory ceiling for each startup/final live HNSW graph proof. "
+            "The canonical fingerprint fails closed if this budget is insufficient."
+        ),
+    )
+    parser.add_argument(
         "--query-table",
         help="External query relation. Omit to use the candidate table's id and embedding columns.",
     )
@@ -2686,7 +3951,7 @@ def main() -> None:
     parser.add_argument(
         "--candidate-validity-predicate",
         type=validate_candidate_validity_predicate,
-        default="",
+        default=DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
         help=(
             "Global partial-index candidate predicate (for example embedding_valid). "
             "It is forwarded as a SQL/planner qual and never as a D1 guidance atom."
@@ -2699,15 +3964,78 @@ def main() -> None:
         help="Expected self_excluded value in the supplied exact-truth CSV.",
     )
     parser.add_argument(
-        "--guidance-filter-strategy",
-        default="traversal_guided",
-        choices=["traversal_guided", "safe_guided", "guided_collect", "acorn1"],
+        "--index-health-ef-search",
+        type=int,
+        default=10000,
         help=(
-            "Formal D1 uses planner-proven traversal_guided with iterative_scan=off. "
-            "safe_guided, guided_collect, and acorn1 remain diagnostic modes and must not be "
-            "reported as traversal-safe D1."
+            "Preflight ef_search used to verify that every calibration/final query vector "
+            "is zero-distance reachable through each measured HNSW index."
         ),
     )
+    parser.add_argument(
+        "--index-health-zero-distance-tolerance",
+        type=float,
+        default=1e-9,
+        help="Maximum absolute distance accepted by the HNSW query-cohort health audit.",
+    )
+    parser.add_argument(
+        "--index-health-min-zero-distance-rate",
+        type=float,
+        default=0.99,
+        help=(
+            "Minimum high-ef zero-distance reachability rate over the formal query cohort. "
+            "This is an ANN graph-quality gate; exact SQL-valid matched recall remains the "
+            "correctness contract."
+        ),
+    )
+    parser.add_argument(
+        "--prewarm-index-health",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Sequentially read each audited HNSW main fork with pg_prewarm before "
+            "the high-ef cohort-health probe, and record the block count and elapsed "
+            "time in the run manifest. This phase is outside measured latency."
+        ),
+    )
+    parser.add_argument(
+        "--release-contract",
+        type=Path,
+        default=DEFAULT_P0_RELEASE_CONTRACT,
+        help="Immutable P0 r33 build-id/vector.so SHA contract; formal runs fail closed against it.",
+    )
+    parser.add_argument(
+        "--expected-sqlens-build-id",
+        help=(
+            "Optional exact parent/wrapper binding for the loaded SQLens build ID; "
+            "must be supplied together with --expected-vector-so-sha256."
+        ),
+    )
+    parser.add_argument(
+        "--expected-vector-so-sha256",
+        help=(
+            "Optional exact parent/wrapper binding for the loaded vector.so SHA-256; "
+            "must be supplied together with --expected-sqlens-build-id."
+        ),
+    )
+    parser.add_argument(
+        "--guidance-filter-strategy",
+        default="safe_guided",
+        choices=["traversal_guided", "safe_guided", "guided_collect", "acorn1"],
+        help=(
+            "safe_guided is the formal candidate-validation D1: it preserves stock graph "
+            "traversal/termination and guides heap admission. traversal_guided is formal only "
+            "when expanded-node or distance-computation counters prove traversal pruning. "
+            "guided_collect and acorn1 remain diagnostic modes."
+        ),
+    )
+    parser.add_argument(
+        "--traversal-guided-prioritization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require the r14 profiled, target-bounded dual-frontier D1 path in child measurements.",
+    )
+    parser.add_argument("--traversal-guided-burst", type=int, default=8)
     parser.add_argument(
         "--guidance-selectivity-max-pct",
         type=float,
@@ -2744,21 +4072,69 @@ def main() -> None:
     parser.add_argument("--warmup-all-queries", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--force-hnsw", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--reuse-calibration-manifest",
+        type=Path,
+        help=(
+            "Reuse a fail-closed audited calibration slice from a prior manifest; "
+            "all calibration protocol, data, database, source, and binary provenance "
+            "must match. Selection/final settings may differ."
+        ),
+    )
     parser.add_argument("--skip-final", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--statement-timeout-ms", type=int, default=300000)
     parser.add_argument("--progress-queries", type=int, default=10)
     parser.add_argument("--bootstrap-samples", type=int, default=10000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260718)
     args = parser.parse_args()
-    args.candidate_validity_predicate_explicit = (
-        "--candidate-validity-predicate" in sys.argv
+    bind_p0_release_contract(args)
+    args.candidate_validity_predicate_explicit = bool(
+        str(args.candidate_validity_predicate).strip()
     )
+
+    if (
+        args.guidance_filter_strategy == "safe_guided"
+        and args.traversal_guided_prioritization
+    ):
+        raise SystemExit(
+            "safe_guided formal runs require --no-traversal-guided-prioritization"
+        )
+
+    if args.index_health_ef_search <= 0:
+        raise SystemExit("--index-health-ef-search must be positive")
+    if (
+        not math.isfinite(args.index_health_zero_distance_tolerance)
+        or args.index_health_zero_distance_tolerance < 0
+    ):
+        raise SystemExit(
+            "--index-health-zero-distance-tolerance must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(args.index_health_min_zero_distance_rate)
+        or not 0.0 <= args.index_health_min_zero_distance_rate <= 1.0
+    ):
+        raise SystemExit("--index-health-min-zero-distance-rate must be within [0, 1]")
+    if bool(args.expected_sqlens_build_id) != bool(args.expected_vector_so_sha256):
+        raise SystemExit(
+            "--expected-sqlens-build-id and --expected-vector-so-sha256 "
+            "must be supplied together"
+        )
+    if args.expected_vector_so_sha256 and (
+        len(args.expected_vector_so_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in args.expected_vector_so_sha256
+        )
+    ):
+        raise SystemExit("--expected-vector-so-sha256 must be 64 lowercase hex characters")
 
     if args.guidance_filter_strategy == "safe_guided":
         print("safe_guided preserves stock termination; guided_collect_target is fixed to 1 and ignored", flush=True)
 
     if args.final_query_offset is None:
         args.final_query_offset = args.calibration_query_offset + args.calibration_queries
+    if args.calibration_recall_margin < 0:
+        raise SystemExit("--calibration-recall-margin must be non-negative")
     calibration_range = range(
         args.calibration_query_offset,
         args.calibration_query_offset + args.calibration_queries,
@@ -2781,6 +4157,9 @@ def main() -> None:
         "matrix_complete": False,
         "measurement_complete": False,
         "comparison_valid": False,
+        "diagnostic_valid": False,
+        "artifact_valid": False,
+        "paper_eligible": False,
         "error": None,
     }
     calibration_rows: list[dict[str, object]] = []
@@ -2803,6 +4182,16 @@ def main() -> None:
         args.run_spec_hash = str(run_spec["run_spec_hash"])
         run_prefix = f"{args.run_spec_hash[:12]}_{args.tag}"
         manifest_out = RESULTS / f"sigmod_matched_recall_manifest_{run_prefix}.json"
+        if bool(args.d2_graph_proof.get("required", True)):
+            args.d2_graph_proof_path = (
+                RESULTS / f"sigmod_matched_recall_d2_graph_proof_{run_prefix}.json"
+            )
+            write_json_atomic(args.d2_graph_proof_path, args.d2_graph_proof)
+            args.d2_graph_proof_path_sha256 = sha256_file(args.d2_graph_proof_path)
+            manifest["delegated_d2_graph_proof"] = {
+                "path": str(args.d2_graph_proof_path),
+                "sha256": args.d2_graph_proof_path_sha256,
+            }
         targets = [args.target_recall] if args.target_recall is not None else parse_targets(args.target_recalls)
         configs = build_configs(args)
         mode_grids = mode_calibration_grids(
@@ -2840,13 +4229,40 @@ def main() -> None:
                 "calibration_policy": {
                     "execution_order": "seeded_interleaved_family_ef_blocks",
                     "schedule_seed": args.schedule_seed,
-                    "stop_condition": (
-                        "independently per iterative-scan family, after every distinct configuration "
-                        "in an ef_search block completes without errors, stop that family when any "
-                        "mean Recall@10 reaches the highest requested target"
+                    "grid_policy": FORMAL_CALIBRATION_GRID_POLICY,
+                    "base_grid_max_ef": FORMAL_BASE_GRID_MAX_EF,
+                    "base_grid_complete_required": True,
+                    "extension_ef_search_values": [
+                        value
+                        for value in parse_ints(args.ef_search_values)
+                        if value > FORMAL_BASE_GRID_MAX_EF
+                    ],
+                    "extension_trigger": (
+                        "max_target_lcb95_unmet_after_complete_base_grid"
                     ),
-                    "selection": "lowest mean latency among complete error-free configurations with mean Recall@10 at or above target; bootstrap CI/LCB is report-only",
-                    "unattainable_condition": "full grid evaluated with every block complete and error-free",
+                    "extension_complete_required_when_triggered": True,
+                    "early_stop_allowed": False,
+                    "grid_exhaustion_semantics": (
+                        "all_policy_required_configs_executed"
+                    ),
+                    "stop_condition": (
+                        "within every iterative-scan family, complete every 20--10000 base-grid "
+                        "configuration; only after that base grid is complete, run the complete "
+                        "20000--100000 extension when the maximum target Recall@10 LCB95 remains "
+                        "unmet; first-crossing and latency-dominance early stops are forbidden"
+                    ),
+                    "stop_metric": calibration_stop_metric(
+                        args.calibration_selection_policy
+                    ),
+                    "selection": calibration_selection_description(
+                        args.calibration_selection_policy
+                    ),
+                    "calibration_recall_margin": args.calibration_recall_margin,
+                    "calibration_selection_policy": args.calibration_selection_policy,
+                    "unattainable_condition": (
+                        "every policy-required base/extension configuration completed "
+                        "without errors and no configuration reached the target LCB95"
+                    ),
                 },
                 "calibration_pairs": calibration_pairs,
             }
@@ -2855,20 +4271,41 @@ def main() -> None:
 
         manifest["timestamps"]["calibration_started_at"] = utc_now()  # type: ignore[index]
         write_json_atomic(manifest_out, manifest)
-        for filter_name in args.filters:
-            for mode in args.modes:
-                print(f"calibrating filter={filter_name} mode={mode}", flush=True)
-                pair_rows, pair_evidence = calibrate_mode_filter(
-                    filter_name,
-                    mode,
-                    configs,
-                    args,
-                    targets,
-                )
-                calibration_rows.extend(pair_rows)
-                calibration_pairs.append(pair_evidence)
+        if args.reuse_calibration_manifest:
+            calibration_rows, calibration_pairs, reuse_evidence = load_reused_calibration(
+                args.reuse_calibration_manifest,
+                args,
+                run_spec,
+            )
+            manifest["calibration_reuse"] = reuse_evidence
+            print(
+                "reused fail-closed calibration manifest "
+                f"{args.reuse_calibration_manifest}",
+                flush=True,
+            )
+        else:
+            for filter_name in args.filters:
+                for mode in args.modes:
+                    print(f"calibrating filter={filter_name} mode={mode}", flush=True)
+                    pair_rows, pair_evidence = calibrate_mode_filter(
+                        filter_name,
+                        mode,
+                        configs,
+                        args,
+                        targets,
+                    )
+                    calibration_rows.extend(pair_rows)
+                    calibration_pairs.append(pair_evidence)
+        manifest["calibration_pairs"] = calibration_pairs
         write_csv(calibration_out, calibration_rows)
-        selected = selected_rows(calibration_rows, args.filters, args.modes, targets)
+        selected = selected_rows(
+            calibration_rows,
+            args.filters,
+            args.modes,
+            targets,
+            args.calibration_recall_margin,
+            args.calibration_selection_policy,
+        )
         write_csv(selected_out, selected)
         manifest["timestamps"]["calibration_completed_at"] = utc_now()  # type: ignore[index]
         manifest["outputs"] = {
@@ -2934,6 +4371,7 @@ def main() -> None:
             selected,
             final_rows,
             args.skip_final,
+            args,
         )
         manifest.update(completion)
         manifest["status"] = completion["status"]

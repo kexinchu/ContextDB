@@ -18,7 +18,7 @@ WITH p AS (
 	SELECT vector_hnsw_last_scan_profile()::jsonb AS j
 )
 SELECT
-	(j->>'profile_semantics_version')::int = 7 AS semantics_v7,
+	(j->>'profile_semantics_version')::int = 12 AS semantics_v12,
 	j ? 'index_page_loads' AND j ? 'index_page_runs' AND
 	j ? 'index_page_distinct_pages' AND j ? 'index_page_last_block' AS index_fields,
 	(j->>'index_page_loads')::bigint >= 0 AND
@@ -27,6 +27,68 @@ SELECT
 	(j->>'index_page_runs')::bigint <= (j->>'index_page_loads')::bigint AS index_runs_bounded,
 	(j->>'index_page_loads')::bigint =
 		(j->>'idx_blks_hit')::bigint + (j->>'idx_blks_read')::bigint AS index_buffers_match,
+	j ? 'index_readbuffer_calls' AND
+	j ? 'index_readbuffer_ms' AND
+	j ? 'index_readbuffer_shared_read_calls' AND
+	j ? 'index_readbuffer_shared_read_ms' AND
+	j ? 'index_readbuffer_shared_hit_calls' AND
+	j ? 'index_readbuffer_shared_hit_ms' AND
+	j ? 'index_readbuffer_unclassified_calls' AND
+	j ? 'index_readbuffer_unclassified_ms' AS readbuffer_fields,
+	(j->>'index_readbuffer_calls')::bigint =
+		(j->>'index_page_loads')::bigint AND
+	(j->>'index_readbuffer_calls')::bigint =
+		(j->>'index_readbuffer_shared_read_calls')::bigint +
+		(j->>'index_readbuffer_shared_hit_calls')::bigint +
+		(j->>'index_readbuffer_unclassified_calls')::bigint AS readbuffer_calls_match,
+	(j->>'index_readbuffer_ms')::double precision >= 0 AND
+	abs(
+		(j->>'index_readbuffer_ms')::double precision -
+		(
+			(j->>'index_readbuffer_shared_read_ms')::double precision +
+			(j->>'index_readbuffer_shared_hit_ms')::double precision +
+			(j->>'index_readbuffer_unclassified_ms')::double precision
+		)
+	) < 0.001 AS readbuffer_time_matches,
+	j ? 'distance_compute_timed_calls' AND
+	j ? 'distance_compute_ms' AND
+	j ? 'hnsw_remaining_ms' AND
+	j ? 'profile_timer_overhead_scope' AS distance_time_fields,
+	(j->>'distance_compute_timed_calls')::bigint =
+		(j->>'distance_compute_count')::bigint AND
+	(j->>'distance_compute_ms')::double precision >= 0 AS distance_calls_match,
+	abs(
+		(j->>'hnsw_am_callback_ms')::double precision -
+		(
+			(j->>'index_readbuffer_ms')::double precision +
+			(j->>'distance_compute_ms')::double precision +
+			(j->>'hnsw_remaining_ms')::double precision
+		)
+	) < 0.001 AS hnsw_breakdown_matches,
+	j ? 'index_page_transition_count' AND
+	j ? 'index_page_same_block_transitions' AND
+	j ? 'index_page_within_1_page_transitions' AND
+	j ? 'index_page_within_4_pages_transitions' AND
+	j ? 'index_page_within_16_pages_transitions' AND
+	j ? 'index_page_backward_transitions' AND
+	j ? 'index_page_total_abs_block_delta' AND
+	j ? 'index_page_max_abs_block_delta' AND
+	j ? 'index_page_trace_sample' AS trace_fields,
+	(j->>'index_page_transition_count')::bigint =
+		GREATEST((j->>'index_page_loads')::bigint - 1, 0) AS transitions_match_one_scan,
+	(j->>'index_page_same_block_transitions')::bigint <=
+		(j->>'index_page_within_1_page_transitions')::bigint AND
+	(j->>'index_page_within_1_page_transitions')::bigint <=
+		(j->>'index_page_within_4_pages_transitions')::bigint AND
+	(j->>'index_page_within_4_pages_transitions')::bigint <=
+		(j->>'index_page_within_16_pages_transitions')::bigint AND
+	(j->>'index_page_within_16_pages_transitions')::bigint <=
+		(j->>'index_page_transition_count')::bigint AS transition_counts_bounded,
+	(j->>'index_page_trace_sample_count')::bigint =
+		LEAST((j->>'index_page_loads')::bigint,
+			  (j->>'index_page_trace_sample_limit')::bigint) AND
+	jsonb_array_length(j->'index_page_trace_sample') =
+		(j->>'index_page_trace_sample_count')::int AS trace_sample_matches,
 	j ? 'heap_tid_returns' AND j ? 'heap_tid_page_runs' AND
 	j ? 'heap_tid_distinct_pages' AS heap_fields,
 	(j->>'heap_tid_returns')::bigint = 4 AND
@@ -36,9 +98,397 @@ SELECT
 		(j->>'raw_index_tids_returned')::bigint AS heap_returns_match,
 	(j->>'heap_blks_are_exact_heap_io')::boolean = false AS heap_io_not_claimed_exact
 FROM p;
- semantics_v7 | index_fields | index_nonnegative | index_runs_bounded | index_buffers_match | heap_fields | predictable_heap_runs | heap_returns_match | heap_io_not_claimed_exact 
---------------+--------------+-------------------+--------------------+---------------------+-------------+-----------------------+--------------------+---------------------------
- t            | t            | t                 | t                  | t                   | t           | t                     | t                  | t
+ semantics_v12 | index_fields | index_nonnegative | index_runs_bounded | index_buffers_match | readbuffer_fields | readbuffer_calls_match | readbuffer_time_matches | distance_time_fields | distance_calls_match | hnsw_breakdown_matches | trace_fields | transitions_match_one_scan | transition_counts_bounded | trace_sample_matches | heap_fields | predictable_heap_runs | heap_returns_match | heap_io_not_claimed_exact 
+---------------+--------------+-------------------+--------------------+---------------------+-------------------+------------------------+-------------------------+----------------------+----------------------+------------------------+--------------+----------------------------+---------------------------+----------------------+-------------+-----------------------+--------------------+---------------------------
+ t             | t            | t                 | t                  | t                   | t                 | t                      | t                       | t                    | t                    | t                      | t            | t                          | t                         | t                    | t           | t                     | t                  | t
+(1 row)
+
+WITH f AS (
+	SELECT vector_hnsw_graph_fingerprint('hnsw_profile_t_idx')::jsonb AS j
+)
+SELECT
+	j->>'format' = 'sqlens-hnsw-graph-v3' AS graph_v3,
+	(j->>'nodes')::bigint = 8 AND
+	(j->>'heap_tids')::bigint = 8 AND
+	(j->>'tombstones')::bigint = 0 AS complete_tuple_coverage,
+	j#>>'{edge_span,format}' = 'sqlens-hnsw-edge-span-v1' AND
+	(j#>>'{edge_span,full_statistics}')::boolean AS edge_span_v1,
+	(j#>>'{edge_span,all_layers,directed_edges}')::bigint >=
+		(j#>>'{edge_span,level_zero,directed_edges}')::bigint AND
+	(j#>>'{edge_span,level_zero,directed_edges}')::bigint > 0 AS edge_counts_complete,
+	(j#>>'{edge_span,level_zero,same_page_edges}')::bigint <=
+		(j#>>'{edge_span,level_zero,within_1_page_edges}')::bigint AND
+	(j#>>'{edge_span,level_zero,within_1_page_edges}')::bigint <=
+		(j#>>'{edge_span,level_zero,within_4_pages_edges}')::bigint AND
+	(j#>>'{edge_span,level_zero,within_4_pages_edges}')::bigint <=
+		(j#>>'{edge_span,level_zero,within_16_pages_edges}')::bigint AND
+	(j#>>'{edge_span,level_zero,within_16_pages_edges}')::bigint <=
+		(j#>>'{edge_span,level_zero,directed_edges}')::bigint AS edge_bands_bounded,
+	(j#>>'{edge_span,level_zero,p50_abs_block_delta}')::bigint <=
+		(j#>>'{edge_span,level_zero,p95_abs_block_delta}')::bigint AND
+	(j#>>'{edge_span,level_zero,p95_abs_block_delta}')::bigint <=
+		(j#>>'{edge_span,level_zero,p99_abs_block_delta}')::bigint AND
+	(j#>>'{edge_span,level_zero,p99_abs_block_delta}')::bigint <=
+		(j#>>'{edge_span,level_zero,max_abs_block_delta}')::bigint AS edge_percentiles_ordered
+FROM f;
+ graph_v3 | complete_tuple_coverage | edge_span_v1 | edge_counts_complete | edge_bands_bounded | edge_percentiles_ordered 
+----------+-------------------------+--------------+----------------------+--------------------+--------------------------
+ t        | t                       | t            | t                    | t                  | t
+(1 row)
+
+RESET enable_seqscan;
+SET enable_seqscan = off;
+SET hnsw.ef_search = 32;
+SET hnsw.filter_strategy = traversal_guided;
+SET hnsw.traversal_guided_prioritization = on;
+SET hnsw.traversal_guided_target = 4;
+SET hnsw.max_scan_tuples = 50000;
+SET hnsw.traversal_guided_min_skip_rate = 0;
+CREATE TABLE hnsw_profile_guidance_t (
+    id int PRIMARY KEY,
+    eligible boolean NOT NULL,
+    tags int[] NOT NULL,
+    other_tags int[] NOT NULL,
+    val vector(2) NOT NULL
+);
+INSERT INTO hnsw_profile_guidance_t
+SELECT i,
+       i % 2 = 0,
+       CASE i % 3 WHEN 0 THEN ARRAY[23] WHEN 1 THEN ARRAY[29] ELSE ARRAY[31] END,
+       CASE i % 2 WHEN 0 THEN ARRAY[23] ELSE ARRAY[31] END,
+       ARRAY[
+           (((i * 37) % 997)::double precision + i / 100000.0)::real,
+           (((i * 97) % 991)::double precision + i / 70000.0)::real
+       ]::vector
+FROM generate_series(1, 256) AS rows(i);
+CREATE INDEX hnsw_profile_guidance_idx
+ON hnsw_profile_guidance_t USING hnsw (val vector_l2_ops)
+WITH (m = 8, ef_construction = 80);
+ANALYZE hnsw_profile_guidance_t;
+SET client_min_messages = warning;
+SELECT vector_hnsw_fragment_tracking_enable('hnsw_profile_guidance_t'::regclass) IS NOT NULL AS profile_guidance_tracking_enabled;
+ profile_guidance_tracking_enabled 
+-----------------------------------
+ t
+(1 row)
+
+RESET client_min_messages;
+SELECT vector_hnsw_guidance_activate(
+	'hnsw_profile_guidance_idx'::regclass,
+	ARRAY['exact:sql:eligible'],
+	'exact'
+) AS activated_guidance_atoms;
+ activated_guidance_atoms 
+--------------------------
+                        1
+(1 row)
+
+SELECT vector_hnsw_guidance_activate(
+	'hnsw_profile_guidance_idx'::regclass,
+	ARRAY['exact:sql:eligible'],
+	'exact'
+) = 1 AS repeated_activation_reuses_guide;
+ repeated_activation_reuses_guide 
+----------------------------------
+ t
+(1 row)
+
+SELECT (vector_hnsw_guidance_profile()::jsonb->>'fast_reactivation_hits')::bigint = 1
+AS fast_reactivation_recorded;
+ fast_reactivation_recorded 
+----------------------------
+ t
+(1 row)
+
+SELECT count(*) > 0 AS traversal_guided_query_honors_profile
+FROM (
+	SELECT id FROM hnsw_profile_guidance_t
+	WHERE (SELECT vector_hnsw_guidance_bind(
+			'hnsw_profile_guidance_idx'::regclass,
+			ARRAY['exact:sql:eligible'],
+			'exact'
+		) OFFSET 0)
+	  AND eligible
+	ORDER BY val <-> '[400,400]'::vector
+	LIMIT 10
+) AS guided_rows;
+ traversal_guided_query_honors_profile 
+---------------------------------------
+ t
+(1 row)
+
+WITH p AS (
+	SELECT vector_hnsw_last_scan_profile()::jsonb AS j
+)
+SELECT
+	(j->>'traversal_result_target')::int = 4 AS traversal_target_is_capped,
+	(j->>'traversal_guided_result_count')::int = 4 AS guided_result_count_matches_target,
+	(j->>'traversal_max_scan_reached')::boolean = false AS max_scan_not_reached_for_loose_cap
+FROM p;
+ traversal_target_is_capped | guided_result_count_matches_target | max_scan_not_reached_for_loose_cap 
+----------------------------+------------------------------------+------------------------------------
+ t                          | t                                  | t
+(1 row)
+
+SET hnsw.max_scan_tuples = 1;
+SELECT vector_hnsw_reset_scan_profile();
+ vector_hnsw_reset_scan_profile 
+--------------------------------
+ 
+(1 row)
+
+SELECT count(*) > 0 AS traversal_guided_query_honors_low_cap
+FROM (
+	SELECT id FROM hnsw_profile_guidance_t
+	WHERE (SELECT vector_hnsw_guidance_bind(
+			'hnsw_profile_guidance_idx'::regclass,
+			ARRAY['exact:sql:eligible'],
+			'exact'
+		) OFFSET 0)
+	  AND eligible
+	ORDER BY val <-> '[400,400]'::vector
+	LIMIT 10
+) AS guided_rows;
+ traversal_guided_query_honors_low_cap 
+---------------------------------------
+ t
+(1 row)
+
+WITH p AS (
+	SELECT vector_hnsw_last_scan_profile()::jsonb AS j
+)
+SELECT
+	(j->>'traversal_result_target')::int = 4 AS traversal_target_stays_capped,
+	(j->>'traversal_guided_result_count')::int < 4 AS guided_result_count_below_target_for_low_cap,
+	(j->>'traversal_max_scan_reached')::boolean = true AS max_scan_reached_for_low_cap
+FROM p;
+ traversal_target_stays_capped | guided_result_count_below_target_for_low_cap | max_scan_reached_for_low_cap 
+-------------------------------+----------------------------------------------+------------------------------
+ t                             | t                                            | t
+(1 row)
+
+SET hnsw.max_scan_tuples = 50000;
+UPDATE hnsw_profile_guidance_t SET eligible = NOT eligible WHERE id = 1;
+SELECT vector_hnsw_guidance_activate(
+	'hnsw_profile_guidance_idx'::regclass,
+	ARRAY['exact:sql:eligible'],
+	'exact'
+) = 1 AS stale_fast_reactivation_deferred_to_scan;
+ stale_fast_reactivation_deferred_to_scan 
+------------------------------------------
+ t
+(1 row)
+
+SELECT count(*) > 0 AS stale_guide_fails_open_to_stock
+FROM (
+	SELECT id FROM hnsw_profile_guidance_t
+	WHERE (SELECT vector_hnsw_guidance_bind(
+			'hnsw_profile_guidance_idx'::regclass,
+			ARRAY['exact:sql:eligible'],
+			'exact'
+		) OFFSET 0)
+	  AND eligible
+	ORDER BY val <-> '[400,400]'::vector
+	LIMIT 10
+) AS stale_rows;
+ stale_guide_fails_open_to_stock 
+---------------------------------
+ t
+(1 row)
+
+SELECT value->>'planner_proof_bypass_reason' = 'stale_relation' AND
+	   value->>'final_path' = 'stock_bypass' AND
+	   value->>'stock_bypass_reason' = 'stale_relation' AND
+	   value->>'traversal_admission_reason' = 'stale_relation'
+	   AS stale_detected_under_query_snapshot
+FROM (SELECT vector_hnsw_last_scan_profile()::jsonb AS value) AS profile;
+ stale_detected_under_query_snapshot 
+-------------------------------------
+ t
+(1 row)
+
+SELECT vector_hnsw_guidance_activate(
+	'hnsw_profile_guidance_idx'::regclass,
+	ARRAY['exact:sql:eligible'],
+	'exact'
+) = 1 AS stale_guide_rebuilt_after_fail_open;
+ stale_guide_rebuilt_after_fail_open 
+-------------------------------------
+ t
+(1 row)
+
+DO $$
+DECLARE
+	guide_profile jsonb;
+	scan_profile jsonb;
+	rows_found bigint;
+BEGIN
+	PERFORM vector_hnsw_guidance_reset();
+	PERFORM vector_hnsw_guidance_activate(
+		'hnsw_profile_guidance_idx'::regclass,
+		ARRAY['exact:sql:tags @> ARRAY[23]::int[]', '|',
+			  'exact:sql:tags @> ARRAY[29]::int[]'],
+		'exact');
+	SELECT count(*) INTO rows_found
+	FROM (
+		SELECT id FROM hnsw_profile_guidance_t
+		WHERE (SELECT vector_hnsw_guidance_bind(
+			'hnsw_profile_guidance_idx'::regclass,
+			ARRAY['exact:sql:tags @> ARRAY[23]::int[]', '|',
+				  'exact:sql:tags @> ARRAY[29]::int[]'],
+			'exact') OFFSET 0)
+		  AND tags && ARRAY[23,29]::int[]
+		ORDER BY val <-> '[400,400]'::vector
+		LIMIT 10
+	) AS overlap_rows;
+	SELECT vector_hnsw_guidance_profile()::jsonb INTO guide_profile;
+	SELECT vector_hnsw_last_scan_profile()::jsonb INTO scan_profile;
+	IF rows_found = 0 OR
+	   guide_profile->>'planner_proof_bypass_reason' <> 'none' OR
+	   NOT (scan_profile->>'planner_proof_succeeded')::boolean OR
+	   (scan_profile->>'guidance_checks')::bigint <= 0 THEN
+		RAISE EXCEPTION 'int4 overlap equivalence proof failed: guide %, scan %',
+			guide_profile, scan_profile;
+	END IF;
+END $$;
+DO $$
+DECLARE
+	guide_profile jsonb;
+	scan_profile jsonb;
+BEGIN
+	PERFORM vector_hnsw_guidance_reset();
+	PERFORM vector_hnsw_guidance_activate(
+		'hnsw_profile_guidance_idx'::regclass,
+		ARRAY['exact:sql:tags @> ARRAY[23]::int[]'],
+		'exact');
+	PERFORM id FROM hnsw_profile_guidance_t
+	WHERE (SELECT vector_hnsw_guidance_bind(
+		'hnsw_profile_guidance_idx'::regclass,
+		ARRAY['exact:sql:tags @> ARRAY[23]::int[]'],
+		'exact') OFFSET 0)
+	  AND tags && ARRAY[23,29]::int[]
+	ORDER BY val <-> '[400,400]'::vector
+	LIMIT 10;
+	SELECT vector_hnsw_guidance_profile()::jsonb INTO guide_profile;
+	SELECT vector_hnsw_last_scan_profile()::jsonb INTO scan_profile;
+	IF guide_profile->>'planner_proof_bypass_reason' <> 'predicate_not_implied' OR
+	   scan_profile->>'final_path' <> 'stock_bypass' OR
+	   (scan_profile->>'guidance_checks')::bigint <> 0 THEN
+		RAISE EXCEPTION 'incomplete overlap guide did not fail open: guide %, scan %',
+			guide_profile, scan_profile;
+	END IF;
+END $$;
+DO $$
+DECLARE
+	guide_profile jsonb;
+	scan_profile jsonb;
+BEGIN
+	PERFORM vector_hnsw_guidance_reset();
+	PERFORM vector_hnsw_guidance_activate(
+		'hnsw_profile_guidance_idx'::regclass,
+		ARRAY['exact:sql:tags @> ARRAY[23]::int[]', '|',
+			  'exact:sql:tags @> ARRAY[29]::int[]'],
+		'exact');
+	PERFORM id FROM hnsw_profile_guidance_t
+	WHERE (SELECT vector_hnsw_guidance_bind(
+		'hnsw_profile_guidance_idx'::regclass,
+		ARRAY['exact:sql:tags @> ARRAY[23]::int[]', '|',
+			  'exact:sql:tags @> ARRAY[29]::int[]'],
+		'exact') OFFSET 0)
+	  AND other_tags && ARRAY[23,29]::int[]
+	ORDER BY val <-> '[400,400]'::vector
+	LIMIT 10;
+	SELECT vector_hnsw_guidance_profile()::jsonb INTO guide_profile;
+	SELECT vector_hnsw_last_scan_profile()::jsonb INTO scan_profile;
+	IF guide_profile->>'planner_proof_bypass_reason' <> 'predicate_not_implied' OR
+	   scan_profile->>'final_path' <> 'stock_bypass' THEN
+		RAISE EXCEPTION 'different-column overlap guide did not fail open: guide %, scan %',
+			guide_profile, scan_profile;
+	END IF;
+END $$;
+DO $$
+DECLARE
+	guide_profile jsonb;
+	scan_profile jsonb;
+BEGIN
+	PERFORM vector_hnsw_guidance_reset();
+	PERFORM vector_hnsw_guidance_activate(
+		'hnsw_profile_guidance_idx'::regclass,
+		ARRAY['exact:sql:tags @> ARRAY[23,29]::int[]'],
+		'exact');
+	PERFORM id FROM hnsw_profile_guidance_t
+	WHERE (SELECT vector_hnsw_guidance_bind(
+		'hnsw_profile_guidance_idx'::regclass,
+		ARRAY['exact:sql:tags @> ARRAY[23,29]::int[]'],
+		'exact') OFFSET 0)
+	  AND tags && ARRAY[23,29]::int[]
+	ORDER BY val <-> '[400,400]'::vector
+	LIMIT 10;
+	SELECT vector_hnsw_guidance_profile()::jsonb INTO guide_profile;
+	SELECT vector_hnsw_last_scan_profile()::jsonb INTO scan_profile;
+	IF guide_profile->>'planner_proof_bypass_reason' <> 'predicate_not_implied' OR
+	   scan_profile->>'final_path' <> 'stock_bypass' THEN
+		RAISE EXCEPTION 'non-singleton overlap guide did not fail open: guide %, scan %',
+			guide_profile, scan_profile;
+	END IF;
+END $$;
+SET hnsw.ef_search = 4;
+SET hnsw.iterative_scan = off;
+SET hnsw.traversal_guided_prioritization = off;
+SET hnsw.traversal_guided_target = 4;
+SELECT vector_hnsw_guidance_activate(
+	'hnsw_profile_guidance_idx'::regclass,
+	ARRAY['page:sql:eligible'],
+	'exact'
+) = 1 AS page_guidance_activated;
+ page_guidance_activated 
+-------------------------
+ t
+(1 row)
+
+SELECT vector_hnsw_reset_scan_profile();
+ vector_hnsw_reset_scan_profile 
+--------------------------------
+ 
+(1 row)
+
+SELECT count(*) = 10 AS page_guidance_returns_limit
+FROM (
+	SELECT id FROM hnsw_profile_guidance_t
+	WHERE (SELECT vector_hnsw_guidance_bind(
+			'hnsw_profile_guidance_idx'::regclass,
+			ARRAY['page:sql:eligible'],
+			'exact'
+		) OFFSET 0)
+	  AND eligible
+	ORDER BY val <-> '[400,400]'::vector
+	LIMIT 10
+) AS page_rows;
+ page_guidance_returns_limit 
+-----------------------------
+ t
+(1 row)
+
+WITH p AS (
+	SELECT vector_hnsw_last_scan_profile()::jsonb AS j
+)
+SELECT
+	(j->>'iterative_scan') = 'off' AS iterative_guc_stays_off,
+	(j->>'effective_iterative_scan') = 'strict_order' AS page_forces_strict,
+	(j->>'traversal_resume_batches')::bigint > 0 AS page_scan_resumed,
+	(j->>'final_path') = 'candidate_admission_validation_only' AS page_path_verified
+FROM p;
+ iterative_guc_stays_off | page_forces_strict | page_scan_resumed | page_path_verified 
+-------------------------+--------------------+-------------------+--------------------
+ t                       | t                  | t                 | t
 (1 row)
 
 DROP TABLE hnsw_profile_t;
+DROP TABLE hnsw_profile_guidance_t;
+RESET hnsw.ef_search;
+RESET hnsw.filter_strategy;
+RESET hnsw.traversal_guided_prioritization;
+RESET hnsw.traversal_guided_target;
+RESET hnsw.max_scan_tuples;
+RESET hnsw.traversal_guided_min_skip_rate;
+RESET hnsw.iterative_scan;

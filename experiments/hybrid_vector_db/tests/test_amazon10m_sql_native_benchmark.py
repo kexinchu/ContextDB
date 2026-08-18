@@ -21,8 +21,8 @@ import amazon10m_sql_native_exact_truth as exact_truth  # noqa: E402
 
 class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
     def _binary_identity_gate(self):
-        build_id = "sqlens-v11-test-build"
-        vector_sha256 = "a" * 64
+        build_id = benchmark.SQLENS_R43_BUILD_ID
+        vector_sha256 = benchmark.SQLENS_R43_VECTOR_SO_SHA256
         stages_and_connections = [
             ("experiment_start", "fragment_store"),
             ("connection_open", "data_guard"),
@@ -264,7 +264,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.bootstrap_samples, 10_000)
         self.assertEqual(
             args.ef_search_values,
-            [250, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000],
+            [20, 40, 60, 80, 100, 150, 200, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000],
         )
         self.assertIsNone(args.expected_sqlens_build_id)
         self.assertIsNone(args.expected_vector_so_sha256)
@@ -274,12 +274,14 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.source_index, benchmark.DEFAULT_SOURCE_INDEX)
         self.assertEqual(args.clone_index, benchmark.DEFAULT_CLONE_INDEX)
         self.assertNotEqual(args.source_index, args.clone_index)
+        self.assertEqual(args.execution_engine, "sqlens")
+        self.assertEqual(args.official_planner_mode, "auto")
         self.assertEqual(args.d3_probe_requests, 2)
         self.assertEqual(args.exact_truth_csv, benchmark.DEFAULT_EXACT_TRUTH_CSV)
         self.assertEqual(args.exact_truth_manifest, benchmark.DEFAULT_EXACT_TRUTH_MANIFEST)
         self.assertFalse(args.debug_compute_exact_truth)
         self.assertEqual(args.candidate_validity_predicate, "embedding_valid")
-        self.assertIn("valid_embeddings_formal", args.query_ids_csv.name)
+        self.assertIn("unique_embeddings_formal", args.query_ids_csv.name)
         filters = benchmark.read_filters(
             ROOT / "configs" / "amazon10m_selectivity14_filters.csv"
         )
@@ -287,6 +289,78 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         args.final_repeats = 4
         with self.assertRaisesRegex(RuntimeError, "final r5"):
             benchmark.validate_formal_dimensions(args, filters)
+
+    def test_q10200_protocol_resolves_p0_dimensions_arms_and_r43_identity(self):
+        args = benchmark.resolve_protocol_args(
+            benchmark.create_argument_parser().parse_args(
+                ["--protocol", "q10200"]
+            )
+        )
+        source_filters = benchmark.read_filters(benchmark.DEFAULT_FILTERS)
+        filters = benchmark.read_filters(
+            benchmark.DEFAULT_FILTERS, set(args.filter_names)
+        )
+        workloads = benchmark.select_workloads(
+            args.workload_names, args.protocol
+        )
+        benchmark.validate_formal_dimensions(
+            args, filters, workloads, source_filters
+        )
+        self.assertEqual(args.calibration_query_offset, 20)
+        self.assertEqual(args.calibration_queries, 80)
+        self.assertEqual(args.calibration_repeats, 2)
+        self.assertEqual(args.final_query_offset, 200)
+        self.assertEqual(args.final_queries, 10_000)
+        self.assertEqual(args.final_repeats, 3)
+        self.assertEqual(args.targets, [0.90])
+        self.assertEqual(benchmark.P0_MODES, (
+            "stock",
+            "sql_first_forced_indexed_exact",
+            "d1_d2_d3",
+        ))
+        self.assertEqual(
+            args.expected_sqlens_build_id, benchmark.SQLENS_R43_BUILD_ID
+        )
+        self.assertEqual(
+            args.expected_vector_so_sha256,
+            benchmark.SQLENS_R43_VECTOR_SO_SHA256,
+        )
+
+    def test_run_spec_integrity_hash_survives_json_integer_key_roundtrip(self):
+        run_spec = {
+            "k": 10,
+            "query_ids": {0: 10, 2: 20, 10: 30},
+            "query_splits": {0: "calibration", 2: "calibration", 10: "final"},
+        }
+        stored = benchmark.canonical_sha256(run_spec)
+        loaded = json.loads(json.dumps(run_spec))
+        self.assertNotEqual(stored, benchmark.canonical_sha256(loaded))
+        self.assertEqual(
+            stored,
+            benchmark.canonical_sha256(
+                benchmark._run_spec_for_integrity_hash(loaded)
+            ),
+        )
+
+    def test_tie_metadata_recompute_uses_producer_float32_precision(self):
+        # Real Amazon-10M edge row (acl_only/popular_ge1000/q5677): two of the
+        # top-k distances sit within one float32 ULP of ``kth - tolerance``.
+        # The producer counts them with faiss float32 semantics (0 strict), so
+        # a naive float64 recompute (2 strict) would wrongly reject the CSV.
+        plus_one = [
+            0.118575215, 0.118575215, 0.118575335, 0.118575335, 0.118575335,
+            0.118575335, 0.118575335, 0.118575335, 0.118575335, 0.118575335,
+            0.118575335,
+        ]
+        k = 10
+        kth = plus_one[k - 1]
+        tolerance = benchmark.distance_tolerance(kth)
+        naive_strict = sum(value < kth - tolerance for value in plus_one[:k])
+        self.assertEqual(naive_strict, 2)
+        recomputed = exact_truth.truth_metadata(
+            benchmark._np.asarray(plus_one, dtype=benchmark._np.float32), k
+        )
+        self.assertEqual(recomputed["strict_closer_count"], 0)
 
     def test_external_truth_loads_squared_l2_as_l2_and_binds_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -458,7 +532,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
 
     def test_sqlens_provenance_gate_rejects_old_or_incomplete_profiles(self):
         profile = {
-            "profile_semantics_version": 7,
+            "profile_semantics_version": 9,
             "graph_elements_visited": 0,
             "raw_index_tids_returned": 0,
             "hnsw_am_callback_ms": 0.0,
@@ -466,20 +540,22 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         }
         profile.update({field: 0 for field in benchmark.SQLENS_PROFILE_FIELDS if field not in profile})
         build_id, validated = benchmark.validate_sqlens_provenance(
-            "sqlens-v11-test", profile
+            benchmark.SQLENS_R43_BUILD_ID, profile
         )
-        self.assertEqual(build_id, "sqlens-v11-test")
+        self.assertEqual(build_id, benchmark.SQLENS_R43_BUILD_ID)
         self.assertEqual(validated, profile)
 
-        with self.assertRaisesRegex(RuntimeError, "expected prefix"):
+        with self.assertRaisesRegex(RuntimeError, "expected exact r43"):
             benchmark.validate_sqlens_provenance("sqlens-v10-old", profile)
         with self.assertRaisesRegex(RuntimeError, "missing"):
             benchmark.validate_sqlens_provenance(
-                "sqlens-v11-test", {"profile_semantics_version": 7}
+                benchmark.SQLENS_R43_BUILD_ID,
+                {"profile_semantics_version": 9},
             )
-        with self.assertRaisesRegex(RuntimeError, "minimum=7"):
+        with self.assertRaisesRegex(RuntimeError, "minimum=9"):
             benchmark.validate_sqlens_provenance(
-                "sqlens-v11-test", profile | {"profile_semantics_version": 6}
+                benchmark.SQLENS_R43_BUILD_ID,
+                profile | {"profile_semantics_version": 8},
             )
 
     def test_formal_execute_requires_exact_binary_identity_cli(self):
@@ -488,7 +564,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             [
                 "--execute",
                 "--expected-sqlens-build-id",
-                "sqlens-v11-test-build",
+                benchmark.SQLENS_R43_BUILD_ID,
             ],
             [
                 "--execute",
@@ -511,9 +587,9 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                 [
                     "--execute",
                     "--expected-sqlens-build-id",
-                    "sqlens-v11-test-build",
+                    benchmark.SQLENS_R43_BUILD_ID,
                     "--expected-vector-so-sha256",
-                    "a" * 64,
+                    benchmark.SQLENS_R43_VECTOR_SO_SHA256,
                 ]
             )
         self.assertEqual(status, 7)
@@ -523,13 +599,17 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             with self.subTest(sha256=value):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     benchmark.expected_sha256_arg(value)
-        for value in ("", "sqlens-v10-old", " sqlens-v11-build"):
+        for value in (
+            "",
+            "sqlens-v11-old",
+            " sqlens-v14-profiled-target-bounded-prioritization-build",
+        ):
             with self.subTest(build_id=value):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     benchmark.expected_sqlens_build_id_arg(value)
 
     def test_serving_binary_identity_gate_reads_server_and_requires_exact_match(self):
-        build_id = "sqlens-v11-test-build"
+        build_id = benchmark.SQLENS_BUILD_PREFIX + "-test-build"
         vector_sha256 = "a" * 64
         cursor = mock.MagicMock()
         cursor.fetchone.return_value = (
@@ -552,7 +632,11 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertIn("vector_sqlens_build_id()", cursor.execute.call_args.args[0])
 
         mismatches = (
-            ("sqlens-v11-other", "/server/lib/vector.so", vector_sha256),
+            (
+                benchmark.SQLENS_BUILD_PREFIX + "-other",
+                "/server/lib/vector.so",
+                vector_sha256,
+            ),
             (build_id, "/server/lib/vector.so", "b" * 64),
             (build_id, "/server/lib/not-vector", vector_sha256),
         )
@@ -698,10 +782,31 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             workload.name: benchmark.build_hybrid_sql("t", "rating = 5", workload=workload)
             for workload in benchmark.WORKLOADS
         }
-        self.assertEqual(len(set(sql_by_workload.values())), 3)
+        self.assertEqual(len(set(sql_by_workload.values())), len(benchmark.WORKLOADS))
         self.assertNotIn("valid_from <= %(as_of)s", sql_by_workload["acl_only"])
         self.assertIn("grant_row.valid_from <= %(as_of)s", sql_by_workload["grant_temporal_selectivity"])
         self.assertIn("fact.valid_from <= %(as_of)s", sql_by_workload["fact_temporal_selectivity"])
+
+    def test_official_compatible_sql_has_no_sqlens_profile_or_binding(self):
+        workload = next(
+            item
+            for item in benchmark.WORKLOADS
+            if item.name == "boolean_complex_narrow_not_exists"
+        )
+
+        sql = benchmark.build_hybrid_sql(
+            "public.vectors",
+            "rating = 5",
+            workload=workload,
+            official_compatible=True,
+        )
+        normalized = sql.lower()
+
+        self.assertIn("not exists", normalized)
+        self.assertNotIn("vector_hnsw_guidance_bind", normalized)
+        self.assertNotIn("vector_hnsw_guidance_profile", normalized)
+        self.assertNotIn("vector_sqlens", normalized)
+        self.assertEqual(sql.count("SELECT v.id"), 1)
 
     def test_as_of_uses_parameterized_set_config_not_parameterized_set(self):
         cursor = mock.MagicMock()
@@ -710,6 +815,80 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             "SELECT set_config('app.as_of', %s, false)",
             ("123456",),
         )
+
+    def test_set_preferred_index_resets_role_before_privileged_guc(self):
+        class _Cursor:
+            def __init__(self) -> None:
+                self.role = "amazon10m_sql_native_benchmark"
+                self.preferred = ""
+                self.statements: list[str] = []
+                self._row: tuple[object, ...] | None = None
+
+            def execute(self, sql: str, params: tuple[object, ...] | None = None) -> None:
+                normalized = " ".join(sql.split())
+                self.statements.append(normalized)
+                if normalized == "SELECT current_user, session_user":
+                    self._row = (self.role, "postgres")
+                elif normalized == "RESET ROLE":
+                    self.role = "postgres"
+                    self._row = None
+                elif normalized.startswith("SET ROLE"):
+                    self.role = "amazon10m_sql_native_benchmark"
+                    self._row = None
+                elif "set_config('hnsw.preferred_index'" in normalized:
+                    if self.role != "postgres":
+                        raise AssertionError("hnsw.preferred_index must be set as postgres")
+                    self.preferred = str(params[0] if params else "")
+                    self._row = (self.preferred,)
+                elif normalized == "SELECT current_setting('hnsw.preferred_index')":
+                    self._row = (self.preferred,)
+                else:
+                    raise AssertionError(f"unexpected SQL {sql!r}")
+
+            def fetchone(self) -> tuple[object, ...] | None:
+                return self._row
+
+        cursor = _Cursor()
+        current = benchmark.set_preferred_index(cursor, "public.source_idx")
+        self.assertEqual(current, "public.source_idx")
+        self.assertEqual(cursor.role, "amazon10m_sql_native_benchmark")
+        self.assertEqual(
+            cursor.statements,
+            [
+                "SELECT current_user, session_user",
+                "RESET ROLE",
+                "SELECT set_config('hnsw.preferred_index', %s, false)",
+                'SET ROLE "amazon10m_sql_native_benchmark"',
+                "SELECT current_setting('hnsw.preferred_index')",
+            ],
+        )
+
+    def test_set_preferred_index_skips_reset_when_already_session_user(self):
+        class _Cursor:
+            def __init__(self) -> None:
+                self.statements: list[str] = []
+                self._row: tuple[object, ...] | None = None
+
+            def execute(self, sql: str, params: tuple[object, ...] | None = None) -> None:
+                normalized = " ".join(sql.split())
+                self.statements.append(normalized)
+                if normalized == "SELECT current_user, session_user":
+                    self._row = ("postgres", "postgres")
+                elif "set_config('hnsw.preferred_index'" in normalized:
+                    self._row = (str(params[0] if params else ""),)
+                elif normalized == "SELECT current_setting('hnsw.preferred_index')":
+                    self._row = ("public.source_idx",)
+                else:
+                    raise AssertionError(f"unexpected SQL {sql!r}")
+
+            def fetchone(self) -> tuple[object, ...] | None:
+                return self._row
+
+        cursor = _Cursor()
+        current = benchmark.set_preferred_index(cursor, "public.source_idx")
+        self.assertEqual(current, "public.source_idx")
+        self.assertNotIn("RESET ROLE", cursor.statements)
+        self.assertFalse(any(item.startswith("SET ROLE") for item in cursor.statements))
 
     def test_filter_loader_preserves_config_predicate_and_atoms(self):
         filters = benchmark.read_filters(ROOT / "configs" / "amazon10m_selectivity14_filters.csv")
@@ -1117,8 +1296,8 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(summary["recall_mean"]), 0.90)
         self.assertLess(float(summary["recall_lcb95"]), 0.90)
-        self.assertTrue(summary["target_met"])
-        self.assertEqual(summary["latency_mean_ms"], 10.0)
+        self.assertFalse(summary["target_met"])
+        self.assertEqual(summary["latency_mean_ms"], benchmark.NA)
 
     def test_scan_profile_export_is_explicit_and_complete(self):
         profile = {field: index for index, field in enumerate(benchmark.SQLENS_PROFILE_EXPORT_FIELDS)}
@@ -1158,6 +1337,100 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertEqual(len(first), len(keys) * len(benchmark.MODES))
         for key in keys:
             self.assertEqual({mode for scheduled_key, mode in first if scheduled_key == key}, set(benchmark.MODES))
+
+    def test_balanced_mixed_trace_is_seeded_unique_and_nearly_uniform(self):
+        query_ids = {query_no: 100_000 + query_no for query_no in range(10_000)}
+        workloads = list(benchmark.WORKLOADS[:3])
+        filters = [
+            benchmark.FilterSpec(
+                f"f{index}", "1%", "rating = 5",
+                ("sql:rating = 5",), 1, 1.0,
+            )
+            for index in range(4)
+        ]
+        first = benchmark.build_balanced_mixed_trace(
+            workloads, filters, query_ids, 19
+        )
+        second = benchmark.build_balanced_mixed_trace(
+            workloads, filters, query_ids, 19
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 10_000)
+        self.assertEqual(len({row["query_no"] for row in first}), 10_000)
+        counts = {}
+        for row in first:
+            key = (row["workload"], row["filter_name"])
+            counts[key] = counts.get(key, 0) + 1
+        self.assertEqual(len(counts), 12)
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+        self.assertEqual(
+            benchmark.mixed_trace_sha256(first),
+            benchmark.mixed_trace_sha256(second),
+        )
+
+    def test_sql_first_explain_gate_requires_registered_scalar_and_no_hnsw(self):
+        scalar_plan = [
+            {
+                "Plan": {
+                    "Node Type": "Index Scan",
+                    "Index Name": "amazon_review_facts_parent_time_idx",
+                }
+            }
+        ]
+        gate = benchmark.validate_sql_first_explain_gate(
+            scalar_plan, ["amazon_review_facts_parent_time_idx"]
+        )
+        self.assertTrue(gate["valid"])
+        self.assertTrue(gate["forced_indexed"])
+        self.assertEqual(gate["vector_hnsw_index_names"], [])
+        with self.assertRaisesRegex(RuntimeError, "SQL-first EXPLAIN"):
+            benchmark.validate_sql_first_explain_gate(
+                [{"Plan": {"Index Name": "amazon10m_hnsw_idx"}}],
+                ["amazon_review_facts_parent_time_idx"],
+            )
+
+    def test_p0_requested_slice_completion_requires_every_mode_repeat_key(self):
+        trace = [
+            {
+                "request_no": 0,
+                "workload": "acl_only",
+                "filter_name": "f",
+                "query_no": 200,
+                "query_id": 1,
+            },
+            {
+                "request_no": 1,
+                "workload": "acl_only",
+                "filter_name": "f",
+                "query_no": 201,
+                "query_id": 2,
+            },
+        ]
+        rows = []
+        for repeat in range(2):
+            for request in trace:
+                for mode in benchmark.P0_MODES:
+                    rows.append(
+                        {
+                            "phase": "measurement",
+                            "mode": mode,
+                            "repeat": repeat,
+                            "pair_key": (
+                                f"{request['workload']}|{request['filter_name']}|"
+                                f"q{request['query_no']}|r{repeat}"
+                            ),
+                            "error": "",
+                        }
+                    )
+        complete = benchmark.p0_requested_slice_completion(
+            rows, trace, benchmark.P0_MODES, 2
+        )
+        self.assertTrue(complete["complete"])
+        self.assertEqual(complete["expected_measurement_rows"], 12)
+        incomplete = benchmark.p0_requested_slice_completion(
+            rows[:-1], trace, benchmark.P0_MODES, 2
+        )
+        self.assertFalse(incomplete["complete"])
 
     def test_run_measurements_selected_modes_avoids_running_unselected_mode(self):
         class FakeCursor:
@@ -1270,7 +1543,11 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         configure.assert_called_once()
         self.assertEqual(plans[0]["explain_order"], "after_all_timed_requests_in_block")
         self.assertNotIn("safe_guided", " ".join(call[0] for call in connection.cursor_value.calls))
-        self.assertEqual(rows[0]["e2e_ms"], rows[0]["activation_ms"] + rows[0]["query_ms"])
+        self.assertGreaterEqual(rows[0]["e2e_ms"], rows[0]["query_ms"])
+        self.assertNotEqual(
+            rows[0]["e2e_ms"],
+            rows[0]["activation_ms"] + rows[0]["query_ms"],
+        )
 
     def test_dry_run_does_not_read_missing_inputs_or_connect(self):
         output = io.StringIO()
@@ -1338,6 +1615,47 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             self.assertEqual(benchmark.MODE_SPECS[mode].filter_strategy, "safe_guided")
             self.assertIn("candidate_admission", benchmark.MODE_SPECS[mode].guidance_semantics)
         self.assertEqual(benchmark.MODE_SPECS["d1_d2_d3"].guidance_kind, "adaptive")
+
+    def test_graph_clone_proof_raises_session_maintenance_work_mem(self):
+        class _Cursor:
+            def __init__(self) -> None:
+                self.statements: list[tuple[str, tuple[object, ...] | None]] = []
+                self._row: tuple[object, ...] | None = None
+
+            def execute(self, sql: str, params: tuple[object, ...] | None = None) -> None:
+                self.statements.append((" ".join(sql.split()), params))
+                if "set_config('maintenance_work_mem'" in sql:
+                    self._row = (params[0] if params else "",)
+                elif "vector_hnsw_graph_compare" in sql:
+                    self._row = (
+                        {
+                            "same_heap": True,
+                            "logical_equal": True,
+                            "entry_equal": True,
+                            "tuple_coverage_equal": True,
+                            "definition_equal": True,
+                            "physical_equal": False,
+                        },
+                    )
+                else:
+                    raise AssertionError(f"unexpected SQL {sql!r}")
+
+            def fetchone(self) -> tuple[object, ...] | None:
+                return self._row
+
+        cursor = _Cursor()
+        proof = benchmark.graph_clone_proof(
+            cursor, "public.source_hnsw", "public.clone_hnsw"
+        )
+        self.assertTrue(proof["valid"])
+        self.assertEqual(proof["comparison"]["physical_equal"], False)
+        self.assertEqual(
+            cursor.statements[0],
+            (
+                "SELECT set_config('maintenance_work_mem', %s, false)",
+                (benchmark.D2_GRAPH_PROOF_MAINTENANCE_WORK_MEM,),
+            ),
+        )
 
     def test_same_graph_clone_proof_is_strict_and_requires_physical_difference(self):
         proof = {
@@ -1834,7 +2152,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         matrix = benchmark.preregister_formal_matrix(
             benchmark.WORKLOADS, filters, (0.90, 0.95, 0.99)
         )
-        self.assertEqual(len(matrix), 3 * 14 * 3)
+        self.assertEqual(len(matrix), len(benchmark.WORKLOADS) * 14 * 3)
         self.assertTrue(all(cell["status"] == "preregistered" for cell in matrix))
         outcomes = {
             (workload.name, spec.name, mode): {
@@ -1849,6 +2167,76 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         finalized = benchmark.finalize_formal_matrix(matrix, outcomes, set())
         self.assertTrue(all(cell["status"] == benchmark.NA for cell in finalized))
         self.assertTrue(all(cell["reason"] == "unattainable_on_grid" for cell in finalized))
+
+    def test_official_matrix_requires_final_target_or_complete_grid_proof(self):
+        workload = benchmark.WorkloadSpec("w", "fixture", 50.0, False)
+        spec = benchmark.FilterSpec("f", "1%", "rating = 5", (), 1, 1.0)
+        config = benchmark.Config(100, 1000, 8.0, "strict_order", 100)
+        matrix = benchmark.preregister_official_formal_matrix([workload], [spec], [0.90])
+        outcome = {
+            "selected": {0.90: {"config": config.label}},
+            "planned_blocks": 1,
+            "executed_blocks": 1,
+            "grid_exhausted": True,
+            "error_free_grid_exhaustion": True,
+            "unattainable_on_grid": [],
+        }
+        final = {
+            "complete": True,
+            "errors": 0,
+            "target_met": True,
+            "recall_mean": 0.91,
+            "recall_lcb95": 0.90,
+            "config": config.label,
+        }
+        complete = benchmark.finalize_official_formal_matrix(
+            matrix, {("w", "f"): outcome}, {("w", "f", 0.90): final}
+        )
+        self.assertEqual(complete[0]["status"], "complete")
+        self.assertTrue(benchmark.formal_matrix_coverage(complete, 1)["all_targets_attained"])
+
+        missing_final = benchmark.finalize_official_formal_matrix(
+            matrix, {("w", "f"): outcome}, {}
+        )
+        self.assertEqual(missing_final[0]["status"], "invalid")
+
+        unattainable = benchmark.finalize_official_formal_matrix(
+            matrix,
+            {
+                ("w", "f"): {
+                    **outcome,
+                    "selected": {0.90: None},
+                    "unattainable_on_grid": [0.90],
+                }
+            },
+            {},
+        )
+        self.assertEqual(unattainable[0]["status"], benchmark.NA)
+        coverage = benchmark.formal_matrix_coverage(unattainable, 1)
+        self.assertTrue(coverage["coverage_complete"])
+        self.assertFalse(coverage["all_targets_attained"])
+
+    def test_official_execution_requires_explicit_independent_contract(self):
+        args = benchmark.create_argument_parser().parse_args(
+            ["--execution-engine", "official"]
+        )
+        with self.assertRaisesRegex(RuntimeError, "independent DSN/container contract"):
+            benchmark.validate_official_contract_args(args)
+        valid = benchmark.create_argument_parser().parse_args(
+            [
+                "--execution-engine", "official",
+                "--official-dsn", "postgresql://upstream.example/amazon",
+                "--official-server-container", "upstream-pgvector",
+                "--official-image-digest", "sha256:" + "b" * 64,
+                "--official-pgvector-commit", "c" * 40,
+                "--official-vector-so-sha256", "d" * 64,
+            ]
+        )
+        benchmark.validate_official_contract_args(valid)
+        self.assertNotEqual(
+            benchmark.dsn_fingerprint(valid.official_dsn),
+            benchmark.dsn_fingerprint("postgresql://sqlens.example/amazon"),
+        )
 
 
 if __name__ == "__main__":

@@ -92,6 +92,8 @@ int			hnsw_traversal_guided_max_bridge_work;
 double		hnsw_traversal_guided_min_skip_rate;
 bool		hnsw_traversal_guided_prioritization;
 int			hnsw_traversal_guided_burst;
+bool		hnsw_traversal_guided_early_stop;
+double		hnsw_traversal_guided_early_stop_distance_ratio;
 double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
 static relopt_kind hnsw_relopt_kind;
@@ -260,7 +262,7 @@ HnswInit(void)
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
-							"Valid range is 1..100000.", &hnsw_ef_search,
+							"Valid range is 1..500000.", &hnsw_ef_search,
 							HNSW_DEFAULT_EF_SEARCH, HNSW_MIN_EF_SEARCH, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("hnsw.iterative_scan", "Sets the mode for iterative scans",
@@ -332,8 +334,8 @@ HnswInit(void)
 							&hnsw_guided_collect_target,
 							 100, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
 
-	DefineCustomIntVariable("hnsw.traversal_guided_target", "Deprecated compatibility target for legacy traversal_guided search",
-							 "Retained for configuration compatibility; native candidate admission ignores this value and collects the hnsw.ef_search result batch.",
+	DefineCustomIntVariable("hnsw.traversal_guided_target", "Sets the result target for predicate-prioritized traversal",
+							 "The prioritized layer-0 search retains this many predicate-matching candidates, capped by hnsw.ef_search. It must be at least the SQL LIMIT; larger values trade latency for recall.",
 							 &hnsw_traversal_guided_target,
 							 40, 1, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
 
@@ -361,6 +363,16 @@ HnswInit(void)
 							 "After this many MAYBE pops, traversal must expand the current nearest predicate-NO bridge before prioritizing another MAYBE node.",
 							 &hnsw_traversal_guided_burst,
 							 8, 1, 1024, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("hnsw.traversal_guided_early_stop", "Stops guided traversal after collecting the configured matching-candidate target",
+							 "This approximate matched-recall mode terminates layer-0 expansion as soon as hnsw.traversal_guided_target predicate-matching candidates have been collected.",
+							 &hnsw_traversal_guided_early_stop,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable("hnsw.traversal_guided_early_stop_distance_ratio", "Sets the distance-aware guided early-stop threshold",
+							 "Zero preserves count-only early stop. A value in (0,1] requires the nearest remaining frontier distance to exceed the current worst result distance relaxed by this ratio; one is stock distance termination.",
+							 &hnsw_traversal_guided_early_stop_distance_ratio,
+							 0, 0, 1, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	/* Same range as hash_mem_multiplier */
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",

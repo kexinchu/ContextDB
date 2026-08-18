@@ -9,10 +9,21 @@ from unittest import mock
 
 from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner import (
     Config,
-    DENSE_12_EF_SEARCH,
+    CALIBRATION_REUSE_ARG_KEYS,
+    DENSE_22_EF_SEARCH,
     DEFAULT_MODES,
+    FILTER_ORDER,
+    FORMAL_D1_MODES,
+    FORMAL_CALIBRATION_GRID_POLICY,
     DEFAULT_BFS_INDEX,
     DEFAULT_BFS_TABLE,
+    DEFAULT_CALIBRATION_QUERIES,
+    DEFAULT_CALIBRATION_QUERY_OFFSET,
+    DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+    DEFAULT_FINAL_QUERIES,
+    DEFAULT_FINAL_REPEATS,
+    DEFAULT_FILTERS_CSV,
+    DEFAULT_P0_RELEASE_CONTRACT,
     DEFAULT_INSERTION_INDEX,
     DEFAULT_INSERTION_TABLE,
     DEFAULT_TRUTH_CSV,
@@ -22,18 +33,26 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
     bootstrap_mean_ci,
     acquire_formal_data_guard,
     build_configs,
+    calibration_stop_metric,
     calibration_stop_reached,
+    calibration_selection_description,
     calibrate_mode_filter,
     consolidate_final,
     configs_for_mode,
     database_fingerprint,
+    d2_graph_proof_from_env,
+    delegated_d2_graph_proof_argument,
     explicit_candidate_validity_predicate,
     formal_completion_gate,
     final_eligible_rows,
+    hnsw_query_cohort_health,
+    load_reused_calibration,
+    load_p0_release_contract,
     mode_calibration_grids,
     paired_speedup_ci,
     parse_targets,
     percentile,
+    plan_index_names,
     plan_evidence_path,
     prepare_fragment_tracking,
     require_plan_evidence,
@@ -46,12 +65,271 @@ from experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_run
     sha256_file,
     stable_fragment_tracking_evidence,
     sqlens_runtime_provenance,
+    summarize_raw,
     truth_query_ids,
+    validate_index_health_observations,
     validate_tie_aware_raw_row,
+)
+from experiments.hybrid_vector_db.scripts.pgvector_design1_design2_design3_selectivity_benchmark import (
+    parse_atoms,
 )
 
 
 class TargetRecallRunnerTests(unittest.TestCase):
+    def test_default_filter_metadata_matches_embedding_valid_candidate_universe(self):
+        self.assertEqual(
+            DEFAULT_FILTERS_CSV.name,
+            "amazon10m_selectivity14_valid_embeddings_filters.csv",
+        )
+
+    def test_calibration_reuse_binds_targets_selection_and_margin(self):
+        for field in (
+            "target_recalls",
+            "target_recall",
+            "calibration_selection_policy",
+            "calibration_recall_margin",
+        ):
+            self.assertIn(field, CALIBRATION_REUSE_ARG_KEYS)
+
+    def test_calibration_reuse_rejects_legacy_first_crossing_policy(self):
+        shared_args = {field: None for field in CALIBRATION_REUSE_ARG_KEYS}
+        current_run_spec = {"args": dict(shared_args)}
+        source = {
+            "run_spec": {"args": dict(shared_args)},
+            "calibration_policy": {
+                "grid_policy": (
+                    "ascending_prefix_first_max_target_lcb_or_latency_dominated"
+                ),
+                "stop_metric": "recall_lcb95",
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "legacy_manifest.json"
+            manifest.write_text(json.dumps(source), encoding="utf-8")
+            with self.assertRaisesRegex(
+                RuntimeError, "legacy or incomplete grid policy"
+            ):
+                load_reused_calibration(
+                    manifest,
+                    argparse.Namespace(),
+                    current_run_spec,
+                )
+
+    def test_calibration_selection_description_matches_policy(self):
+        self.assertIn(
+            "report-only", calibration_selection_description("mean_latency")
+        )
+        conservative = calibration_selection_description("lcb_then_max_recall")
+        self.assertIn("LCB95", conservative)
+        self.assertIn("unattainable", conservative)
+        with self.assertRaises(ValueError):
+            calibration_selection_description("unknown")
+
+    def test_parse_atoms_preserves_explicit_or_composition(self):
+        self.assertEqual(
+            parse_atoms("sql:tags @> ARRAY[23]||OR||sql:tags @> ARRAY[29]"),
+            ["sql:tags @> ARRAY[23]", "OR", "sql:tags @> ARRAY[29]"],
+        )
+        self.assertEqual(
+            parse_atoms("sql:category = 'book'||sql:rating = 5"),
+            ["sql:category = 'book'", "sql:rating = 5"],
+        )
+        with self.assertRaises(ValueError):
+            parse_atoms("OR||sql:tags @> ARRAY[23]")
+
+    def test_plan_index_names_collects_nested_explain_indexes(self):
+        plan = [
+            {
+                "Plan": {
+                    "Node Type": "Limit",
+                    "Plans": [
+                        {
+                            "Node Type": "Index Scan",
+                            "Index Name": "items_embedding_hnsw_idx",
+                        }
+                    ],
+                }
+            }
+        ]
+        self.assertEqual(plan_index_names(plan), {"items_embedding_hnsw_idx"})
+
+    def test_index_health_accepts_zero_distance_duplicate_vector_tie(self):
+        proof = validate_index_health_observations(
+            "public.items_embedding_hnsw_idx",
+            [
+                {"query_id": 10, "returned_id": 10, "distance": 0.0},
+                {"query_id": 20, "returned_id": 21, "distance": 5e-10},
+            ],
+            zero_distance_tolerance=1e-9,
+        )
+        self.assertTrue(proof["passed"])
+        self.assertEqual(proof["zero_distance_hits"], 2)
+        self.assertEqual(proof["self_id_hits"], 1)
+
+    def test_index_health_rejects_missing_or_nonzero_query_vector(self):
+        with self.assertRaisesRegex(RuntimeError, "not zero-distance reachable"):
+            validate_index_health_observations(
+                "public.items_embedding_hnsw_idx",
+                [
+                    {"query_id": 10, "returned_id": None, "distance": None},
+                    {"query_id": 20, "returned_id": 99, "distance": 0.25},
+                ],
+                zero_distance_tolerance=1e-9,
+            )
+
+    def test_index_health_uses_a_cohort_quality_threshold(self):
+        observations = [
+            {"query_id": value, "returned_id": value, "distance": 0.0}
+            for value in range(99)
+        ]
+        observations.append(
+            {"query_id": 99, "returned_id": 100, "distance": 0.25}
+        )
+        proof = validate_index_health_observations(
+            "public.items_embedding_hnsw_idx",
+            observations,
+            zero_distance_tolerance=1e-9,
+            minimum_zero_distance_rate=0.99,
+        )
+        self.assertTrue(proof["passed"])
+        self.assertEqual(proof["zero_distance_rate"], 0.99)
+
+    def test_index_health_rejects_empty_cohort(self):
+        with self.assertRaisesRegex(RuntimeError, "not zero-distance reachable"):
+            validate_index_health_observations(
+                "public.items_embedding_hnsw_idx",
+                [],
+                zero_distance_tolerance=1e-9,
+            )
+
+    def test_external_query_health_records_index_prewarm_before_probe_skip(self):
+        cursor = mock.Mock()
+        cursor.fetchone.side_effect = [
+            ("sqlens-v16-d3-representation-preserving-exact-d2-edge-trace-r33",),
+            (123,),
+        ]
+        connection = mock.MagicMock()
+        connection.cursor.return_value = cursor
+        connection.__enter__.return_value = connection
+        connection.__exit__.return_value = False
+        args = argparse.Namespace(
+            expected_truth_self_excluded=False,
+            query_table="public.external_queries",
+            insertion_table="public.items",
+            insertion_index="public.items_hnsw",
+            bfs_table="public.items",
+            bfs_index="public.items_hnsw",
+            modes=["original", "design1_bloom"],
+            query_id_column="qid",
+            query_vector_column="embedding",
+            candidate_validity_predicate="TRUE",
+            index_health_ef_search=10_000,
+            index_health_zero_distance_tolerance=1e-9,
+            index_health_min_zero_distance_rate=0.99,
+            statement_timeout_ms=300_000,
+            prewarm_index_health=True,
+            preferred_index_guc="hnsw.preferred_index",
+        )
+        with (
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.psycopg.connect",
+                return_value=connection,
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.pg_config_from_env",
+                return_value=argparse.Namespace(conninfo="postgresql://test"),
+            ),
+        ):
+            evidence = hnsw_query_cohort_health(args, [1, 2])
+
+        self.assertTrue(evidence["passed"])
+        self.assertTrue(evidence["skipped"])
+        [index] = evidence["indexes"]
+        self.assertEqual(index["prewarm"]["blocks"], 123)
+        self.assertGreaterEqual(index["prewarm"]["elapsed_ms"], 0.0)
+
+    def test_delegated_d2_proof_uses_sha_bound_file_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "proof.json"
+            path.write_text('{"required":true}\n', encoding="utf-8")
+            args = argparse.Namespace(
+                d2_graph_proof={"required": True},
+                d2_graph_proof_path=path,
+                d2_graph_proof_path_sha256=sha256_file(path),
+            )
+            self.assertEqual(delegated_d2_graph_proof_argument(args), str(path))
+            path.write_text('{"required":false}\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "changed"):
+                delegated_d2_graph_proof_argument(args)
+
+    def test_default_candidate_universe_matches_partial_hnsw_indexes(self):
+        self.assertEqual(DEFAULT_CANDIDATE_VALIDITY_PREDICATE, "embedding_valid")
+
+    def test_formal_default_query_splits_are_disjoint_and_held_out(self):
+        calibration = set(
+            range(
+                DEFAULT_CALIBRATION_QUERY_OFFSET,
+                DEFAULT_CALIBRATION_QUERY_OFFSET + DEFAULT_CALIBRATION_QUERIES,
+            )
+        )
+        final = set(range(100, 100 + DEFAULT_FINAL_QUERIES))
+        self.assertEqual(calibration, set(range(20, 100)))
+        self.assertEqual(final, set(range(100, 200)))
+        self.assertTrue(calibration.isdisjoint(final))
+        self.assertEqual(DEFAULT_FINAL_REPEATS, 5)
+
+    def test_live_d2_graph_proof_uses_explicit_session_memory_contract(self):
+        cursor = mock.Mock()
+        cursor.fetchone.return_value = ("64GB",)
+        connection = mock.MagicMock()
+        connection.cursor.return_value = cursor
+        connection.__enter__.return_value = connection
+        connection.__exit__.return_value = False
+        args = argparse.Namespace(
+            modes=["design1_bloom_bfs_layout"],
+            insertion_index="public.source_idx",
+            bfs_index="public.clone_idx",
+            d2_graph_proof_maintenance_work_mem="64GB",
+        )
+        canonical = {"artifact_valid": True}
+
+        with (
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.psycopg.connect",
+                return_value=connection,
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.pg_config_from_env",
+                return_value=argparse.Namespace(conninfo="postgresql://test"),
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.ensure_functions"
+            ) as functions,
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.require_d2_graph_proof",
+                return_value=canonical,
+            ) as proof_gate,
+        ):
+            proof = d2_graph_proof_from_env(args)
+
+        functions.assert_called_once_with(cursor)
+        cursor.execute.assert_called_once_with(
+            "SELECT set_config('maintenance_work_mem', %s, false)",
+            ("64GB",),
+        )
+        proof_gate.assert_called_once_with(
+            cursor, "public.source_idx", "public.clone_idx"
+        )
+        self.assertEqual(proof["artifact_valid"], True)
+        self.assertEqual(
+            proof["memory_contract"]["maintenance_work_mem"], "64GB"
+        )
+        self.assertEqual(
+            proof["memory_contract"]["scope"],
+            "live_vector_hnsw_graph_compare_session",
+        )
+        self.assertGreaterEqual(proof["memory_contract"]["elapsed_ms"], 0.0)
+
     def test_fragment_tracking_run_spec_evidence_excludes_timestamp(self):
         args = argparse.Namespace(
             fragment_tracking_evidence={
@@ -235,6 +513,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
             bfs_index="public.items_hnsw_bfs",
             query_table="public.queries",
             candidate_validity_predicate="embedding_valid",
+            traversal_guided_prioritization=False,
         )
         with (
             mock.patch(
@@ -258,6 +537,54 @@ class TargetRecallRunnerTests(unittest.TestCase):
         )
         self.assertEqual(len(fingerprint["candidate_validity_predicate_sha256"]), 64)
         self.assertEqual(fingerprint["query_table"]["row_count"], 200)
+
+    def test_database_fingerprint_omits_unrequested_bfs_relation(self):
+        cursor = mock.Mock()
+        cursor.fetchone.side_effect = [
+            ("16.4", "0.8.2"),
+            (10, 20, 100, 1000, True, True, None),
+            (11, 21, 100, 2000, True, True, "embedding_valid"),
+        ]
+        connection = mock.MagicMock()
+        connection.cursor.return_value = cursor
+        connect = mock.MagicMock()
+        connect.return_value.__enter__.return_value = connection
+        args = argparse.Namespace(
+            modes=["original", "design1_bloom"],
+            insertion_table="public.items",
+            insertion_index="public.items_hnsw",
+            bfs_table="public.items_bfs",
+            bfs_index="public.missing_bfs_idx",
+            query_table="public.queries",
+            candidate_validity_predicate="embedding_valid",
+            candidate_validity_predicate_explicit=True,
+        )
+        with (
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.psycopg.connect",
+                connect,
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.pg_config_from_env",
+                return_value=argparse.Namespace(conninfo="postgresql://test"),
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.query_relation_provenance",
+                return_value={"name": "public.queries", "row_count": 200},
+            ),
+        ):
+            fingerprint = database_fingerprint(args, "sqlens-v11-test")
+
+        self.assertEqual(
+            set(fingerprint["relations"]),
+            {"public.items", "public.items_hnsw"},
+        )
+        executed_params = [
+            call.args[1]
+            for call in cursor.execute.call_args_list
+            if len(call.args) > 1
+        ]
+        self.assertNotIn(("public.missing_bfs_idx",), executed_params)
 
     def test_q200_external_truth_requires_non_self_excluded_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -374,6 +701,37 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertFalse(met)
         self.assertIsNone(selected)
 
+    def test_select_row_excludes_calibration_fallback_from_pure_d1(self):
+        rows = [
+            {
+                "config": "mixed-fast",
+                "mode": "design1_bloom",
+                "ok": 20,
+                "errors": 0,
+                "rows_complete": True,
+                "recall_mean": 0.99,
+                "latency_mean_ms": 1.0,
+                "fallback_requests_mean": 0.05,
+                "stock_bypass_requests_mean": 0.0,
+            },
+            {
+                "config": "pure",
+                "mode": "design1_bloom",
+                "ok": 20,
+                "errors": 0,
+                "rows_complete": True,
+                "recall_mean": 0.95,
+                "latency_mean_ms": 10.0,
+                "fallback_requests_mean": 0.0,
+                "stock_bypass_requests_mean": 0.0,
+            },
+        ]
+
+        selected, met = select_row(rows, target=0.95)
+
+        self.assertTrue(met)
+        self.assertEqual(selected["config"], "pure")
+
     def test_select_row_uses_mean_recall_and_reports_lower_bound_separately(self):
         rows = [
             {
@@ -420,6 +778,118 @@ class TargetRecallRunnerTests(unittest.TestCase):
             selected_rows_for_target[0]["target_lcb95_met_in_calibration"]
         )
 
+    def test_lcb_selection_policy_prefers_confirmed_candidate(self):
+        rows = [
+            {
+                "config": "fast-borderline",
+                "ok": 200,
+                "errors": 0,
+                "rows_complete": True,
+                "recall_mean": 0.96,
+                "recall_lcb95": 0.93,
+                "latency_mean_ms": 10.0,
+                "iterative_scan": "off",
+            },
+            {
+                "config": "confirmed",
+                "ok": 200,
+                "errors": 0,
+                "rows_complete": True,
+                "recall_mean": 0.97,
+                "recall_lcb95": 0.95,
+                "latency_mean_ms": 20.0,
+                "iterative_scan": "strict_order",
+            },
+        ]
+
+        selected, met = select_row(
+            rows, 0.95, selection_policy="lcb_then_max_recall"
+        )
+
+        self.assertTrue(met)
+        self.assertEqual(selected["config"], "confirmed")
+
+    def test_lcb_selection_policy_rejects_mean_only_fallback(self):
+        rows = [
+            {
+                "config": "fast-off",
+                "ok": 200,
+                "errors": 0,
+                "rows_complete": True,
+                "recall_mean": 0.992,
+                "recall_lcb95": 0.98,
+                "latency_mean_ms": 10.0,
+                "iterative_scan": "off",
+            },
+            {
+                "config": "strict",
+                "ok": 200,
+                "errors": 0,
+                "rows_complete": True,
+                "recall_mean": 0.995,
+                "recall_lcb95": 0.985,
+                "latency_mean_ms": 30.0,
+                "iterative_scan": "strict_order",
+            },
+        ]
+
+        selected, met = select_row(
+            rows, 0.99, selection_policy="lcb_then_max_recall"
+        )
+
+        self.assertFalse(met)
+        self.assertIsNone(selected)
+
+        for row in rows:
+            row.update({
+                "filter_name": "f",
+                "mode": "original",
+                "ef_search": 100,
+                "guided_collect_target": 1,
+                "max_scan_tuples": 5_000_000,
+                "scan_mem_multiplier": 32.0,
+                "grid_exhausted": True,
+                "stopped_early": False,
+            })
+        [diagnostic] = selected_rows(
+            rows, ["f"], ["original"], [0.99],
+            calibration_selection_policy="lcb_then_max_recall",
+        )
+        self.assertEqual(diagnostic["selection_status"], "unattainable_on_grid")
+        self.assertFalse(diagnostic["target_confirmed_in_calibration"])
+
+    def test_selection_margin_avoids_barely_passing_calibration_row(self):
+        rows = [
+            {
+                "filter_name": "f",
+                "mode": "original",
+                "config": "fast-borderline",
+                "ok": 2,
+                "errors": 0,
+                "rows_complete": True,
+                "recall_mean": 0.901,
+                "recall_lcb95": 0.89,
+                "latency_mean_ms": 1.0,
+            },
+            {
+                "filter_name": "f",
+                "mode": "original",
+                "config": "stable",
+                "ok": 2,
+                "errors": 0,
+                "rows_complete": True,
+                "recall_mean": 0.915,
+                "recall_lcb95": 0.90,
+                "latency_mean_ms": 2.0,
+            },
+        ]
+
+        selected = selected_rows(rows, ["f"], ["original"], [0.90], 0.01)
+
+        self.assertEqual(selected[0]["config"], "stable")
+        self.assertEqual(selected[0]["calibration_selection_recall"], 0.91)
+        self.assertEqual(selected[0]["calibration_recall_margin"], 0.01)
+
     def test_calibration_stop_uses_mean_recall_not_lcb95(self):
         rows = [{
             "ok": 80,
@@ -429,6 +899,55 @@ class TargetRecallRunnerTests(unittest.TestCase):
             "recall_lcb95": 0.93,
         }]
         self.assertTrue(calibration_stop_reached(rows, 0.95))
+
+    def test_lcb_calibration_stop_requires_lcb95(self):
+        rows = [{
+            "ok": 80,
+            "errors": 0,
+            "rows_complete": True,
+            "recall_mean": 0.99,
+            "recall_lcb95": 0.97,
+        }]
+
+        self.assertEqual(
+            calibration_stop_metric("lcb_then_max_recall"),
+            "recall_lcb95",
+        )
+        self.assertFalse(
+            calibration_stop_reached(
+                rows,
+                0.99,
+                selection_policy="lcb_then_max_recall",
+            )
+        )
+        rows[0]["recall_lcb95"] = 0.99
+        self.assertTrue(
+            calibration_stop_reached(
+                rows,
+                0.99,
+                selection_policy="lcb_then_max_recall",
+            )
+        )
+        with self.assertRaises(ValueError):
+            calibration_stop_metric("unknown")
+
+    def test_calibration_stop_ignores_ineligible_fallback_or_bypass_rows(self):
+        base = {
+            "ok": 80,
+            "errors": 0,
+            "rows_complete": True,
+            "recall_mean": 0.99,
+            "recall_lcb95": 0.99,
+            "mode": "design1_bloom",
+        }
+        self.assertFalse(calibration_stop_reached(
+            [{**base, "fallback_requests_mean": 1}], 0.99,
+            selection_policy="lcb_then_max_recall",
+        ))
+        self.assertFalse(calibration_stop_reached(
+            [{**base, "stock_bypass_requests_mean": 1}], 0.99,
+            selection_policy="lcb_then_max_recall",
+        ))
 
     def test_final_eligible_rows_requires_a_jointly_attainable_method(self):
         rows = [
@@ -469,11 +988,11 @@ class TargetRecallRunnerTests(unittest.TestCase):
             "latency_mean_ms": latency,
         }]
 
-    def test_calibration_stops_after_a_complete_ef_group_reaches_max_target(self):
+    def test_calibration_completes_every_base_config_after_early_lcb_crossing(self):
         configs = [
-            Config(100, 1000, 8.0, "strict_order", 10),
-            Config(100, 2000, 8.0, "strict_order", 10),
-            Config(200, 1000, 8.0, "strict_order", 10),
+            Config(100, 1000, 8.0, "strict_order", 10, 40),
+            Config(100, 2000, 8.0, "strict_order", 10, 40),
+            Config(200, 1000, 8.0, "strict_order", 10, 40),
         ]
 
         def summarize(path, *_args):
@@ -498,13 +1017,144 @@ class TargetRecallRunnerTests(unittest.TestCase):
                 "f", "design1_bloom", configs, self._calibration_args(), [0.95, 0.99]
             )
 
-        self.assertEqual(run_mock.call_count, 2)
-        self.assertEqual([row["ef_search"] for row in rows], [100, 100])
+        self.assertEqual(run_mock.call_count, 3)
+        self.assertEqual([row["ef_search"] for row in rows], [100, 100, 200])
         self.assertEqual(evidence["configs_planned"], 3)
-        self.assertEqual(evidence["configs_executed"], 2)
-        self.assertTrue(evidence["stopped_early"])
-        self.assertEqual(evidence["max_ef_evaluated"], 100)
-        self.assertFalse(evidence["grid_exhausted"])
+        self.assertEqual(evidence["configs_executed"], 3)
+        self.assertFalse(evidence["stopped_early"])
+        self.assertEqual(evidence["max_ef_evaluated"], 200)
+        self.assertTrue(evidence["grid_exhausted"])
+        self.assertTrue(evidence["calibration_complete"])
+        self.assertTrue(evidence["global_target_reached"])
+        self.assertEqual(
+            evidence["calibration_grid_policy"], FORMAL_CALIBRATION_GRID_POLICY
+        )
+
+    def test_calibration_skips_high_extension_after_base_grid_hits_max_target(self):
+        configs = [
+            Config(100, 1000, 8.0, "strict_order", 10, 40),
+            Config(20_000, 1000, 8.0, "strict_order", 10, 40),
+        ]
+        plan_entry = {"path": "plan.json", "sha256": "abc", "checks": [{"passed": True}]}
+        with (
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.run_d123",
+                return_value=1.0,
+            ) as run_mock,
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.summarize_raw",
+                return_value=self._calibration_summary(0.99),
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.plan_evidence_manifest_entry",
+                return_value=plan_entry,
+            ),
+        ):
+            rows, evidence = calibrate_mode_filter(
+                "f", "design1_bloom", configs, self._calibration_args(), [0.99]
+            )
+
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertEqual([row["ef_search"] for row in rows], [100])
+        family = evidence["families"]["strict_order"]
+        self.assertFalse(family["high_extension_required"])
+        self.assertFalse(family["high_extension_executed"])
+        self.assertEqual(
+            family["high_extension_skip_reason"],
+            "max_target_lcb_met_on_complete_base_grid",
+        )
+        self.assertFalse(family["stopped_early"])
+        self.assertTrue(family["grid_exhausted"])
+
+    def test_calibration_runs_high_extension_when_base_grid_misses_max_target(self):
+        configs = [
+            Config(100, 1000, 8.0, "strict_order", 10, 40),
+            Config(20_000, 1000, 8.0, "strict_order", 10, 40),
+            Config(50_000, 1000, 8.0, "strict_order", 10, 40),
+            Config(100_000, 1000, 8.0, "strict_order", 10, 40),
+        ]
+
+        def summarize(path, *_args):
+            return self._calibration_summary(
+                0.99
+                if any(
+                    marker in path.name
+                    for marker in ("ef20000_", "ef50000_", "ef100000_")
+                )
+                else 0.98
+            )
+
+        plan_entry = {"path": "plan.json", "sha256": "abc", "checks": [{"passed": True}]}
+        with (
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.run_d123",
+                return_value=1.0,
+            ) as run_mock,
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.summarize_raw",
+                side_effect=summarize,
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.plan_evidence_manifest_entry",
+                return_value=plan_entry,
+            ),
+        ):
+            rows, evidence = calibrate_mode_filter(
+                "f", "design1_bloom", configs, self._calibration_args(), [0.99]
+            )
+
+        self.assertEqual(run_mock.call_count, 4)
+        self.assertEqual(
+            [row["ef_search"] for row in rows],
+            [100, 20_000, 50_000, 100_000],
+        )
+        family = evidence["families"]["strict_order"]
+        self.assertTrue(family["high_extension_required"])
+        self.assertTrue(family["high_extension_executed"])
+        self.assertTrue(family["grid_exhausted"])
+        self.assertEqual(family["max_ef_evaluated"], 100_000)
+
+    def test_lcb_calibration_continues_past_mean_only_target(self):
+        configs = [
+            Config(100, 1000, 8.0, "strict_order", 10, 40),
+            Config(200, 1000, 8.0, "strict_order", 10, 40),
+        ]
+
+        def summarize(path, *_args):
+            if "ef100_" in path.name:
+                [row] = self._calibration_summary(0.97)
+                row["recall_mean"] = 0.99
+                return [row]
+            return self._calibration_summary(0.99)
+
+        args = self._calibration_args()
+        args.calibration_selection_policy = "lcb_then_max_recall"
+        plan_entry = {"path": "plan.json", "sha256": "abc", "checks": [{"passed": True}]}
+        with (
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.run_d123",
+                return_value=1.0,
+            ) as run_mock,
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.summarize_raw",
+                side_effect=summarize,
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.plan_evidence_manifest_entry",
+                return_value=plan_entry,
+            ),
+        ):
+            rows, evidence = calibrate_mode_filter(
+                "f", "design1_bloom", configs, args, [0.99]
+            )
+
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertEqual([row["ef_search"] for row in rows], [100, 200])
+        self.assertEqual(evidence["calibration_stop_metric"], "recall_lcb95")
+        self.assertEqual(
+            evidence["calibration_selection_policy"],
+            "lcb_then_max_recall",
+        )
 
     def test_unattained_target_is_marked_only_after_the_full_grid_completes(self):
         calibration = []
@@ -540,10 +1190,10 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertEqual(selected[0]["config"], "")
         self.assertTrue(selected[0]["grid_exhausted"])
 
-    def test_resume_reuses_completed_block_and_stops_before_higher_ef(self):
+    def test_resume_reuses_every_required_base_config(self):
         configs = [
-            Config(100, 1000, 8.0, "strict_order", 10),
-            Config(200, 1000, 8.0, "strict_order", 10),
+            Config(100, 1000, 8.0, "strict_order", 10, 40),
+            Config(200, 1000, 8.0, "strict_order", 10, 40),
         ]
         plan_entry = {"path": "plan.json", "sha256": "abc", "checks": [{"passed": True}]}
         with (
@@ -566,16 +1216,18 @@ class TargetRecallRunnerTests(unittest.TestCase):
                 "f", "design1_bloom", configs, self._calibration_args(resume=True), [0.95, 0.99]
             )
 
-        self.assertEqual(reusable_mock.call_count, 1)
+        self.assertEqual(reusable_mock.call_count, 2)
         run_mock.assert_not_called()
-        self.assertEqual([row["ef_search"] for row in rows], [100])
-        self.assertEqual(evidence["configs_reused"], 1)
-        self.assertTrue(evidence["stopped_early"])
+        self.assertEqual([row["ef_search"] for row in rows], [100, 200])
+        self.assertEqual(evidence["configs_reused"], 2)
+        self.assertFalse(evidence["stopped_early"])
+        self.assertTrue(evidence["grid_exhausted"])
+        self.assertTrue(evidence["calibration_complete"])
 
-    def test_stock_iterative_scan_families_stop_independently(self):
+    def test_stock_iterative_scan_families_each_complete_the_base_grid(self):
         configs = [
-            Config(100, 5000000, 32.0, "off", 100),
-            Config(200, 5000000, 32.0, "off", 200),
+            Config(100, 5000000, 32.0, "off", 100, 40),
+            Config(200, 5000000, 32.0, "off", 200, 40),
         ]
 
         def summarize(path, *_args):
@@ -602,20 +1254,83 @@ class TargetRecallRunnerTests(unittest.TestCase):
         ):
             rows, evidence = calibrate_mode_filter("f", "original", configs, args, [0.99])
 
-        self.assertEqual(run_mock.call_count, 3)
+        self.assertEqual(run_mock.call_count, 4)
         self.assertEqual(
-            [(row["iterative_scan"], row["ef_search"]) for row in rows],
-            [("off", 100), ("strict_order", 100), ("strict_order", 200)],
+            {(row["iterative_scan"], row["ef_search"]) for row in rows},
+            {
+                ("off", 100),
+                ("off", 200),
+                ("strict_order", 100),
+                ("strict_order", 200),
+            },
         )
-        self.assertTrue(evidence["families"]["off"]["stopped_early"])
+        self.assertFalse(evidence["families"]["off"]["stopped_early"])
         self.assertFalse(evidence["families"]["strict_order"]["stopped_early"])
+        self.assertFalse(
+            evidence["families"]["strict_order"]["stopped_by_cross_family_target"]
+        )
         self.assertTrue(evidence["families"]["strict_order"]["grid_exhausted"])
+        self.assertTrue(evidence["families"]["off"]["grid_exhausted"])
+        self.assertTrue(evidence["families"]["off"]["target_reached"])
+        self.assertTrue(evidence["families"]["strict_order"]["target_reached"])
+        self.assertTrue(evidence["global_target_reached"])
+        self.assertEqual(
+            evidence["calibration_stop_scope"],
+            "per_family_complete_20_to_10000_base_then_conditional_complete_"
+            "20000_50000_100000_extension",
+        )
+
+    def test_slower_family_is_not_stopped_by_latency_dominance(self):
+        configs = [
+            Config(100, 5000000, 32.0, "off", 100, 40),
+            Config(200, 5000000, 32.0, "off", 200, 40),
+        ]
+
+        def summarize(path, *_args):
+            if "_strict_order_" in path.name:
+                return self._calibration_summary(0.99, latency=5.0)
+            return self._calibration_summary(0.80, latency=10.0)
+
+        args = self._calibration_args()
+        args.stock_iterative_scan_values = "off,strict_order"
+        plan_entry = {
+            "path": "plan.json",
+            "sha256": "abc",
+            "checks": [{"passed": True}],
+        }
+        with (
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.run_d123",
+                return_value=1.0,
+            ) as run_mock,
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.summarize_raw",
+                side_effect=summarize,
+            ),
+            mock.patch(
+                "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.plan_evidence_manifest_entry",
+                return_value=plan_entry,
+            ),
+        ):
+            rows, evidence = calibrate_mode_filter(
+                "f", "original", configs, args, [0.99]
+            )
+
+        self.assertEqual(run_mock.call_count, 4)
+        self.assertEqual(len(rows), 4)
+        off = evidence["families"]["off"]
+        self.assertFalse(off["stopped_early"])
+        self.assertFalse(off["stopped_by_cross_family_target"])
+        self.assertFalse(off["target_reached"])
+        self.assertTrue(off["grid_exhausted"])
+        self.assertTrue(evidence["calibration_complete"])
+        self.assertTrue(evidence["global_target_reached"])
 
     def test_calibration_family_error_prevents_early_stop_and_selection(self):
         configs = [
-            Config(100, 1000, 32.0, "off", 100),
-            Config(100, 2000, 32.0, "off", 100),
-            Config(200, 1000, 32.0, "off", 200),
+            Config(100, 1000, 32.0, "off", 100, 40),
+            Config(100, 2000, 32.0, "off", 100, 40),
+            Config(200, 1000, 32.0, "off", 200, 40),
         ]
 
         def summarize(path, *_args):
@@ -657,7 +1372,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertEqual(selected[0]["selection_status"], "incomplete_or_failed")
 
     def test_seeded_calibration_block_is_reproducible_and_randomized(self):
-        configs = [Config(100, value, 32.0, "off", 100) for value in range(1000, 9000, 1000)]
+        configs = [Config(100, value, 32.0, "off", 100, 40) for value in range(1000, 9000, 1000)]
 
         first = seeded_calibration_block(configs, 20260718, "f", "original", "off", 0)
         second = seeded_calibration_block(configs, 20260718, "f", "original", "off", 0)
@@ -667,7 +1382,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
         self.assertNotEqual(first, configs)
 
     def test_manifest_mode_grids_record_stock_and_sqlens_actual_configs(self):
-        configs = [Config(100, 5000000, 32.0, "off", 100)]
+        configs = [Config(100, 5000000, 32.0, "off", 100, 40)]
 
         grids = mode_calibration_grids(
             configs,
@@ -681,12 +1396,51 @@ class TargetRecallRunnerTests(unittest.TestCase):
         )
         self.assertEqual([row["iterative_scan"] for row in grids["design1_bloom"]], ["off"])
 
+    @staticmethod
+    def _formal_protocol_args():
+        contract = load_p0_release_contract(DEFAULT_P0_RELEASE_CONTRACT)
+        return argparse.Namespace(
+            calibration_queries=80,
+            calibration_repeats=2,
+            calibration_query_offset=20,
+            final_queries=100,
+            final_repeats=5,
+            final_query_offset=100,
+            final_execution_order="interleaved",
+            calibration_selection_policy="lcb_then_max_recall",
+            calibration_recall_margin=0.0,
+            ef_search_values=DENSE_22_EF_SEARCH,
+            iterative_scan_values="off,strict_order",
+            stock_iterative_scan_values="off,strict_order",
+            guidance_filter_strategy="safe_guided",
+            traversal_guided_prioritization=False,
+            max_scan_tuples_values="5000000",
+            scan_mem_multiplier_values="32",
+            warmup_all_queries=True,
+            force_hnsw=True,
+            require_preferred_index_guc=True,
+            candidate_validity_predicate=DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+            filters_csv=DEFAULT_FILTERS_CSV,
+            truth_csv=DEFAULT_TRUTH_CSV,
+            release_contract_provenance=contract,
+        )
+
     def test_formal_completion_gate_distinguishes_matrix_measurement_and_comparison(self):
-        filters = [f"dataset_filter_{number}" for number in range(14)]
-        modes = DEFAULT_MODES
+        filters = FILTER_ORDER
+        modes = FORMAL_D1_MODES
         targets = [0.90, 0.95, 0.99]
         selected = [
-            {"filter_name": filter_name, "mode": mode, "target_recall": target}
+            {
+                "filter_name": filter_name,
+                "mode": mode,
+                "target_recall": target,
+                "selection_status": "selected",
+                "target_lcb95_met_in_calibration": True,
+                "grid_exhausted": True,
+                "stopped_early": False,
+                "calibration_complete": True,
+                "calibration_grid_policy": FORMAL_CALIBRATION_GRID_POLICY,
+            }
             for filter_name in filters
             for target in targets
             for mode in modes
@@ -704,12 +1458,85 @@ class TargetRecallRunnerTests(unittest.TestCase):
             for row in selected
         ]
 
-        complete = formal_completion_gate(filters, modes, targets, selected, final, False)
+        complete = formal_completion_gate(
+            filters, modes, targets, selected, final, False,
+            self._formal_protocol_args(),
+        )
         self.assertTrue(complete["matrix_complete"])
         self.assertTrue(complete["measurement_complete"])
         self.assertTrue(complete["comparison_valid"])
-        self.assertEqual(complete["expected_cells"], 168)
+        self.assertEqual(complete["expected_cells"], 84)
         self.assertEqual(complete["status"], "complete")
+        self.assertTrue(complete["requested_slice_complete"])
+        self.assertTrue(complete["formal_release_complete"])
+        self.assertTrue(complete["diagnostic_valid"])
+        self.assertTrue(complete["artifact_valid"])
+        self.assertTrue(complete["paper_eligible"])
+
+        extra_ef = self._formal_protocol_args()
+        extra_ef.ef_search_values = DENSE_22_EF_SEARCH + ",200000,500000"
+        wrong_grid = formal_completion_gate(
+            filters, modes, targets, selected, final, False, extra_ef
+        )
+        self.assertTrue(wrong_grid["requested_slice_complete"])
+        self.assertFalse(wrong_grid["formal_release_complete"])
+        self.assertIn(
+            "dense_22_ef_grid", wrong_grid["formal_protocol_errors"]
+        )
+
+        synthetic_filters = [f"dataset_filter_{number}" for number in range(14)]
+        synthetic_name = dict(zip(filters, synthetic_filters))
+        synthetic_selected = [
+            {**row, "filter_name": synthetic_name[row["filter_name"]]}
+            for row in selected
+        ]
+        synthetic_final = [
+            {**row, "filter_name": synthetic_name[row["filter_name"]]}
+            for row in final
+        ]
+        synthetic = formal_completion_gate(
+            synthetic_filters, modes, targets,
+            synthetic_selected, synthetic_final, False,
+            self._formal_protocol_args(),
+        )
+        self.assertTrue(synthetic["requested_slice_complete"])
+        self.assertFalse(synthetic["formal_release_complete"])
+        self.assertIn("filters_not_preregistered_amazon14", synthetic["formal_protocol_errors"])
+
+        slice_filters = filters[:2]
+        slice_modes = modes[:3]
+        slice_targets = [0.90]
+        slice_selected = [
+            {"filter_name": filter_name, "mode": mode, "target_recall": target}
+            for filter_name in slice_filters
+            for target in slice_targets
+            for mode in slice_modes
+        ]
+        slice_final = [
+            {
+                **row,
+                "final_status": "complete",
+                "rows_complete": True,
+                "errors": 0,
+                "target_confirmed_in_calibration": True,
+                "target_confirmed_in_final": True,
+                "matched_recall_comparison_valid": True,
+            }
+            for row in slice_selected
+        ]
+        complete_slice = formal_completion_gate(
+            slice_filters,
+            slice_modes,
+            slice_targets,
+            slice_selected,
+            slice_final,
+            False,
+        )
+        self.assertEqual(complete_slice["expected_cells"], 4)
+        self.assertTrue(complete_slice["matrix_complete"])
+        self.assertTrue(complete_slice["comparison_valid"])
+        self.assertEqual(complete_slice["status"], "complete")
+        self.assertFalse(complete_slice["formal_release_complete"])
 
         duplicate = formal_completion_gate(
             filters,
@@ -718,17 +1545,24 @@ class TargetRecallRunnerTests(unittest.TestCase):
             selected + [dict(selected[0])],
             final,
             False,
+            self._formal_protocol_args(),
         )
         self.assertFalse(duplicate["matrix_complete"])
         self.assertEqual(duplicate["status"], "incomplete")
 
-        missing_final = formal_completion_gate(filters, modes, targets, selected, final[:-1], False)
+        missing_final = formal_completion_gate(
+            filters, modes, targets, selected, final[:-1], False,
+            self._formal_protocol_args(),
+        )
         self.assertTrue(missing_final["matrix_complete"])
         self.assertFalse(missing_final["measurement_complete"])
         self.assertFalse(missing_final["comparison_valid"])
 
         final[-1]["matched_recall_comparison_valid"] = False
-        invalid_comparison = formal_completion_gate(filters, modes, targets, selected, final, False)
+        invalid_comparison = formal_completion_gate(
+            filters, modes, targets, selected, final, False,
+            self._formal_protocol_args(),
+        )
         self.assertTrue(invalid_comparison["measurement_complete"])
         self.assertFalse(invalid_comparison["comparison_valid"])
         self.assertEqual(invalid_comparison["status"], "incomplete")
@@ -773,7 +1607,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
                 0,
                 1,
                 1,
-                Config(100, 1000, 8.0, "off", 100),
+                Config(100, 1000, 8.0, "off", 100, 40),
                 args,
                 None,
             )
@@ -786,6 +1620,12 @@ class TargetRecallRunnerTests(unittest.TestCase):
             cmd[cmd.index("--candidate-validity-predicate") + 1],
             "embedding_valid",
         )
+        self.assertEqual(
+            cmd[cmd.index("--traversal-guided-target") + 1],
+            "40",
+        )
+        self.assertIn("--no-traversal-guided-prioritization", cmd)
+        self.assertNotIn("--traversal-guided-prioritization", cmd)
 
     def test_interleaved_parent_forwards_candidate_validity_predicate(self):
         args = argparse.Namespace(
@@ -819,6 +1659,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
             require_preferred_index_guc=False,
             warmup_all_queries=False,
             force_hnsw=True,
+            traversal_guided_prioritization=True,
             sqlens_runtime_provenance={
                 "loaded_vector_sqlens_build_id": "sqlens-v11-exact",
                 "loaded_vector_so_sha256": "a" * 64,
@@ -826,7 +1667,7 @@ class TargetRecallRunnerTests(unittest.TestCase):
         )
         modes = ["original", "design1_bloom"]
         configs = {
-            mode: Config(100, 1000, 8.0, "off", 100) for mode in modes
+            mode: Config(100, 1000, 8.0, "off", 100, 40) for mode in modes
         }
         with tempfile.TemporaryDirectory() as tmp, mock.patch(
             "experiments.hybrid_vector_db.scripts.pgvector_target_recall_selectivity_runner.run_command",
@@ -846,11 +1687,17 @@ class TargetRecallRunnerTests(unittest.TestCase):
             cmd[cmd.index("--candidate-validity-predicate") + 1],
             "embedding_valid",
         )
+        self.assertEqual(
+            cmd[cmd.index("--traversal-guided-target") + 1],
+            "40",
+        )
         self.assertIn("--no-expected-truth-self-excluded", cmd)
+        self.assertIn("--traversal-guided-prioritization", cmd)
+        self.assertNotIn("--no-traversal-guided-prioritization", cmd)
 
     def test_sqlens_runtime_provenance_records_loaded_contract_and_fails_closed(self):
         profile = {
-            "profile_semantics_version": 7,
+            "profile_semantics_version": 9,
             "graph_elements_visited": 1,
             "raw_index_tids_returned": 2,
             "hnsw_am_callback_ms": 0.1,
@@ -868,7 +1715,11 @@ class TargetRecallRunnerTests(unittest.TestCase):
         cursor = mock.MagicMock()
         binary_sha256 = "a" * 64
         cursor.fetchone.side_effect = [
-            ("sqlens-v11-test", "/usr/lib/postgresql/16/lib/vector.so", binary_sha256),
+            (
+                "sqlens-v16-d3-full-materialization-persisted-reuse-test",
+                "/usr/lib/postgresql/16/lib/vector.so",
+                binary_sha256,
+            ),
             (json.dumps(profile),),
         ]
         connection = mock.MagicMock()
@@ -882,18 +1733,28 @@ class TargetRecallRunnerTests(unittest.TestCase):
         ):
             provenance = sqlens_runtime_provenance()
 
-        self.assertEqual(provenance["loaded_vector_sqlens_build_id"], "sqlens-v11-test")
+        self.assertEqual(
+            provenance["loaded_vector_sqlens_build_id"],
+            "sqlens-v16-d3-full-materialization-persisted-reuse-test",
+        )
         self.assertEqual(provenance["loaded_vector_so_sha256"], binary_sha256)
-        self.assertEqual(provenance["required_build_prefix"], "sqlens-v11-")
-        self.assertEqual(provenance["minimum_profile_semantics_version"], 7.0)
-        self.assertEqual(provenance["profile_semantics_version"], 7)
+        self.assertEqual(
+            provenance["required_build_prefix"],
+            "sqlens-v16-d3-full-materialization-persisted-reuse-",
+        )
+        self.assertEqual(provenance["minimum_profile_semantics_version"], 9.0)
+        self.assertEqual(provenance["profile_semantics_version"], 9)
         self.assertEqual(provenance["required_profile_fields"], {
             key: profile[key]
             for key in SQLENS_PROFILE_REQUIRED_FIELDS + SQLENS_TRAVERSAL_PROFILE_REQUIRED_FIELDS
         })
 
         cursor.fetchone.side_effect = [
-            ("sqlens-v11-test", "/usr/lib/postgresql/16/lib/vector.so", "not-a-sha"),
+            (
+                "sqlens-v16-d3-full-materialization-persisted-reuse-test",
+                "/usr/lib/postgresql/16/lib/vector.so",
+                "not-a-sha",
+            ),
             (json.dumps(profile),),
         ]
         with mock.patch(
@@ -904,9 +1765,13 @@ class TargetRecallRunnerTests(unittest.TestCase):
                 sqlens_runtime_provenance()
 
         profile.pop("executor_residual_ms")
-        profile["profile_semantics_version"] = 6
+        profile["profile_semantics_version"] = 8
         cursor.fetchone.side_effect = [
-            ("sqlens-v11-test", "/usr/lib/postgresql/16/lib/vector.so", binary_sha256),
+            (
+                "sqlens-v16-d3-full-materialization-persisted-reuse-test",
+                "/usr/lib/postgresql/16/lib/vector.so",
+                binary_sha256,
+            ),
             (json.dumps(profile),),
         ]
         with mock.patch(
@@ -918,9 +1783,10 @@ class TargetRecallRunnerTests(unittest.TestCase):
 
     def test_configs_for_mode_deduplicates_stock_but_not_sqlens(self):
         configs = [
-            Config(100, 1000, 8.0, "strict_order", 100),
-            Config(100, 1000, 8.0, "strict_order", 200),
-            Config(200, 1000, 8.0, "strict_order", 100),
+            Config(100, 1000, 8.0, "strict_order", 100, 40),
+            Config(100, 1000, 8.0, "strict_order", 100, 80),
+            Config(100, 1000, 8.0, "strict_order", 200, 80),
+            Config(200, 1000, 8.0, "strict_order", 100, 40),
         ]
 
         stock = configs_for_mode(configs, "original")
@@ -928,10 +1794,11 @@ class TargetRecallRunnerTests(unittest.TestCase):
 
         self.assertEqual(len(stock), 2)
         self.assertEqual([config.guided_collect_target for config in stock], [100, 100])
+        self.assertEqual({config.traversal_guided_target for config in stock}, {40})
         self.assertEqual(sqlens, configs)
 
     def test_configs_for_mode_independently_tunes_stock_iterative_scan(self):
-        configs = [Config(100, 5000000, 32.0, "off", 100)]
+        configs = [Config(100, 5000000, 32.0, "off", 100, 40)]
 
         stock = configs_for_mode(configs, "original", "off,strict_order")
         sqlens = configs_for_mode(configs, "design1_bloom", "off,strict_order")
@@ -948,46 +1815,98 @@ class TargetRecallRunnerTests(unittest.TestCase):
         args = argparse.Namespace(
             ef_search_values="100,200",
             guided_collect_target_values="10,20,ef",
+            traversal_guided_target_values="40,80",
             max_scan_tuples_values="1000",
             scan_mem_multiplier_values="8",
             iterative_scan_values="strict_order",
             guidance_filter_strategy="safe_guided",
+            expected_truth_self_excluded=True,
         )
 
         configs = build_configs(args)
 
         self.assertEqual(len(configs), 2)
         self.assertEqual({config.guided_collect_target for config in configs}, {1})
+        self.assertEqual(
+            {config.traversal_guided_target for config in configs},
+            {40},
+        )
 
-    def test_traversal_guided_grid_requires_off_and_targets_at_least_ef(self):
+    def test_traversal_guided_target_grid_expands_and_respects_ef_and_self_exclusion_bounds(self):
         args = argparse.Namespace(
             ef_search_values="100,200",
-            guided_collect_target_values="40,ef",
+            guided_collect_target_values="ef",
+            traversal_guided_target_values="11,160,200",
             max_scan_tuples_values="1000",
             scan_mem_multiplier_values="8",
             iterative_scan_values="off",
             guidance_filter_strategy="traversal_guided",
+            expected_truth_self_excluded=True,
         )
 
         configs = build_configs(args)
 
         self.assertEqual(
-            {(config.ef_search, config.guided_collect_target) for config in configs},
-            {(100, 100), (200, 200)},
+            {(config.ef_search, config.traversal_guided_target) for config in configs},
+            {(100, 11), (200, 11), (200, 160), (200, 200)},
         )
+
+    def test_traversal_guided_grid_requires_off_and_targets_at_least_ef(self):
+        args = argparse.Namespace(
+            ef_search_values="100,200",
+            guided_collect_target_values="40,ef",
+            traversal_guided_target_values="20,40,160",
+            max_scan_tuples_values="1000",
+            scan_mem_multiplier_values="8",
+            iterative_scan_values="off",
+            guidance_filter_strategy="traversal_guided",
+            expected_truth_self_excluded=True,
+        )
+
+        configs = build_configs(args)
+
+        self.assertEqual(
+            {(config.ef_search, config.guided_collect_target, config.traversal_guided_target) for config in configs},
+            {
+                (100, 100, 20),
+                (100, 100, 40),
+                (200, 200, 20),
+                (200, 200, 40),
+                (200, 200, 160),
+            },
+        )
+        args.expected_truth_self_excluded = False
+        args.guidance_filter_strategy = "guided_collect"
+        configs = build_configs(args)
+        self.assertIn((100, 40, 20), {(row.ef_search, row.guided_collect_target, row.traversal_guided_target) for row in configs})
+        self.assertIn((100, 40, 40), {(row.ef_search, row.guided_collect_target, row.traversal_guided_target) for row in configs})
+        self.assertIn((200, 40, 160), {(row.ef_search, row.guided_collect_target, row.traversal_guided_target) for row in configs})
+        args.guidance_filter_strategy = "traversal_guided"
+        args.expected_truth_self_excluded = True
+        args.traversal_guided_target_values = "5"
+        with self.assertRaisesRegex(SystemExit, "no valid traversal_guided_target values remain"):
+            build_configs(args)
+
+        args.traversal_guided_target_values = "500,600"
+        with self.assertRaisesRegex(SystemExit, "no valid traversal_guided_target values remain"):
+            build_configs(args)
+
         args.iterative_scan_values = "strict_order"
         with self.assertRaisesRegex(SystemExit, "iterative-scan-values=off"):
             build_configs(args)
 
-    def test_default_ef_grid_matches_dense_12(self):
+    def test_default_ef_grid_includes_low_budget_high_selectivity_points(self):
         self.assertEqual(
-            [int(value) for value in DENSE_12_EF_SEARCH.split(",")],
-            [250, 500, 750, 1000, 1500, 2000, 3000, 4000, 5000, 7000, 8500, 10000],
+            [int(value) for value in DENSE_22_EF_SEARCH.split(",")],
+            [20, 40, 60, 80, 100, 150, 200, 250, 500, 750, 1000, 1500, 2000, 3000, 4000, 5000, 7000, 8500, 10000, 20000, 50000, 100000],
         )
-        self.assertEqual(DEFAULT_TRUTH_CSV.name, "amazon_selectivity14_exact_truth_q200_formal.csv")
+        self.assertEqual(
+            DEFAULT_TRUTH_CSV.name,
+            "amazon_selectivity14_exact_truth_q200_unique_embeddings_formal.csv",
+        )
         self.assertEqual(DEFAULT_INSERTION_TABLE, DEFAULT_BFS_TABLE)
         self.assertNotEqual(DEFAULT_INSERTION_INDEX, DEFAULT_BFS_INDEX)
-        self.assertIn("bfs_clone", DEFAULT_BFS_INDEX)
+        self.assertIn("fullmem_bfs", DEFAULT_BFS_INDEX)
 
     def test_raw_recall_is_recomputed_from_tie_aware_distances(self):
         row = {
@@ -1015,6 +1934,176 @@ class TargetRecallRunnerTests(unittest.TestCase):
         row["recall"] = "0.8"
         with self.assertRaises(ValueError):
             validate_tie_aware_raw_row(row)
+
+    def test_d3_raw_lifecycle_requires_predicate_scoped_phase_proof(self):
+        row = {
+            "sqlens_build_id": "sqlens-v14-test",
+            "vector_so_sha256": "a" * 64,
+            "backend_pid": "123",
+            "backend_cpu_observed": "48-63",
+            "backend_cpu_requested": "",
+            "backend_cpu_pinning_attempted_by_runner": "false",
+            "mode": "design1_bloom_bfs_layout_d3",
+            "d3_phase": "probe",
+            "guidance_route": "d3_stock_probe",
+            "guidance_enabled": "false",
+            "d3_active_after": "false",
+            "d3_admitted_after": "false",
+            "recall_contract": TIE_AWARE_RECALL_CONTRACT,
+            "truth_self_excluded": "true",
+            "truth_filtered_rows": "1",
+            "truth_kth_distance_sq": "1.0",
+            "truth_tie_tolerance": "0.0",
+            "result_distances": "[0.5]",
+            "returned": "1",
+            "k": "1",
+            "recall": "1.0",
+            "error": "",
+        }
+
+        self.assertEqual(validate_tie_aware_raw_row(row), 1.0)
+        warm = {
+            **row,
+            "d3_phase": "warm",
+            "guidance_route": "enabled",
+            "guidance_enabled": "true",
+            "d3_active_after": "true",
+            "d3_admitted_after": "true",
+            "d3_same_predicate_before": "true",
+            "d3_admitted_before": "true",
+            "d3_active_guidance_reused": "true",
+        }
+        self.assertEqual(validate_tie_aware_raw_row(warm), 1.0)
+        warm["d3_same_predicate_before"] = "false"
+        with self.assertRaisesRegex(ValueError, "warm row"):
+            validate_tie_aware_raw_row(warm)
+
+    def test_d3_summary_separates_probe_admission_and_warm_costs(self):
+        common = {
+            "sqlens_build_id": "sqlens-v14-test",
+            "vector_so_sha256": "a" * 64,
+            "backend_pid": "123",
+            "backend_cpu_observed": "48-63",
+            "backend_cpu_requested": "",
+            "backend_cpu_pinning_attempted_by_runner": "false",
+            "filter_name": "filter_a",
+            "mode": "design1_bloom_bfs_layout_d3",
+            "recall_contract": TIE_AWARE_RECALL_CONTRACT,
+            "truth_self_excluded": "true",
+            "truth_filtered_rows": "1",
+            "truth_kth_distance_sq": "1.0",
+            "truth_tie_tolerance": "0.0",
+            "result_distances": "[0.5]",
+            "returned": "1",
+            "k": "1",
+            "recall": "1.0",
+            "repeat": "0",
+            "error": "",
+        }
+        rows = [
+            {
+                **common,
+                "query_no": "0",
+                "d3_phase": "probe",
+                "guidance_route": "d3_stock_probe",
+                "guidance_enabled": "false",
+                "d3_active_after": "false",
+                "d3_admitted_after": "false",
+                "end_to_end_ms": "30",
+                "activation_ms": "2",
+                "query_latency_ms": "28",
+            },
+            {
+                **common,
+                "query_no": "1",
+                "d3_phase": "admission",
+                "guidance_route": "enabled",
+                "guidance_enabled": "true",
+                "d3_active_after": "true",
+                "d3_admitted_after": "true",
+                "d3_adaptive_admissions_delta": "1",
+                "end_to_end_ms": "60",
+                "activation_ms": "40",
+                "query_latency_ms": "20",
+            },
+            {
+                **common,
+                "query_no": "2",
+                "d3_phase": "warm",
+                "guidance_route": "enabled",
+                "guidance_enabled": "true",
+                "d3_active_after": "true",
+                "d3_admitted_after": "true",
+                "d3_same_predicate_before": "true",
+                "d3_admitted_before": "true",
+                "d3_active_guidance_reused": "true",
+                "end_to_end_ms": "10",
+                "activation_ms": "1",
+                "query_latency_ms": "9",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "raw.csv"
+            fields = list(dict.fromkeys(field for row in rows for field in row))
+            with path.open("w", newline="", encoding="utf-8") as target:
+                writer = csv.DictWriter(target, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            summary = summarize_raw(
+                path,
+                bootstrap_samples=10,
+                expected_queries=3,
+                expected_repeats=1,
+            )[0]
+
+        self.assertEqual(summary["d3_probe_count"], 1)
+        self.assertEqual(summary["d3_admission_count"], 1)
+        self.assertEqual(summary["d3_warm_count"], 1)
+        self.assertEqual(summary["d3_probe_latency_mean_ms"], 30.0)
+        self.assertEqual(summary["d3_admission_activation_mean_ms"], 40.0)
+        self.assertEqual(summary["d3_warm_query_latency_mean_ms"], 9.0)
+
+    def test_summary_preserves_non_self_excluded_external_query_contract(self):
+        row = {
+            "sqlens_build_id": "sqlens-v14-test",
+            "vector_so_sha256": "a" * 64,
+            "backend_pid": "123",
+            "backend_cpu_observed": "48-63",
+            "backend_cpu_requested": "",
+            "backend_cpu_pinning_attempted_by_runner": "false",
+            "filter_name": "filter_a",
+            "mode": "original",
+            "query_no": "0",
+            "repeat": "0",
+            "recall_contract": TIE_AWARE_RECALL_CONTRACT,
+            "truth_self_excluded": "false",
+            "truth_filtered_rows": "1",
+            "truth_kth_distance_sq": "1.0",
+            "truth_tie_tolerance": "0.0",
+            "result_distances": "[0.5]",
+            "returned": "1",
+            "k": "1",
+            "recall": "1.0",
+            "end_to_end_ms": "5.0",
+            "error": "",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "raw.csv"
+            with path.open("w", newline="", encoding="utf-8") as target:
+                writer = csv.DictWriter(target, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow(row)
+
+            summary = summarize_raw(
+                path,
+                bootstrap_samples=10,
+                expected_queries=1,
+                expected_repeats=1,
+                expected_truth_self_excluded=False,
+            )[0]
+
+        self.assertIs(summary["truth_self_excluded"], False)
 
     def test_formal_traversal_raw_contract_rejects_self_and_stock_fallback(self):
         row = {
@@ -1060,6 +2149,73 @@ class TargetRecallRunnerTests(unittest.TestCase):
             "error": "",
         }
         self.assertEqual(validate_tie_aware_raw_row(row), 1.0)
+
+        safe_guided = {
+            **row,
+            "guidance_filter_strategy": "safe_guided",
+            "self_exclusion_contract": "sql_residual_id_not_equal",
+            "final_path": "validation_only",
+            "traversal_guidance_scope": "pre_heap_tid_validation",
+            "guidance_checks": "5",
+        }
+        self.assertEqual(validate_tie_aware_raw_row(safe_guided), 1.0)
+        safe_guided["graph_expansion_pruned"] = "true"
+        with self.assertRaisesRegex(ValueError, "graph-expansion pruning"):
+            validate_tie_aware_raw_row(safe_guided)
+
+        prioritized = {
+            **row,
+            "sqlens_build_id": "sqlens-v14-test",
+            "final_path": "approximate_traversal_prioritization",
+            "traversal_guidance_scope": (
+                "approximate_traversal_prioritization_and_candidate_admission"
+            ),
+            "approximate_ann_path": "true",
+            "approximate_prioritization_attempted": "true",
+            "priority_reorders": "1",
+            "traversal_order_changed": "true",
+            "match_frontier_pops": "3",
+            "no_bridge_frontier_pops": "2",
+            "traversal_prioritization_burst": "8",
+        }
+        self.assertEqual(validate_tie_aware_raw_row(prioritized), 1.0)
+        prioritized["traversal_order_changed"] = "false"
+        with self.assertRaisesRegex(ValueError, "priority_reorders"):
+            validate_tie_aware_raw_row(prioritized)
+
+        fallback = {
+            **prioritized,
+            "traversal_order_changed": "true",
+            "final_path": "fresh_stock_fallback",
+            "approximate_ann_path": "false",
+            "fallback_requests": "1",
+            "fallback_reason": "insufficient_guided_matches",
+            "fallback_iterative_scan_enabled": "true",
+            "guidance_checks": "0",
+            "traversal_guidance_scope": "none",
+            "guided_expanded_nodes": "10",
+            "guided_phase_distance_computations": "20",
+            "stock_phase_expanded_nodes": "5",
+            "stock_phase_distance_computations": "9",
+            "fallback_stock_expanded_nodes": "5",
+            "fallback_stock_distance_computations": "9",
+            "neighbor_expansion_guidance_checks": "5",
+            "neighbor_expansion_guidance_matches": "3",
+            "neighbor_expansion_guidance_misses": "2",
+            "returned": "0",
+            "raw_returned_before_self_exclusion": "0",
+            "ids": "",
+            "result_distances": "[]",
+            "recall": "0.0",
+        }
+        with self.assertRaisesRegex(ValueError, "fresh-stock fallback"):
+            validate_tie_aware_raw_row(fallback)
+        self.assertEqual(
+            validate_tie_aware_raw_row(
+                fallback, allow_fresh_stock_fallback=True
+            ),
+            0.0,
+        )
 
         row["fallback_requests"] = "1"
         with self.assertRaisesRegex(ValueError, "fresh-stock fallback"):
@@ -1331,10 +2487,10 @@ class TargetRecallRunnerTests(unittest.TestCase):
             results = run_final_interleaved(selected, args)
 
         self.assertEqual(run_mock.call_count, 2)
-        low_stock = results[(0.90, "f", "original", "ef500_target1_max5000000_mem32p0_strict_order")]
-        low_method = results[(0.90, "f", "design1_bloom", "ef750_target1_max5000000_mem32p0_strict_order")]
-        high_stock = results[(0.95, "f", "original", "ef500_target1_max5000000_mem32p0_strict_order")]
-        high_method = results[(0.95, "f", "design1_bloom", "ef1500_target1_max5000000_mem32p0_strict_order")]
+        low_stock = results[(0.90, "f", "original", "ef500_target1_traverse40_max5000000_mem32p0_strict_order")]
+        low_method = results[(0.90, "f", "design1_bloom", "ef750_target1_traverse40_max5000000_mem32p0_strict_order")]
+        high_stock = results[(0.95, "f", "original", "ef500_target1_traverse40_max5000000_mem32p0_strict_order")]
+        high_method = results[(0.95, "f", "design1_bloom", "ef1500_target1_traverse40_max5000000_mem32p0_strict_order")]
         self.assertEqual(low_stock["final_raw"], low_method["final_raw"])
         self.assertEqual(high_stock["final_raw"], high_method["final_raw"])
         self.assertNotEqual(low_stock["final_raw"], high_stock["final_raw"])

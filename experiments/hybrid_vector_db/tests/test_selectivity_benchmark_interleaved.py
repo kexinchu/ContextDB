@@ -18,6 +18,122 @@ import pgvector_design1_design2_design3_selectivity_benchmark as benchmark  # no
 
 class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
     @staticmethod
+    def _checkpoint_fixture(tmp: Path):
+        modes = ["original", "design1_bloom_bfs_layout_d3"]
+        requests = [
+            benchmark.WorkloadRequest(i, i, 100 + i, "filter_a", 0, "measurement")
+            for i in range(1, 4)
+        ]
+        args = argparse.Namespace(
+            out=tmp / "formal.csv",
+            modes=modes,
+            repeats=1,
+            schedule_seed=17,
+            resume_from_checkpoint=True,
+        )
+        scheduled = list(requests)
+        random.Random(args.schedule_seed).shuffle(scheduled)
+        rows = []
+        for position, request in enumerate(scheduled[:2], start=1):
+            order = benchmark.balanced_mode_order(
+                modes, position - 1, args.schedule_seed
+            )
+            for mode in order:
+                rows.append(
+                    {
+                        "repeat": 0,
+                        "request_no": request.request_no,
+                        "query_no": request.query_no,
+                        "query_order_position": position,
+                        "block_no": position - 1,
+                        "mode": mode,
+                        "filter_name": request.filter_name,
+                        "error": "",
+                    }
+                )
+        return args, requests, rows
+
+    def test_workload_checkpoint_round_trip_accepts_complete_schedule_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args, requests, rows = self._checkpoint_fixture(Path(directory))
+
+            benchmark.write_workload_checkpoint(args, rows)
+            loaded, completed = benchmark.load_workload_checkpoint(args, requests)
+
+            self.assertEqual(len(loaded), 4)
+            self.assertEqual(completed, {0: 2})
+            self.assertEqual(args.workload_checkpoint_last_rows, 4)
+
+    def test_workload_checkpoint_rejects_partial_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args, _requests, rows = self._checkpoint_fixture(Path(directory))
+
+            with self.assertRaisesRegex(RuntimeError, "partial interleaved"):
+                benchmark.write_workload_checkpoint(args, rows[:-1])
+
+    def test_workload_checkpoint_rejects_gap_and_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args, requests, rows = self._checkpoint_fixture(Path(directory))
+            rows[2]["request_no"] = 999
+            benchmark.write_workload_checkpoint(args, rows)
+            with self.assertRaisesRegex(RuntimeError, "not a prefix"):
+                benchmark.load_workload_checkpoint(args, requests)
+
+        with tempfile.TemporaryDirectory() as directory:
+            args, requests, rows = self._checkpoint_fixture(Path(directory))
+            rows[0]["error"] = "QueryCanceled"
+            benchmark.write_workload_checkpoint(args, rows)
+            with self.assertRaisesRegex(RuntimeError, "query error"):
+                benchmark.load_workload_checkpoint(args, requests)
+
+    def test_search_configuration_evidence_distinguishes_global_and_per_filter(self):
+        args = argparse.Namespace(
+            mode_configs_json={"original": {"ef_search": 500}},
+            filter_ef_search_json={},
+            filter_traversal_target_json={},
+            guidance_bypass_ef_search=1000,
+            guidance_low_selectivity_bypass_ef_search=2000,
+            guidance_bypass_iterative_scan="strict_order",
+            guidance_selectivity_min_pct=0.6,
+            guidance_selectivity_max_pct=6.0,
+            guidance_composite_max_selectivity_pct=4.0,
+        )
+
+        global_evidence = benchmark.search_configuration_evidence(args)
+        self.assertEqual(global_evidence["configured_scope"], "global_policy")
+        self.assertEqual(global_evidence["mode_defaults"]["original"]["ef_search"], 500)
+        self.assertEqual(
+            global_evidence["guidance_bypass_policy"]["low_selectivity_ef_search"],
+            2000,
+        )
+
+        args.filter_ef_search_json = {"original": {"filter_a": 700}}
+        args.filter_traversal_target_json = {
+            "design1_bloom_bfs_layout_d3": {"filter_a": 40}
+        }
+        per_filter_evidence = benchmark.search_configuration_evidence(args)
+        self.assertEqual(per_filter_evidence["configured_scope"], "per_filter")
+        self.assertEqual(
+            per_filter_evidence["filter_ef_search_overrides"]["original"]["filter_a"],
+            700,
+        )
+
+    def test_plan_evidence_count_includes_every_repeat(self):
+        args = argparse.Namespace(
+            modes=["original", "design1_bloom_bfs_layout_d3"],
+            repeats=3,
+        )
+        filters = [
+            (f"filter_{position}", float(position), "a = 1")
+            for position in range(14)
+        ]
+
+        self.assertEqual(
+            benchmark.expected_plan_evidence_count(args, filters),
+            84,
+        )
+
+    @staticmethod
     def _d2_proof(checked_at: str = "2026-07-18T00:00:00+00:00") -> dict[str, object]:
         return {
             "checked_at": checked_at,
@@ -59,11 +175,13 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
     @staticmethod
     def _sqlens_profile() -> dict[str, object]:
         profile = {
-            "profile_semantics_version": 7,
+            "profile_semantics_version": 12,
             "graph_elements_visited": 11,
             "raw_index_tids_returned": 7,
-            "hnsw_am_callback_ms": 1.25,
+            "hnsw_am_callback_ms": 0.0,
             "executor_residual_ms": 0.75,
+            "distance_compute_count": 0,
+            "hnsw_remaining_ms": 0.0,
         }
         profile.update({field: 0 for field in benchmark.SQLENS_PROFILE_FIELDS if field not in profile})
         profile.update({field: 0 for field in benchmark.SQLENS_TRAVERSAL_PROFILE_FIELDS})
@@ -82,6 +200,9 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
     @staticmethod
     def _successful_traversal_profile() -> dict[str, object]:
         return {
+            "traversal_result_target": 40,
+            "traversal_guided_result_count": 10,
+            "traversal_max_scan_reached": False,
             "guidance_checks": 5,
             "distance_compute_count": 8,
             "traversal_expanded_nodes": 4,
@@ -101,6 +222,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             "neighbor_expansion_guidance_checks": 5,
             "neighbor_expansion_guidance_matches": 3,
             "neighbor_expansion_guidance_misses": 2,
+            "traversal_candidate_admissions": 5,
             "traversal_guided_admissions": 3,
             "traversal_guided_suppressions": 2,
             "traversal_heap_tids_suppressed": 2,
@@ -114,8 +236,15 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             "fallback_reason": "none",
             "fallback_stock_expanded_nodes": 0,
             "fallback_stock_distance_computations": 0,
+            "fallback_iterative_scan_enabled": False,
             "traversal_estimated_skip_rate_valid": True,
             "traversal_estimated_skip_rate": 0.5,
+            "approximate_prioritization_attempted": False,
+            "traversal_order_changed": False,
+            "approximate_ann_path": False,
+            "priority_reorders": 0,
+            "match_frontier_pops": 0,
+            "no_bridge_frontier_pops": 0,
         }
 
     def test_sqlens_v11_gate_accepts_required_build_and_profile(self):
@@ -128,7 +257,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         build_id, profile = benchmark.require_sqlens_provenance(cursor)
 
         self.assertEqual(build_id, "sqlens-v11-amazon-build")
-        self.assertEqual(profile["profile_semantics_version"], 7)
+        self.assertEqual(profile["profile_semantics_version"], 12)
         self.assertEqual(
             [call.args[0] for call in cursor.execute.call_args_list],
             [
@@ -137,11 +266,46 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             ],
         )
 
+    def test_sqlens_gate_accepts_v12_dual_frontier_build(self):
+        cursor = mock.Mock()
+        cursor.fetchone.side_effect = [
+            ("sqlens-v12-dual-frontier-prioritization-test",),
+            (json.dumps(self._sqlens_profile()),),
+        ]
+
+        build_id, _ = benchmark.require_sqlens_provenance(cursor)
+
+        self.assertEqual(build_id, "sqlens-v12-dual-frontier-prioritization-test")
+
+    def test_sqlens_gate_accepts_v13_target_bounded_build(self):
+        cursor = mock.Mock()
+        cursor.fetchone.side_effect = [
+            ("sqlens-v13-target-bounded-prioritization-test",),
+            (json.dumps(self._sqlens_profile()),),
+        ]
+
+        build_id, _ = benchmark.require_sqlens_provenance(cursor)
+
+        self.assertEqual(build_id, "sqlens-v13-target-bounded-prioritization-test")
+
+    def test_sqlens_gate_accepts_v14_profiled_target_bounded_build(self):
+        cursor = mock.Mock()
+        cursor.fetchone.side_effect = [
+            ("sqlens-v14-profiled-target-bounded-prioritization-test",),
+            (json.dumps(self._sqlens_profile()),),
+        ]
+
+        build_id, _ = benchmark.require_sqlens_provenance(cursor)
+
+        self.assertEqual(
+            build_id, "sqlens-v14-profiled-target-bounded-prioritization-test"
+        )
+
     def test_sqlens_v11_gate_rejects_old_build_before_profile_or_wrapper_ddl(self):
         cursor = mock.Mock()
         cursor.fetchone.return_value = ("sqlens-v8-old-build",)
 
-        with self.assertRaisesRegex(RuntimeError, "expected the 'sqlens-v11-' prefix"):
+        with self.assertRaisesRegex(RuntimeError, "expected one of"):
             benchmark.ensure_functions(cursor)
 
         self.assertEqual(cursor.execute.call_count, 1)
@@ -153,6 +317,49 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, r"vector_sqlens_build_id\(\) is unavailable"):
             benchmark.require_sqlens_provenance(cursor)
+
+    def test_wrapper_ddl_is_serialized_with_session_advisory_lock(self):
+        cursor = mock.Mock()
+        cursor.fetchone.side_effect = [
+            ("sqlens-v14-profiled-target-bounded-prioritization-test",),
+            (json.dumps(self._sqlens_profile()),),
+        ]
+
+        benchmark.ensure_functions(cursor)
+
+        statements = [call.args[0] for call in cursor.execute.call_args_list]
+        lock_sql = "SELECT pg_catalog.pg_advisory_lock(%s)"
+        unlock_sql = "SELECT pg_catalog.pg_advisory_unlock(%s)"
+        self.assertIn(lock_sql, statements)
+        self.assertIn(unlock_sql, statements)
+        self.assertLess(statements.index(lock_sql), statements.index(unlock_sql))
+
+    def test_tracking_requires_extension_owned_hardened_trigger(self):
+        cursor = mock.Mock()
+        cursor.fetchone.return_value = (True, True, True, True)
+
+        benchmark.ensure_tracking(cursor, "public.items", "public.items")
+
+        self.assertEqual(cursor.execute.call_count, 2)
+        contract_sql = cursor.execute.call_args_list[0].args[0]
+        self.assertIn("p.prosecdef", contract_sql)
+        self.assertIn("pg_catalog.pg_depend", contract_sql)
+        self.assertEqual(
+            cursor.execute.call_args_list[1].args,
+            (
+                "SELECT vector_hnsw_fragment_tracking_enable(%s::regclass)",
+                ("public.items",),
+            ),
+        )
+
+    def test_tracking_rejects_non_extension_trigger(self):
+        cursor = mock.Mock()
+        cursor.fetchone.return_value = (True, True, True, False)
+
+        with self.assertRaisesRegex(RuntimeError, "extension-owned SECURITY DEFINER"):
+            benchmark.ensure_tracking(cursor, "public.items")
+
+        self.assertEqual(cursor.execute.call_count, 1)
 
     def test_sqlens_v11_gate_rejects_missing_profile_function_actionably(self):
         cursor = mock.Mock()
@@ -243,8 +450,113 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
                 self._successful_traversal_profile(), "traversal_guided"
             )
         )
+        prioritized = {
+            **self._successful_traversal_profile(),
+            "final_path": "approximate_traversal_prioritization",
+            "traversal_guidance_scope": (
+                "approximate_traversal_prioritization_and_candidate_admission"
+            ),
+            "approximate_ann_path": True,
+            "approximate_prioritization_attempted": True,
+            "traversal_order_changed": True,
+            "priority_reorders": 1,
+            "match_frontier_pops": 3,
+            "no_bridge_frontier_pops": 1,
+            "traversal_prioritization_burst": 4,
+        }
+        self.assertTrue(
+            benchmark.guidance_scan_contract_satisfied(
+                prioritized, "traversal_guided", True, 4
+            )
+        )
+        all_matches = dict(prioritized)
+        all_matches.update(
+            {
+                "neighbor_expansion_guidance_matches": 5,
+                "neighbor_expansion_guidance_misses": 0,
+                "traversal_candidate_admissions": 5,
+                "traversal_guided_admissions": 5,
+                "traversal_guided_suppressions": 0,
+                "traversal_heap_tids_suppressed": 0,
+            }
+        )
+        self.assertTrue(
+            benchmark.guidance_scan_contract_satisfied(
+                all_matches, "traversal_guided", True, 4
+            )
+        )
+        self.assertFalse(
+            benchmark.guidance_scan_contract_satisfied(
+                prioritized, "traversal_guided", True, 8
+            )
+        )
+        wrong_scope = dict(prioritized)
+        wrong_scope["traversal_guidance_scope"] = "candidate_admission_and_validation"
+        self.assertFalse(
+            benchmark.guidance_scan_contract_satisfied(
+                wrong_scope, "traversal_guided", True, 4
+            )
+        )
+        fallback = dict(prioritized)
+        fallback.update(
+            {
+                "guidance_checks": 0,
+                "final_path": "fresh_stock_fallback",
+                "approximate_ann_path": False,
+                "traversal_order_changed": False,
+                "priority_reorders": 0,
+                "fallback_requests": 1,
+                "fallback_reason": "insufficient_guided_matches",
+                "fallback_iterative_scan_enabled": True,
+                "stock_phase_expanded_nodes": 3,
+                "stock_phase_distance_computations": 6,
+                "fallback_stock_expanded_nodes": 3,
+                "fallback_stock_distance_computations": 6,
+                "traversal_guidance_scope": "none",
+            }
+        )
+        self.assertTrue(
+            benchmark.guidance_scan_contract_satisfied(
+                fallback, "traversal_guided", True, 4
+            )
+        )
+        fallback_without_iterative = dict(fallback)
+        fallback_without_iterative["fallback_iterative_scan_enabled"] = False
+        self.assertFalse(
+            benchmark.guidance_scan_contract_satisfied(
+                fallback_without_iterative, "traversal_guided", True, 4
+            )
+        )
+        admission_bypass = dict(self._successful_traversal_profile())
+        admission_bypass.update(
+            {
+                "guidance_checks": 0,
+                "traversal_guidance_checks": 0,
+                "neighbor_expansion_guidance_checks": 0,
+                "final_path": "stock_bypass",
+                "stock_bypass_requests": 1,
+                "stock_bypass_reason": "low_estimated_skip_rate",
+                "traversal_guidance_scope": "none",
+                "guided_expanded_nodes": 0,
+                "guided_phase_distance_computations": 0,
+                "stock_phase_expanded_nodes": 4,
+                "stock_phase_distance_computations": 8,
+                "traversal_estimated_skip_rate": 0.01,
+            }
+        )
+        self.assertTrue(
+            benchmark.guidance_scan_contract_satisfied(
+                admission_bypass, "traversal_guided", True, 4
+            )
+        )
+        unsupported_bypass = dict(admission_bypass)
+        unsupported_bypass["stock_bypass_reason"] = "skip_estimate_unavailable"
+        self.assertFalse(
+            benchmark.guidance_scan_contract_satisfied(
+                unsupported_bypass, "traversal_guided", True, 4
+            )
+        )
         for field, value in (
-            ("final_path", "stock_bypass"),
             ("stock_bypass_requests", 1),
             ("fallback_requests", 1),
             ("planner_proof_succeeded", False),
@@ -273,7 +585,8 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         configs = benchmark.parse_mode_configs_json(
             '{"original":{"ef_search":200},'
             '"design1_bloom":{"max_scan_tuples":5000,"scan_mem_multiplier":4,'
-            '"iterative_scan":"relaxed_order","guided_collect_target":300}}'
+            '"iterative_scan":"relaxed_order","guided_collect_target":300,'
+            '"traversal_guided_prioritization":false,"traversal_guided_burst":4}}'
         )
         args = argparse.Namespace(
             ef_search=100,
@@ -293,8 +606,61 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
                 "scan_mem_multiplier": 4.0,
                 "iterative_scan": "relaxed_order",
                 "guided_collect_target": 300,
+                "traversal_guided_target": 40,
+                "traversal_guided_prioritization": False,
+                "traversal_guided_burst": 4,
+                "traversal_guided_early_stop": False,
+                "traversal_guided_early_stop_distance_ratio": 0.0,
             },
         )
+        original = benchmark.effective_mode_config(args, "original")
+        self.assertTrue(original["traversal_guided_prioritization"])
+        self.assertEqual(original["traversal_guided_burst"], 8)
+
+    def test_prioritized_target_covers_client_self_exclusion_without_exceeding_ef(self):
+        args = argparse.Namespace(
+            k=10,
+            ef_search=100,
+            max_scan_tuples=1000,
+            scan_mem_multiplier=8.0,
+            iterative_scan="off",
+            guided_collect_target=100,
+            traversal_guided_target=9,
+            traversal_guided_prioritization=True,
+            traversal_guided_burst=8,
+            mode_configs_json={},
+        )
+        with self.assertRaisesRegex(ValueError, "client_self_exclusion"):
+            benchmark.effective_mode_config(args, "design1_bloom")
+
+        args.traversal_guided_target = 10
+        with self.assertRaisesRegex(ValueError, "client_self_exclusion=True"):
+            benchmark.effective_mode_config(args, "design1_bloom")
+
+        args.traversal_guided_target = 11
+        self.assertEqual(
+            benchmark.effective_mode_config(args, "design1_bloom")[
+                "traversal_guided_target"
+            ],
+            11,
+        )
+
+        args.traversal_guided_target = 101
+        with self.assertRaisesRegex(ValueError, "ef_search"):
+            benchmark.effective_mode_config(args, "design1_bloom")
+
+    def test_d1_auto_kind_uses_exact_only_for_selective_filters(self):
+        args = argparse.Namespace(
+            d1_guidance_kind="auto",
+            d1_exact_max_selectivity_pct=2.5,
+            filter_selectivity_by_name={"rare": 0.2, "boundary": 2.5, "wide": 5.0},
+        )
+        self.assertEqual(benchmark.d1_guidance_kind(args, "rare"), "exact")
+        self.assertEqual(benchmark.d1_guidance_kind(args, "boundary"), "exact")
+        self.assertEqual(benchmark.d1_guidance_kind(args, "wide"), "bloom")
+
+        args.d1_guidance_kind = "bloom"
+        self.assertEqual(benchmark.d1_guidance_kind(args, "rare"), "bloom")
 
     def test_mode_configs_json_rejects_unknown_or_invalid_values(self):
         invalid = [
@@ -303,6 +669,8 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             '{"original":{"not_a_setting":100}}',
             '{"original":{"ef_search":true}}',
             '{"original":{"iterative_scan":"sometimes"}}',
+            '{"design1_bloom":{"traversal_guided_prioritization":1}}',
+            '{"design1_bloom":{"traversal_guided_burst":true}}',
         ]
 
         for value in invalid:
@@ -317,6 +685,204 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             configs = benchmark.parse_mode_configs_json(str(path))
 
         self.assertEqual(configs, {"design1_bloom": {"ef_search": 321}})
+
+    def test_filter_ef_search_json_validates_and_resolves_overrides(self):
+        configs = benchmark.parse_filter_ef_search_json(
+            '{"original":{"wide":2000,"sparse":50000}}'
+        )
+        args = argparse.Namespace(ef_search=1000, filter_ef_search_json=configs)
+        runtime = SimpleNamespace(
+            mode="original",
+            config={"ef_search": 3000},
+        )
+
+        self.assertEqual(
+            benchmark.configured_ef_search_for_filter(args, runtime, "wide"),
+            2000,
+        )
+        self.assertEqual(
+            benchmark.configured_ef_search_for_filter(args, runtime, "missing"),
+            3000,
+        )
+
+        invalid = (
+            '{"unknown":{"wide":2000}}',
+            '{"original":{"wide":0}}',
+            '{"original":{"wide":true}}',
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                benchmark.parse_filter_ef_search_json(value)
+
+    def test_filter_traversal_target_json_validates_and_resolves_overrides(self):
+        configs = benchmark.parse_filter_traversal_target_json(
+            '{"design1_bloom_bfs_layout_d3":{"wide":40,"sparse":120}}'
+        )
+        args = argparse.Namespace(
+            traversal_guided_target=20,
+            filter_traversal_target_json=configs,
+        )
+        runtime = SimpleNamespace(
+            mode="design1_bloom_bfs_layout_d3",
+            config={"traversal_guided_target": 80},
+        )
+
+        self.assertEqual(
+            benchmark.configured_traversal_target_for_filter(
+                args, runtime, "wide"
+            ),
+            40,
+        )
+        self.assertEqual(
+            benchmark.configured_traversal_target_for_filter(
+                args, runtime, "missing"
+            ),
+            80,
+        )
+
+        invalid = (
+            '{"unknown":{"wide":40}}',
+            '{"design1_bloom_bfs_layout_d3":{"wide":0}}',
+            '{"design1_bloom_bfs_layout_d3":{"wide":true}}',
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                benchmark.parse_filter_traversal_target_json(value)
+
+    def test_filter_mode_configs_route_complete_per_filter_settings(self):
+        configs = benchmark.parse_filter_mode_configs_json(
+            '{"design1_bloom_bfs_layout_d3":{"sparse":{'
+            '"ef_search":20,"max_scan_tuples":70000,'
+            '"iterative_scan":"strict_order",'
+            '"traversal_guided_target":11,'
+            '"traversal_guided_early_stop":true,'
+            '"traversal_guided_early_stop_distance_ratio":0.925}}}'
+        )
+        self.assertEqual(
+            configs["design1_bloom_bfs_layout_d3"]["sparse"]["max_scan_tuples"],
+            70000,
+        )
+        with self.assertRaises(argparse.ArgumentTypeError):
+            benchmark.parse_filter_mode_configs_json(
+                '{"original":{"wide":{"unknown_setting":1}}}'
+            )
+
+        cursor = SimpleNamespace(execute=mock.Mock())
+        args = argparse.Namespace(
+            insertion_table="heap",
+            insertion_index="source_idx",
+            bfs_table="heap",
+            bfs_index="bfs_idx",
+            d2_source_on_guidance_bypass=True,
+            require_preferred_index_guc=True,
+            preferred_index_guc="hnsw.preferred_index",
+            filter_selectivity_by_name={"sparse": 1.0},
+            filter_atoms={"sparse": ["a = 1"]},
+            guidance_selectivity_min_pct=0.0,
+            guidance_selectivity_max_pct=6.0,
+            guidance_composite_max_selectivity_pct=6.0,
+            guidance_max_atoms=64,
+            guidance_filter_strategy="traversal_guided",
+            guidance_bypass_iterative_scan="off",
+            guidance_bypass_ef_search=0,
+            guidance_low_selectivity_bypass_ef_search=0,
+            filter_mode_configs_json=configs,
+        )
+        runtime = benchmark.ModeRuntime(
+            mode="design1_bloom_bfs_layout_d3",
+            config={
+                **benchmark.MODE_CONFIG_DEFAULTS,
+                "ef_search": 100,
+                "max_scan_tuples": 5000,
+                "traversal_guided_target": 10,
+            },
+            cache_mb=1024,
+            conn=SimpleNamespace(),
+            cur=cursor,
+            preferred_index_current_setting="bfs_idx",
+            filter_strategy_current_setting="traversal_guided",
+            iterative_scan_current_setting="off",
+            ef_search_current_setting=100,
+            traversal_guided_target_current_setting=10,
+            guidance_policy_enabled=True,
+        )
+        benchmark.route_runtime_request(args, runtime, "sparse")
+        statement, params = cursor.execute.call_args.args
+        self.assertIn("hnsw.max_scan_tuples", params)
+        self.assertIn("70000", params)
+        self.assertEqual(runtime.max_scan_tuples_current_setting, 70000)
+        self.assertEqual(runtime.iterative_scan_current_setting, "strict_order")
+        self.assertTrue(runtime.traversal_guided_early_stop_current_setting)
+
+    def test_configure_forces_stock_off_and_enables_d1_traversal_prioritization(self):
+        class Cursor:
+            def __init__(self):
+                self.sql = []
+
+            def execute(self, query, params=None):
+                self.sql.append(str(query))
+
+        args = argparse.Namespace(
+            ef_search=1000,
+            max_scan_tuples=200000,
+            scan_mem_multiplier=8.0,
+            iterative_scan="off",
+            guided_collect_target=1000,
+            traversal_guided_prioritization=True,
+            traversal_guided_burst=4,
+            mode_configs_json={},
+            statement_timeout_ms=300000,
+            d2_page_access="off",
+            d2_index_page_access="off",
+            d2_page_window=128,
+            d2_page_prefetch_min_items=2,
+            d2_page_disable_after_no_merge=2,
+            force_hnsw=False,
+        )
+
+        stock = Cursor()
+        benchmark.configure(stock, args, 1024, "original")
+        guided = Cursor()
+        benchmark.configure(guided, args, 1024, "design1_bloom")
+
+        self.assertIn("SET hnsw.traversal_guided_prioritization = off", stock.sql)
+        self.assertIn("SET hnsw.traversal_guided_prioritization = on", guided.sql)
+        self.assertIn("SET hnsw.traversal_guided_burst = 4", guided.sql)
+
+    def test_configure_forces_stock_prioritization_off_and_enables_d1(self):
+        args = argparse.Namespace(
+            ef_search=100,
+            max_scan_tuples=1000,
+            scan_mem_multiplier=8.0,
+            iterative_scan="off",
+            guided_collect_target=100,
+            traversal_guided_prioritization=True,
+            traversal_guided_burst=4,
+            mode_configs_json={},
+            statement_timeout_ms=1000,
+            d2_page_access="off",
+            d2_index_page_access="off",
+            d2_page_window=128,
+            d2_page_prefetch_min_items=2,
+            d2_page_disable_after_no_merge=2,
+            force_hnsw=False,
+        )
+
+        stock = SimpleNamespace(execute=mock.Mock())
+        benchmark.configure(stock, args, 64, "original")
+        stock_sql = [call.args[0] for call in stock.execute.call_args_list]
+        self.assertIn("SET hnsw.traversal_guided_prioritization = off", stock_sql)
+        self.assertIn("SET hnsw.traversal_guided_burst = 4", stock_sql)
+
+        guided = SimpleNamespace(execute=mock.Mock())
+        benchmark.configure(guided, args, 64, "design1_bloom")
+        guided_sql = [call.args[0] for call in guided.execute.call_args_list]
+        self.assertIn("SET hnsw.traversal_guided_prioritization = on", guided_sql)
+        self.assertIn("SET hnsw.traversal_guided_burst = 4", guided_sql)
 
     def test_truth_loader_requires_self_excluded_tie_aware_contract(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -483,6 +1049,283 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
                 for call in cursor.execute.call_args_list)
         )
 
+    def test_guided_activation_preserves_active_guide_for_c_fast_reactivation(self):
+        cursor = SimpleNamespace(
+            execute=mock.Mock(),
+            fetchone=mock.Mock(return_value=(1,)),
+        )
+        args = argparse.Namespace(
+            bfs_table="bfs_table",
+            bfs_index="bfs_index",
+            insertion_table="insertion_table",
+            insertion_index="insertion_index",
+            filter_selectivity_by_name={"filter_a": 1.0},
+            filter_atoms={"filter_a": ["a = 1"]},
+            guidance_selectivity_max_pct=100.0,
+            guidance_max_atoms=64,
+            guidance_filter_strategy="traversal_guided",
+            reset_cache_per_query=False,
+            candidate_validity_predicate="embedding_valid",
+        )
+
+        benchmark.activate(cursor, args, "design1_bloom", "filter_a", read_profile=False)
+        benchmark.activate(cursor, args, "design1_bloom", "filter_a", read_profile=False)
+
+        statements = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertNotIn("SELECT vector_hnsw_guidance_reset()", statements)
+        self.assertEqual(
+            sum("vector_hnsw_guidance_activate" in statement for statement in statements),
+            2,
+        )
+
+    def test_policy_bypass_resets_active_guidance(self):
+        cursor = SimpleNamespace(execute=mock.Mock())
+        args = argparse.Namespace(
+            bfs_table="bfs_table",
+            bfs_index="bfs_index",
+            insertion_table="insertion_table",
+            insertion_index="insertion_index",
+            filter_selectivity_by_name={"wide_filter": 50.0},
+            filter_atoms={"wide_filter": ["a = 1"]},
+            guidance_selectivity_max_pct=10.0,
+            guidance_max_atoms=64,
+            guidance_filter_strategy="traversal_guided",
+        )
+
+        profile = benchmark.activate(
+            cursor,
+            args,
+            "design1_bloom_bfs_layout_d3",
+            "wide_filter",
+        )
+
+        statements = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertIn("SELECT vector_hnsw_guidance_reset()", statements)
+        self.assertEqual(profile["guidance_route"], "selectivity>10%")
+
+    def test_atom_aware_policy_bypasses_broad_composite_only(self):
+        args = argparse.Namespace(
+            filter_selectivity_by_name={"single": 5.9, "composite": 2.0},
+            filter_atoms={
+                "single": ["a = 1"],
+                "composite": ["a = 1", "b = 2"],
+            },
+            guidance_selectivity_max_pct=6.0,
+            guidance_composite_max_selectivity_pct=0.5,
+            guidance_max_atoms=64,
+        )
+
+        self.assertEqual(
+            benchmark.should_enable_guidance(args, "single"),
+            (True, "enabled"),
+        )
+        self.assertEqual(
+            benchmark.should_enable_guidance(args, "composite"),
+            (False, "composite_selectivity>0.5%"),
+        )
+
+    def test_exact_and_guidance_materializes_final_composite_predicate(self):
+        args = argparse.Namespace(
+            filter_atoms={
+                "and_filter": ["sql:a = 1", "sql:b >= 2"],
+                "or_filter": ["sql:a = 1", "|", "sql:b >= 2"],
+            },
+            filter_predicate_by_name={
+                "and_filter": "a = 1 AND b >= 2",
+                "or_filter": "a = 1 OR b >= 2",
+            },
+            filter_selectivity_by_name={"and_filter": 1.0, "or_filter": 1.0},
+            d1_guidance_kind="auto",
+            d1_exact_max_selectivity_pct=6.0,
+            collapse_exact_and_guidance=True,
+        )
+
+        self.assertEqual(
+            benchmark.activation_atoms(
+                args, "design1_bloom_bfs_layout_d3", "and_filter"
+            ),
+            ["exact:sql:a = 1 AND b >= 2"],
+        )
+        self.assertEqual(
+            benchmark.activation_atoms(
+                args, "design1_bloom_bfs_layout_d3", "or_filter"
+            ),
+            ["exact:sql:a = 1 OR b >= 2"],
+        )
+
+    def test_d2_admission_routes_policy_bypass_to_source_layout(self):
+        args = argparse.Namespace(
+            insertion_table="heap",
+            insertion_index="source_idx",
+            bfs_table="heap",
+            bfs_index="bfs_idx",
+            d2_source_on_guidance_bypass=True,
+            filter_selectivity_by_name={"wide": 50.0, "selective": 0.2},
+            filter_atoms={"wide": ["a = 1"], "selective": ["b = 2"]},
+            guidance_selectivity_max_pct=6.0,
+            guidance_composite_max_selectivity_pct=0.5,
+            guidance_max_atoms=64,
+        )
+
+        self.assertEqual(
+            benchmark.mode_table_index(
+                args, "design1_bloom_bfs_layout_d3", "wide"
+            ),
+            ("heap", "source_idx"),
+        )
+        self.assertEqual(
+            benchmark.mode_table_index(
+                args, "design1_bloom_bfs_layout_d3", "selective"
+            ),
+            ("heap", "bfs_idx"),
+        )
+
+    def test_route_request_uses_fixed_bypass_search_budget(self):
+        cursor = SimpleNamespace(execute=mock.Mock())
+        args = argparse.Namespace(
+            insertion_table="heap",
+            insertion_index="source_idx",
+            bfs_table="heap",
+            bfs_index="bfs_idx",
+            d2_source_on_guidance_bypass=True,
+            require_preferred_index_guc=True,
+            preferred_index_guc="hnsw.preferred_index",
+            filter_selectivity_by_name={"wide": 50.0, "selective": 0.2},
+            filter_atoms={"wide": ["a = 1"], "selective": ["b = 2"]},
+            guidance_selectivity_max_pct=6.0,
+            guidance_composite_max_selectivity_pct=6.0,
+            guidance_max_atoms=64,
+            guidance_filter_strategy="traversal_guided",
+            guidance_bypass_iterative_scan="strict_order",
+            guidance_bypass_ef_search=100,
+            iterative_scan="off",
+        )
+        runtime = benchmark.ModeRuntime(
+            mode="design1_bloom_bfs_layout_d3",
+            config={"ef_search": 500, "iterative_scan": "off"},
+            cache_mb=1024,
+            conn=SimpleNamespace(),
+            cur=cursor,
+            preferred_index_current_setting="bfs_idx",
+            filter_strategy_current_setting="traversal_guided",
+            iterative_scan_current_setting="off",
+            ef_search_current_setting=500,
+            guidance_policy_enabled=True,
+        )
+
+        result = benchmark.route_runtime_request(args, runtime, "wide")
+
+        self.assertEqual(result, ("heap", "source_idx", True, True))
+        statement, params = cursor.execute.call_args.args
+        self.assertIn("set_config('hnsw.ef_search'", statement)
+        self.assertIn("100", params)
+        self.assertEqual(runtime.ef_search_current_setting, 100)
+
+        cursor.execute.reset_mock()
+        result = benchmark.route_runtime_request(args, runtime, "selective")
+        self.assertEqual(result, ("heap", "bfs_idx", False, False))
+        statement, params = cursor.execute.call_args.args
+        self.assertIn("set_config('hnsw.ef_search'", statement)
+        self.assertIn("500", params)
+        self.assertEqual(runtime.ef_search_current_setting, 500)
+
+    def test_stock_route_ignores_guidance_bypass_search_budget(self):
+        cursor = SimpleNamespace(execute=mock.Mock())
+        args = argparse.Namespace(
+            insertion_table="heap",
+            insertion_index="source_idx",
+            bfs_table="heap",
+            bfs_index="bfs_idx",
+            d2_source_on_guidance_bypass=True,
+            require_preferred_index_guc=True,
+            preferred_index_guc="hnsw.preferred_index",
+            filter_selectivity_by_name={"wide": 50.0},
+            filter_atoms={"wide": ["a = 1"]},
+            guidance_selectivity_max_pct=6.0,
+            guidance_composite_max_selectivity_pct=6.0,
+            guidance_max_atoms=64,
+            guidance_filter_strategy="traversal_guided",
+            guidance_bypass_iterative_scan="strict_order",
+            guidance_bypass_ef_search=500,
+            iterative_scan="off",
+        )
+        runtime = benchmark.ModeRuntime(
+            mode="original",
+            config={"ef_search": 5000, "iterative_scan": "strict_order"},
+            cache_mb=1024,
+            conn=SimpleNamespace(),
+            cur=cursor,
+            preferred_index_current_setting="source_idx",
+            filter_strategy_current_setting="off",
+            iterative_scan_current_setting="strict_order",
+            ef_search_current_setting=500,
+            guidance_policy_enabled=False,
+        )
+
+        result = benchmark.route_runtime_request(args, runtime, "wide")
+
+        self.assertEqual(result, ("heap", "source_idx", False, False))
+        statement, params = cursor.execute.call_args.args
+        self.assertIn("set_config('hnsw.ef_search'", statement)
+        self.assertIn("5000", params)
+        self.assertEqual(runtime.ef_search_current_setting, 5000)
+
+        cursor.execute.reset_mock()
+        runtime.ef_search_current_setting = 500
+        previous_enabled = benchmark.route_runtime_search_settings(
+            args, runtime, "wide"
+        )
+        self.assertFalse(previous_enabled)
+        cursor.execute.assert_called_once_with("SET hnsw.ef_search = 5000")
+        self.assertEqual(runtime.ef_search_current_setting, 5000)
+
+    def test_low_selectivity_bypass_uses_its_own_search_budget(self):
+        cursor = SimpleNamespace(execute=mock.Mock())
+        args = argparse.Namespace(
+            insertion_table="heap",
+            insertion_index="source_idx",
+            bfs_table="heap",
+            bfs_index="bfs_idx",
+            d2_source_on_guidance_bypass=True,
+            require_preferred_index_guc=True,
+            preferred_index_guc="hnsw.preferred_index",
+            filter_selectivity_by_name={"very_selective": 0.2},
+            filter_atoms={"very_selective": ["a = 1"]},
+            guidance_selectivity_min_pct=1.0,
+            guidance_selectivity_max_pct=6.0,
+            guidance_composite_max_selectivity_pct=6.0,
+            guidance_max_atoms=64,
+            guidance_filter_strategy="traversal_guided",
+            guidance_bypass_iterative_scan="strict_order",
+            guidance_bypass_ef_search=500,
+            guidance_low_selectivity_bypass_ef_search=2000,
+            iterative_scan="off",
+        )
+        runtime = benchmark.ModeRuntime(
+            mode="design1_bloom_bfs_layout_d3",
+            config={"ef_search": 500, "iterative_scan": "off"},
+            cache_mb=1024,
+            conn=SimpleNamespace(),
+            cur=cursor,
+            preferred_index_current_setting="bfs_idx",
+            filter_strategy_current_setting="traversal_guided",
+            iterative_scan_current_setting="off",
+            ef_search_current_setting=500,
+            guidance_policy_enabled=True,
+        )
+
+        self.assertEqual(
+            benchmark.should_enable_guidance(args, "very_selective"),
+            (False, "selectivity<1%"),
+        )
+        result = benchmark.route_runtime_request(args, runtime, "very_selective")
+
+        self.assertEqual(result, ("heap", "source_idx", True, True))
+        statement, params = cursor.execute.call_args.args
+        self.assertIn("set_config('hnsw.ef_search'", statement)
+        self.assertIn("2000", params)
+        self.assertEqual(runtime.ef_search_current_setting, 2000)
+
     def test_shuffled_modes_is_seeded_and_balanced(self):
         modes = benchmark.MODES[:3]
         first_rng = random.Random(20260718)
@@ -535,9 +1378,9 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         second = benchmark.activate(cursor, args, "design1_bloom_bfs_layout_d3", "filter_a")
         third = benchmark.activate(cursor, args, "design1_bloom_bfs_layout_d3", "filter_a")
 
-        self.assertEqual((first["activation_atom_count"], first["guidance_route"]), (0, "d3_probe"))
+        self.assertEqual((first["activation_atom_count"], first["guidance_route"]), (0, "d3_stock_probe"))
         self.assertFalse(first["guidance_enabled"])
-        self.assertEqual((second["activation_atom_count"], second["guidance_route"]), (0, "d3_probe"))
+        self.assertEqual((second["activation_atom_count"], second["guidance_route"]), (0, "d3_stock_probe"))
         self.assertFalse(second["guidance_enabled"])
         self.assertEqual((third["activation_atom_count"], third["adaptive_state"]), (2, "page"))
         self.assertTrue(third["guidance_enabled"])
@@ -547,10 +1390,40 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         ]
         self.assertEqual(len(activation_calls), 3)
         self.assertTrue(all(call.args[1][-1] == "adaptive" for call in activation_calls))
-        self.assertTrue(all(call.args[1][1] == ["a = 1"] for call in activation_calls))
+        self.assertTrue(
+            all(call.args[1][1] == ["exact:a = 1"] for call in activation_calls)
+        )
         self.assertFalse(
             any("embedding_valid" in call.args[1][1] for call in activation_calls)
         )
+
+    def test_d3_cross_predicate_probe_does_not_reuse_previous_active_guide(self):
+        evidence = benchmark.d3_phase_evidence(
+            {
+                "active": True,
+                "adaptive_state": "page",
+                "adaptive_admissions": 1,
+            },
+            {
+                "active": False,
+                "adaptive_state": "probing",
+                "adaptive_admissions": 1,
+            },
+            {"resident_entries": 1, "resident_bytes": 4096},
+            {"resident_entries": 1, "resident_bytes": 4096},
+            {
+                "guidance_route": "d3_stock_probe",
+                "guidance_enabled": False,
+                "activation_atom_count": 0,
+            },
+            same_predicate_before=False,
+        )
+
+        self.assertEqual(evidence["d3_phase"], "probe")
+        self.assertTrue(evidence["d3_global_active_before"])
+        self.assertFalse(evidence["d3_active_before"])
+        self.assertFalse(evidence["d3_same_predicate_before"])
+        self.assertFalse(evidence["d3_active_guidance_reused"])
 
     def test_d3_measurements_preserve_admission_and_prove_warm_reuse(self):
         cursor = SimpleNamespace(execute=mock.Mock(), fetchone=mock.Mock(return_value=("{}",)))
@@ -616,7 +1489,34 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             {"resident_entries": 1, "resident_bytes": 4096, "composed_guide_hits": 0},
             {"resident_entries": 1, "resident_bytes": 4096, "composed_guide_hits": 1},
         ]
-        scan_profile = {"guidance_checks": 1, "traversal_guidance_checks": 1}
+        scan_profile = {
+            "guidance_checks": 1,
+            "traversal_guidance_checks": 1,
+            "total_scan_ms": 4.0,
+            "hnsw_search_ms": 2.5,
+            "heap_fetch_ms": 1.5,
+            "vector_search_ms": 2.0,
+            "hnsw_am_callback_ms": 2.5,
+            "executor_residual_ms": 1.5,
+            "heap_fetch_ms_is_residual_proxy": True,
+            "index_readbuffer_calls": 10,
+            "index_readbuffer_ms": 0.75,
+            "index_readbuffer_shared_read_calls": 2,
+            "index_readbuffer_shared_read_ms": 0.5,
+            "index_readbuffer_shared_hit_calls": 8,
+            "index_readbuffer_shared_hit_ms": 0.25,
+            "index_readbuffer_unclassified_calls": 0,
+            "index_readbuffer_unclassified_ms": 0.0,
+            "index_readbuffer_timing_scope": "readbuffer",
+            "index_readbuffer_classification_scope": "pgBufferUsage",
+            "distance_compute_timed_calls": 7,
+            "distance_compute_ms": 1.0,
+            "distance_compute_timing_scope": "distance",
+            "hnsw_remaining_ms": 0.75,
+            "hnsw_remaining_ms_is_residual": True,
+            "hnsw_remaining_scope": "residual",
+            "profile_timer_overhead_scope": "two clocks",
+        }
 
         with (
             mock.patch.object(benchmark, "activate", return_value=activation) as activate_mock,
@@ -680,10 +1580,29 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         self.assertAlmostEqual(first["activation_ms"], 100.0)
         self.assertAlmostEqual(first["query_latency_ms"], 200.0)
         self.assertAlmostEqual(first["end_to_end_ms"], 300.0)
+        self.assertEqual(first["total_scan_ms"], 4.0)
+        self.assertEqual(first["hnsw_search_ms"], 2.5)
+        self.assertEqual(first["heap_fetch_ms"], 1.5)
+        self.assertEqual(first["vector_search_ms"], 2.0)
+        self.assertEqual(first["hnsw_am_callback_ms"], 2.5)
+        self.assertEqual(first["executor_residual_ms"], 1.5)
+        self.assertTrue(first["heap_fetch_ms_is_residual_proxy"])
+        self.assertEqual(first["index_readbuffer_calls"], 10)
+        self.assertEqual(first["index_readbuffer_shared_read_calls"], 2)
+        self.assertEqual(first["index_readbuffer_shared_hit_calls"], 8)
+        self.assertEqual(first["index_readbuffer_unclassified_calls"], 0)
+        self.assertEqual(first["index_readbuffer_ms"], 0.75)
+        self.assertEqual(first["distance_compute_timed_calls"], 7)
+        self.assertEqual(first["distance_compute_ms"], 1.0)
+        self.assertEqual(first["hnsw_remaining_ms"], 0.75)
+        self.assertTrue(first["hnsw_remaining_ms_is_residual"])
+        self.assertEqual(first["profile_timer_overhead_scope"], "two clocks")
         self.assertEqual(first["sqlens_build_id"], "sqlens-v11-exact")
         self.assertEqual(first["vector_so_sha256"], "a" * 64)
         bindings = [call.args[5] for call in run_query_mock.call_args_list]
-        self.assertEqual(bindings, [("bfs_index", ["a = 1"], "adaptive")] * 2)
+        self.assertEqual(
+            bindings, [("bfs_index", ["exact:a = 1"], "adaptive")] * 2
+        )
         self.assertTrue(all(call.kwargs["reset_profile"] is False for call in run_query_mock.call_args_list))
         self.assertTrue(all(call.kwargs["read_profile"] is False for call in run_query_mock.call_args_list))
 
@@ -743,6 +1662,91 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         warmup_mock.assert_not_called()
         measured_mock.assert_called_once()
 
+    def test_admitted_warm_policy_warms_d3_before_measurement(self):
+        mode = "design1_bloom_bfs_layout_d3"
+        runtime = SimpleNamespace(mode=mode)
+        args = argparse.Namespace(
+            modes=[mode],
+            d3_measurement_policy="admitted_warm_reuse",
+            warmup_all_queries=True,
+            warmup_queries=0,
+            repeats=1,
+            progress_queries=0,
+        )
+
+        with (
+            mock.patch.object(benchmark, "open_mode_runtime", return_value=runtime),
+            mock.patch.object(benchmark, "close_mode_runtime"),
+            mock.patch.object(benchmark, "run_warmup") as warmup_mock,
+            mock.patch.object(
+                benchmark,
+                "run_measured_query",
+                return_value={"mode": mode, "filter_name": "filter_a", "error": ""},
+            ),
+        ):
+            benchmark.run_mode(
+                args,
+                mode,
+                [("filter_a", 1.0, "a = 1")],
+                [1, 2, 3],
+                {1: 101, 2: 102, 3: 103},
+                truth={},
+            )
+
+        self.assertEqual(warmup_mock.call_count, 3)
+
+    def test_admitted_warm_lifecycle_rejects_nonwarm_measured_d3(self):
+        modes = ["design1_bloom_bfs_layout", "design1_bloom_bfs_layout_d3"]
+        cpu_evidence = [
+            {
+                "mode": mode,
+                "backend_pid": 100 + position,
+                "requested_cpu_list": "52",
+                "observed_cpu_list": "52",
+                "exact_match": True,
+                "pinning_attempted_by_runner": False,
+            }
+            for position, mode in enumerate(modes)
+        ]
+        identity_evidence = [
+            {
+                "mode": mode,
+                "exact_match": True,
+                "expected_build_id": "sqlens-v16-test",
+                "expected_vector_so_sha256": "a" * 64,
+            }
+            for mode in modes
+        ]
+        args = argparse.Namespace(
+            modes=modes,
+            d3_measurement_policy="admitted_warm_reuse",
+            warmup_all_queries=True,
+            warmup_queries=0,
+            warmup_evidence=[{"status": "complete"} for _ in range(6)],
+            d3_phase_evidence=[
+                {"filter_name": "filter_a", "d3_phase": "warm"} for _ in range(3)
+            ],
+            d3_warmup_phase_evidence=[
+                {"filter_name": "filter_a", "d3_phase": phase}
+                for phase in ("probe", "admission", "warm")
+            ],
+            repeats=1,
+            backend_cpu_list="52",
+            backend_cpu_evidence=cpu_evidence,
+            expected_sqlens_build_id="sqlens-v16-test",
+            expected_vector_so_sha256="a" * 64,
+            runtime_sqlens_identity_evidence=identity_evidence,
+        )
+        filters = [("filter_a", 1.0, "a = 1")]
+
+        evidence = benchmark.validate_execution_lifecycle(args, filters, [1, 2, 3])
+        self.assertEqual(evidence["warmup_policy"], "admitted_warm_reuse")
+        self.assertEqual(evidence["d3_phase_counts"]["filter_a"]["warm"], 3)
+
+        args.d3_phase_evidence[0]["d3_phase"] = "admission"
+        with self.assertRaisesRegex(RuntimeError, "not exclusively warm"):
+            benchmark.validate_execution_lifecycle(args, filters, [1, 2, 3])
+
     def test_lifecycle_gate_checks_warmup_count_and_all_d3_phases(self):
         args = argparse.Namespace(
             modes=["original", "design1_bloom_bfs_layout_d3"],
@@ -750,7 +1754,7 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
             warmup_queries=1,
             warmup_evidence=[{"status": "complete"}],
             d3_phase_evidence=[
-                {"filter_name": "filter_a", "d3_phase": "cold"},
+                {"filter_name": "filter_a", "d3_phase": "probe"},
                 {"filter_name": "filter_a", "d3_phase": "admission"},
                 {"filter_name": "filter_a", "d3_phase": "warm"},
             ],
@@ -799,12 +1803,95 @@ class InterleavedSelectivityBenchmarkTests(unittest.TestCase):
         self.assertTrue(evidence["d3_lifecycle_complete"])
         self.assertEqual(
             evidence["d3_phase_counts"]["filter_a"],
-            {"cold": 1, "admission": 1, "warm": 1},
+            {
+                "probe": 1,
+                "admission": 1,
+                "refinement": 0,
+                "warm": 1,
+                "bypass": 0,
+            },
+        )
+
+        args.d3_phase_evidence[1]["d3_phase"] = "refinement"
+        evidence = benchmark.validate_execution_lifecycle(
+            args, filters, [1, 2, 3]
+        )
+        self.assertEqual(
+            evidence["d3_phase_counts"]["filter_a"]["refinement"], 1
         )
 
         args.warmup_evidence = []
         with self.assertRaisesRegex(RuntimeError, "warmup evidence"):
             benchmark.validate_execution_lifecycle(args, filters, [1, 2, 3])
+
+    def test_lifecycle_accepts_complete_selectivity_policy_bypass(self):
+        args = argparse.Namespace(
+            modes=["design1_bloom_bfs_layout_d3"],
+            d3_measurement_policy="workload_driven_adaptive",
+            filter_selectivity_by_name={"wide_filter": 50.0},
+            filter_atoms={"wide_filter": ["a = 1"]},
+            guidance_selectivity_min_pct=0.0,
+            guidance_selectivity_max_pct=10.0,
+            guidance_composite_max_selectivity_pct=10.0,
+            guidance_max_atoms=64,
+            warmup_all_queries=False,
+            warmup_queries=1,
+            warmup_evidence=[],
+            d3_phase_evidence=[
+                {"filter_name": "wide_filter", "d3_phase": "bypass"}
+                for _ in range(3)
+            ],
+            repeats=1,
+            backend_cpu_list="48-51",
+            backend_cpu_evidence=[
+                {
+                    "mode": "design1_bloom_bfs_layout_d3",
+                    "backend_pid": 101,
+                    "requested_cpu_list": "48-51",
+                    "observed_cpu_list": "48-51",
+                    "exact_match": True,
+                    "pinning_attempted_by_runner": False,
+                }
+            ],
+            expected_sqlens_build_id="sqlens-v16-test",
+            expected_vector_so_sha256="a" * 64,
+            runtime_sqlens_identity_evidence=[
+                {
+                    "mode": "design1_bloom_bfs_layout_d3",
+                    "exact_match": True,
+                    "expected_build_id": "sqlens-v16-test",
+                    "expected_vector_so_sha256": "a" * 64,
+                }
+            ],
+        )
+
+        evidence = benchmark.validate_execution_lifecycle(
+            args,
+            [("wide_filter", "50.0", "a = 1")],
+            [1, 2, 3],
+        )
+
+        self.assertEqual(
+            evidence["d3_admission_outcomes"]["wide_filter"],
+            "policy_bypass",
+        )
+        self.assertEqual(
+            evidence["d3_phase_counts"]["wide_filter"]["bypass"],
+            3,
+        )
+
+        args.filter_selectivity_by_name = {"wide_filter": 0.2}
+        args.guidance_selectivity_min_pct = 1.0
+        args.guidance_selectivity_max_pct = 100.0
+        evidence = benchmark.validate_execution_lifecycle(
+            args,
+            [("wide_filter", "0.2", "a = 1")],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            evidence["d3_admission_outcomes"]["wide_filter"],
+            "policy_bypass",
+        )
 
     def test_open_d3_runtime_has_no_prewarm_bloom_and_resets_after_plan_gate(self):
         cursor = SimpleNamespace(execute=mock.Mock(), close=mock.Mock())

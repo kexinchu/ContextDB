@@ -1,0 +1,34 @@
+{
+  "amazon": {
+    "popular_ge1000": {"guidance": false, "stock": {"ef_search": 22, "iterative_scan": "off"}, "sqlens": {"ef_search": 22, "iterative_scan": "off"}},
+    "popular_ge1340": {"guidance": false, "stock": {"ef_search": 25, "iterative_scan": "off"}, "sqlens": {"ef_search": 25, "iterative_scan": "off"}},
+    "popular_ge1780": {"guidance": false, "stock": {"ef_search": 35, "iterative_scan": "off"}, "sqlens": {"ef_search": 35, "iterative_scan": "off"}},
+    "popular_ge2428": {"guidance": false, "stock": {"ef_search": 33, "iterative_scan": "off"}, "sqlens": {"ef_search": 33, "iterative_scan": "off"}},
+    "popular_ge3284": {"guidance": false, "stock": {"ef_search": 38, "iterative_scan": "off"}, "sqlens": {"ef_search": 38, "iterative_scan": "off"}},
+    "popular_ge4559": {"guidance": false, "stock": {"ef_search": 45, "iterative_scan": "off"}, "sqlens": {"ef_search": 45, "iterative_scan": "off"}},
+    "price_10_to_20": {"guidance": false, "stock": {"ef_search": 52, "iterative_scan": "off"}, "sqlens": {"ef_search": 52, "iterative_scan": "off"}},
+    "popular_ge10066": {"guidance": false, "stock": {"ef_search": 95, "iterative_scan": "off"}, "sqlens": {"ef_search": 95, "iterative_scan": "off"}},
+    "rating5_price_le10": {"guidance": false, "stock": {"ef_search": 220, "iterative_scan": "off"}, "sqlens": {"ef_search": 220, "iterative_scan": "off"}},
+    "long_review_ge500": {"stock": {"ef_search": 11000, "iterative_scan": "off"}, "sqlens": {"ef_search": 130, "max_scan_tuples": 15000, "traversal_guided_target": 11}},
+    "grocery_rating5": {"stock": {"ef_search": 700, "iterative_scan": "off"}, "sqlens": {"ef_search": 11, "max_scan_tuples": 4000, "traversal_guided_target": 11}},
+    "grocery_helpful": {"stock": {"ef_search": 1600, "iterative_scan": "off"}, "sqlens": {"ef_search": 11, "max_scan_tuples": 7500, "traversal_guided_target": 11}},
+    "helpful_ge20": {"stock": {"ef_search": 8000, "iterative_scan": "off"}, "sqlens": {"ef_search": 11, "max_scan_tuples": 18000, "traversal_guided_target": 11}},
+    "grocery_long500": {"stock": {"ef_search": 20, "iterative_scan": "strict_order", "max_scan_tuples": 75000}, "sqlens": {"ef_search": 11, "max_scan_tuples": 70000, "traversal_guided_target": 11}}
+  },
+  "yfcc": {
+    "tagor_23_29": {"guidance": false, "stock": {"ef_search": 90, "iterative_scan": "off"}, "sqlens": {"ef_search": 90, "iterative_scan": "off"}},
+    "tagor_23_89": {"guidance": false, "stock": {"ef_search": 80, "iterative_scan": "off"}, "sqlens": {"ef_search": 80, "iterative_scan": "off"}},
+    "tagor_23_3": {"guidance": false, "stock": {"ef_search": 80, "iterative_scan": "off"}, "sqlens": {"ef_search": 80, "iterative_scan": "off"}},
+    "tagor_23_90": {"guidance": false, "stock": {"ef_search": 105, "iterative_scan": "off"}, "sqlens": {"ef_search": 105, "iterative_scan": "off"}},
+    "tagor_29_8": {"guidance": false, "stock": {"ef_search": 80, "iterative_scan": "off"}, "sqlens": {"ef_search": 80, "iterative_scan": "off"}},
+    "tagor_89_18": {"guidance": false, "stock": {"ef_search": 95, "iterative_scan": "off"}, "sqlens": {"ef_search": 95, "iterative_scan": "off"}},
+    "tagor_8_28": {"guidance": false, "stock": {"ef_search": 100, "iterative_scan": "off"}, "sqlens": {"ef_search": 100, "iterative_scan": "off"}},
+    "tagor_20_12": {"guidance": false, "stock": {"ef_search": 120, "iterative_scan": "off"}, "sqlens": {"ef_search": 120, "iterative_scan": "off"}},
+    "tagor_3_515": {"guidance": false, "stock": {"ef_search": 250, "iterative_scan": "off"}, "sqlens": {"ef_search": 250, "iterative_scan": "off"}},
+    "tagor_24": {"stock": {"ef_search": 600, "iterative_scan": "off"}, "sqlens": {"ef_search": 180, "traversal_guided_target": 10, "traversal_guided_early_stop_distance_ratio": 0.975}},
+    "tagor_36_414": {"stock": {"ef_search": 1000, "iterative_scan": "off"}, "sqlens": {"ef_search": 100, "traversal_guided_target": 10}},
+    "tagor_430_3076": {"stock": {"ef_search": 100, "iterative_scan": "strict_order", "max_scan_tuples": 150000}, "sqlens": {"ef_search": 70, "max_scan_tuples": 20000, "traversal_guided_target": 10}},
+    "tagor_902": {"stock": {"ef_search": 20, "iterative_scan": "strict_order", "max_scan_tuples": 30000}, "sqlens": {"ef_search": 20, "traversal_guided_target": 10, "traversal_guided_early_stop_distance_ratio": 0.925}},
+    "tagor_990": {"stock": {"ef_search": 20, "iterative_scan": "strict_order", "max_scan_tuples": 100000}, "sqlens": {"ef_search": 20, "max_scan_tuples": 70000, "traversal_guided_target": 10, "traversal_guided_early_stop_distance_ratio": 0.925}}
+  }
+}

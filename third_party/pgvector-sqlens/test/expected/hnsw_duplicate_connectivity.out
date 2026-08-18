@@ -1,0 +1,35 @@
+SET enable_seqscan = off;
+SET hnsw.ef_search = 100;
+SET hnsw.iterative_scan = off;
+SET hnsw.build_seed = 5;
+CREATE TABLE hnsw_duplicate_connectivity_t (
+	id bigint PRIMARY KEY,
+	val vector(2) NOT NULL
+);
+INSERT INTO hnsw_duplicate_connectivity_t
+SELECT i, ARRAY[((i % 20)::float / 20.0), ((i / 20)::float / 20.0)]::vector
+FROM generate_series(1, 400) AS rows(i);
+INSERT INTO hnsw_duplicate_connectivity_t
+SELECT i, '[100,100]'::vector
+FROM generate_series(401, 4000) AS rows(i);
+CREATE INDEX hnsw_duplicate_connectivity_idx
+ON hnsw_duplicate_connectivity_t USING hnsw (val vector_l2_ops)
+WITH (m = 2, ef_construction = 10);
+WITH nearest AS (
+	SELECT val <-> '[0,0]'::vector AS distance
+	FROM hnsw_duplicate_connectivity_t
+	ORDER BY val <-> '[0,0]'::vector
+	LIMIT 10
+)
+SELECT count(*) = 10 AND max(distance) < 2 AS duplicate_clique_keeps_bridge
+FROM nearest;
+ duplicate_clique_keeps_bridge 
+-------------------------------
+ t
+(1 row)
+
+DROP TABLE hnsw_duplicate_connectivity_t;
+RESET hnsw.build_seed;
+RESET hnsw.iterative_scan;
+RESET hnsw.ef_search;
+RESET enable_seqscan;

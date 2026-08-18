@@ -1,0 +1,44 @@
+{
+  "amazon": {
+    "popular_ge1000": {
+      "guidance": false,
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 80, "iterative_scan": "off"}
+    },
+    "popular_ge1340": {
+      "guidance": false,
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 110, "iterative_scan": "off"}
+    },
+    "popular_ge2428": {
+      "guidance": false,
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 180, "iterative_scan": "off"}
+    },
+    "popular_ge3284": {
+      "guidance": false,
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 185, "iterative_scan": "off"}
+    },
+    "popular_ge4559": {
+      "guidance": false,
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 170, "iterative_scan": "off"}
+    },
+    "price_10_to_20": {
+      "guidance": false,
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 175, "iterative_scan": "off"}
+    },
+    "popular_ge10066": {
+      "guidance": false,
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 260, "iterative_scan": "off"}
+    },
+    "rating5_price_le10": {
+      "guidance": false,
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 1050, "iterative_scan": "off"}
+    }
+  }
+}

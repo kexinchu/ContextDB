@@ -13,6 +13,14 @@ SMOKE_SQL = (
     / "experiments/hybrid_vector_db/sql/pgvector_epoch_writer_permissions_smoke.sql"
 )
 MAKEFILE = ROOT / "third_party/pgvector-sqlens/Makefile"
+FORMAL_RUNNERS = (
+    ROOT
+    / "experiments/hybrid_vector_db/scripts/pgvector_design1_design2_design3_selectivity_benchmark.py",
+    ROOT
+    / "experiments/hybrid_vector_db/scripts/yfcc_overlap_sqlens_variants_benchmark.py",
+    ROOT
+    / "experiments/hybrid_vector_db/scripts/laion25m_sqlens_variants_benchmark.py",
+)
 
 
 def test_epoch_trigger_uses_narrow_security_definer_authority() -> None:
@@ -54,3 +62,12 @@ def test_writer_permission_smoke_covers_dml_hot_and_metadata_denial() -> None:
     assert "before_epoch + 4" in smoke_sql
     assert "EXCEPTION WHEN insufficient_privilege" in smoke_sql
     assert "pgvector_epoch_writer_permissions_smoke.sql" in makefile
+
+
+def test_formal_runners_do_not_downgrade_epoch_trigger_security() -> None:
+    expected = (
+        '"RETURNS trigger AS \'vector\' LANGUAGE C SECURITY DEFINER "\n'
+        '        "SET search_path = pg_catalog, pg_temp"'
+    )
+    for runner in FORMAL_RUNNERS:
+        assert expected in runner.read_text(), runner

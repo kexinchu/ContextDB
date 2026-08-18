@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "plan_id": "table6-r37-isolated-fixed-target-grid-20260731",
+  "release_contract": "experiments/hybrid_vector_db/configs/p0_release_contract.json",
+  "dataset_config": "experiments/hybrid_vector_db/configs/figure5_r37_formal_datasets.json",
+  "qualification_scope": "global_min_predicate_lcb",
+  "targets": [
+    0.9,
+    0.95,
+    0.99
+  ],
+  "protocol": {
+    "calibration_requests": 2800,
+    "observations_per_predicate": 200,
+    "predicates": 14,
+    "parallel_db_cells": false,
+    "require_global_db_lock": true,
+    "cache_state": "warm",
+    "screening_latency_eligible": false
+  },
+  "groups": [
+    {
+      "dataset": "amazon",
+      "mode": "stock",
+      "family": "stock_strict",
+      "output_dir": "results/hybrid_vector_db/figure5_r37_formal_calibration_isolated/amazon_stock",
+      "ef_search_values": [
+        20,
+        60,
+        50000,
+        100000
+      ]
+    },
+    {
+      "dataset": "amazon",
+      "mode": "sqlens",
+      "family": "sqlens_target",
+      "output_dir": "results/hybrid_vector_db/figure5_r37_formal_calibration_isolated/amazon_sqlens",
+      "settings": [
+        "200:200",
+        "500:500",
+        "5000:1000",
+        "10000:2000"
+      ]
+    },
+    {
+      "dataset": "yfcc",
+      "mode": "stock",
+      "family": "stock_strict",
+      "output_dir": "results/hybrid_vector_db/figure5_r37_formal_calibration_isolated/yfcc_stock",
+      "ef_search_values": [
+        250,
+        2000,
+        20000,
+        50000
+      ]
+    },
+    {
+      "dataset": "yfcc",
+      "mode": "sqlens",
+      "family": "sqlens_target",
+      "output_dir": "results/hybrid_vector_db/figure5_r37_formal_calibration_isolated/yfcc_sqlens",
+      "settings": [
+        "100:20",
+        "200:80",
+        "5000:1000",
+        "10000:2000"
+      ]
+    },
+    {
+      "dataset": "laion",
+      "mode": "stock",
+      "family": "stock_strict",
+      "output_dir": "results/hybrid_vector_db/figure5_r37_formal_calibration_isolated/laion_stock",
+      "ef_search_values": [
+        20000,
+        50000,
+        100000
+      ]
+    },
+    {
+      "dataset": "laion",
+      "mode": "sqlens",
+      "family": "sqlens_target",
+      "output_dir": "results/hybrid_vector_db/figure5_r37_formal_calibration_isolated/laion_sqlens",
+      "settings": [
+        "3000:250",
+        "5000:500",
+        "10000:1000"
+      ]
+    }
+  ]
+}

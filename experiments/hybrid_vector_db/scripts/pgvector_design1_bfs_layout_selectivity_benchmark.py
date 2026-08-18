@@ -778,7 +778,7 @@ def main() -> None:
     parser.add_argument(
         "--truth-csv",
         type=Path,
-        default=Path("results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_formal.csv"),
+        default=Path("results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_unique_embeddings_formal.csv"),
     )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--filter-names", nargs="*")

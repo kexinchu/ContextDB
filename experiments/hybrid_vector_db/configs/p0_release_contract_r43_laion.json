@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "contract_id": "sigmod-p0-r43-laion-20260806",
+  "purpose": "LAION-25M clone :55434 SQLens r43 identity for Figure 6 iso-recall calibration",
+  "expected_sqlens_build_id": "sqlens-v17-predistance-promotion-20260806-r43",
+  "expected_vector_so_sha256": "2056a67b9b0012c401c6684d49915cbc31bc8fa770946dbfaddda9d779eecbf2"
+}

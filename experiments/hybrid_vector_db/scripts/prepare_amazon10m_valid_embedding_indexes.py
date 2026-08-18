@@ -27,8 +27,8 @@ except ImportError:  # Direct execution places this directory on sys.path.
 
 
 DEFAULT_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
-DEFAULT_SOURCE_INDEX = "public.amazon10m_embedding_valid_hnsw_source_idx"
-DEFAULT_CLONE_INDEX = "public.amazon10m_embedding_valid_hnsw_bfs_clone_idx"
+DEFAULT_SOURCE_INDEX = "public.amazon10m_hnsw_m32ef200_dupbridge_r29_source_idx"
+DEFAULT_CLONE_INDEX = "public.amazon10m_hnsw_m32ef200_dupbridge_r29_bfs_idx"
 DEFAULT_CONSTRAINT = "amazon10m_embedding_valid_norm_check"
 DEFAULT_PROOF_OUTPUT = Path(
     "results/hybrid_vector_db/amazon10m_valid_embedding_d2_graph_proof.json"
@@ -38,14 +38,18 @@ LEGACY_INDEXES = {
     "public.amazon_grocery_reviews_10m_pgvector_hnsw_bfs_clone_idx",
 }
 EXPECTED_ROWS = 10_000_000
-HNSW_M = 16
-HNSW_EF_CONSTRUCTION = 64
+HNSW_M = 32
+HNSW_EF_CONSTRUCTION = 200
 HNSW_MIN_M = 2
 HNSW_MAX_M = 100
 HNSW_MIN_EF_CONSTRUCTION = 4
 HNSW_MAX_EF_CONSTRUCTION = 1000
-INDEX_PROVENANCE_PREFIX = "sqlens-valid-embedding-index-v1:"
-INDEX_PROVENANCE_CONTRACT = "sqlens_valid_embedding_same_heap_hnsw_v1"
+DEFAULT_MAINTENANCE_WORK_MEM = "128GB"
+DEFAULT_PARALLEL_MAINTENANCE_WORKERS = 7
+INDEX_PROVENANCE_PREFIX = "sqlens-valid-embedding-index-v2:"
+INDEX_PROVENANCE_CONTRACT = "sqlens_valid_embedding_same_heap_hnsw_v2"
+HNSW_DUPLICATE_BRIDGE_POLICY = "preserve_last_positive_edge_v1"
+DUPLICATE_BRIDGE_BUILD_MARKER = "-duplicate-bridge-"
 ARTIFACT_CONTRACT = "sqlens_amazon10m_valid_embedding_indexes_v1"
 STAGES = ("all", "column", "source", "clone", "proof", "verify")
 
@@ -146,6 +150,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def build_seed_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < -1:
+        raise argparse.ArgumentTypeError("build seed must be -1 or nonnegative")
     return parsed
 
 
@@ -533,6 +544,18 @@ def index_state(cur: psycopg.Cursor, index_name: str) -> IndexState | None:
 def source_build_contract(
     args: argparse.Namespace, table: RelationState
 ) -> dict[str, object]:
+    source_build_id = (
+        getattr(args, "expected_source_sqlens_build_id", None)
+        or args.expected_sqlens_build_id
+    )
+    source_vector_sha = (
+        getattr(args, "expected_source_vector_so_sha256", None)
+        or args.expected_vector_so_sha256
+    )
+    source_memory = (
+        getattr(args, "source_maintenance_work_mem", None)
+        or args.maintenance_work_mem
+    )
     return {
         "contract": INDEX_PROVENANCE_CONTRACT,
         "role": "source",
@@ -547,10 +570,15 @@ def source_build_contract(
         ),
         "build_page_order": "insertion",
         "clone_source": "",
-        "require_full_memory_build": False,
+        "require_full_memory_build": True,
         "build_seed": args.build_seed,
-        "maintenance_work_mem": args.maintenance_work_mem,
-        "max_parallel_maintenance_workers": 0,
+        "maintenance_work_mem": source_memory,
+        "max_parallel_maintenance_workers": int(
+            getattr(args, "max_parallel_maintenance_workers", 0)
+        ),
+        "duplicate_bridge_policy": HNSW_DUPLICATE_BRIDGE_POLICY,
+        "sqlens_build_id": source_build_id,
+        "vector_so_sha256": source_vector_sha,
     }
 
 
@@ -577,6 +605,9 @@ def clone_build_contract(
         "build_seed": None,
         "maintenance_work_mem": args.maintenance_work_mem,
         "max_parallel_maintenance_workers": 0,
+        "duplicate_bridge_policy": HNSW_DUPLICATE_BRIDGE_POLICY,
+        "sqlens_build_id": args.expected_sqlens_build_id,
+        "vector_so_sha256": args.expected_vector_so_sha256,
     }
 
 
@@ -704,9 +735,12 @@ def build_source_index(
             "SELECT set_config('maintenance_work_mem', %s, true)",
             (args.maintenance_work_mem,),
         )
-        cur.execute("SET LOCAL max_parallel_maintenance_workers = 0")
+        cur.execute(
+            f"SET LOCAL max_parallel_maintenance_workers = "
+            f"{int(args.max_parallel_maintenance_workers)}"
+        )
         cur.execute("SELECT set_config('hnsw.build_page_order', 'insertion', true)")
-        cur.execute("SELECT set_config('hnsw.require_full_memory_build', 'off', true)")
+        cur.execute("SELECT set_config('hnsw.require_full_memory_build', 'on', true)")
         cur.execute("SELECT set_config('hnsw.clone_source', '', true)")
         cur.execute(
             "SELECT set_config('hnsw.build_seed', %s, true)",
@@ -966,6 +1000,10 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, object]:
             "ef_construction": args.hnsw_ef_construction,
         },
         "source_layout": "insertion",
+        "source_requires_full_memory_build": True,
+        "source_max_parallel_maintenance_workers": (
+            args.max_parallel_maintenance_workers
+        ),
         "clone_layout": "bfs",
         "clone_source": qualified_name(args.source_index),
         "clone_requires_full_memory_build": True,
@@ -1056,6 +1094,7 @@ def run(
                     cur,
                     qualified_name(args.source_index),
                     qualified_name(args.clone_index),
+                    expected_heap_tids=int(column_report["row_counts"]["valid_rows"]),
                 )
                 comparison = proof.get("comparison")
                 if not isinstance(comparison, dict):
@@ -1099,6 +1138,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-vector-so-sha256", type=sha256_value, required=True
     )
+    parser.add_argument(
+        "--expected-source-sqlens-build-id",
+        help=(
+            "Audited build ID that created an existing source index; defaults "
+            "to --expected-sqlens-build-id. This never relaxes the live binary gate."
+        ),
+    )
+    parser.add_argument(
+        "--expected-source-vector-so-sha256",
+        type=sha256_value,
+        help=(
+            "Audited vector.so SHA256 that created an existing source index; "
+            "defaults to --expected-vector-so-sha256."
+        ),
+    )
     parser.add_argument("--expected-rows", type=positive_int, default=EXPECTED_ROWS)
     parser.add_argument("--hnsw-m", type=positive_int, default=HNSW_M)
     parser.add_argument(
@@ -1107,9 +1161,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=HNSW_EF_CONSTRUCTION,
     )
     parser.add_argument(
-        "--maintenance-work-mem", type=memory_setting, default="64GB"
+        "--maintenance-work-mem",
+        type=memory_setting,
+        default=DEFAULT_MAINTENANCE_WORK_MEM,
     )
-    parser.add_argument("--build-seed", type=nonnegative_int, default=57)
+    parser.add_argument(
+        "--source-maintenance-work-mem",
+        type=memory_setting,
+        help=(
+            "Audited maintenance_work_mem used to create an existing source "
+            "index; defaults to --maintenance-work-mem."
+        ),
+    )
+    parser.add_argument(
+        "--build-seed",
+        type=build_seed_int,
+        default=-1,
+        help=(
+            "HNSW build seed; -1 preserves upstream pgvector's randomized build "
+            "behavior, while a nonnegative value enables deterministic SQLens ties"
+        ),
+    )
+    parser.add_argument(
+        "--max-parallel-maintenance-workers",
+        type=nonnegative_int,
+        default=DEFAULT_PARALLEL_MAINTENANCE_WORKERS,
+        help=(
+            "parallel workers for the source build; deterministic nonnegative "
+            "build seeds require zero"
+        ),
+    )
     parser.add_argument("--proof-output", type=Path, default=DEFAULT_PROOF_OUTPUT)
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -1134,6 +1215,24 @@ def validate_args(args: argparse.Namespace) -> None:
         raise AssertionError("new default indexes must not reuse legacy index names")
     if not args.expected_sqlens_build_id.strip():
         raise PreparationError("expected SQLens build ID must not be empty")
+    if DUPLICATE_BRIDGE_BUILD_MARKER not in args.expected_sqlens_build_id:
+        raise PreparationError(
+            "v2 index provenance requires a duplicate-bridge SQLens build"
+        )
+    source_build_id = (
+        getattr(args, "expected_source_sqlens_build_id", None)
+        or args.expected_sqlens_build_id
+    )
+    if DUPLICATE_BRIDGE_BUILD_MARKER not in source_build_id:
+        raise PreparationError(
+            "source index provenance requires a duplicate-bridge SQLens build"
+        )
+    if bool(getattr(args, "expected_source_sqlens_build_id", None)) != bool(
+        getattr(args, "expected_source_vector_so_sha256", None)
+    ):
+        raise PreparationError(
+            "source build ID and vector.so SHA256 overrides must be supplied together"
+        )
     if not HNSW_MIN_M <= args.hnsw_m <= HNSW_MAX_M:
         raise PreparationError(
             f"hnsw_m must be in [{HNSW_MIN_M}, {HNSW_MAX_M}]"
@@ -1149,6 +1248,11 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.hnsw_ef_construction < 2 * args.hnsw_m:
         raise PreparationError("hnsw_ef_construction must be at least 2 * hnsw_m")
+    if args.build_seed >= 0 and args.max_parallel_maintenance_workers != 0:
+        raise PreparationError(
+            "nonnegative hnsw.build_seed requires "
+            "max_parallel_maintenance_workers=0"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

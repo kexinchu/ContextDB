@@ -7,7 +7,7 @@ SET hnsw.index_page_access = off;
 SET hnsw.traversal_guided_min_skip_rate = 0;
 
 SELECT vector_sqlens_build_id() LIKE
-       'sqlens-v12-dual-frontier-prioritization-%' AS r11_loaded;
+       'sqlens-v16-%' AS r16_loaded;
 SHOW hnsw.traversal_guided_prioritization;
 SHOW hnsw.traversal_guided_burst;
 SET hnsw.traversal_guided_burst = 0;
@@ -32,9 +32,11 @@ CREATE INDEX hnsw_traversal_priority_idx
 ON hnsw_traversal_priority_t USING hnsw (val vector_l2_ops)
 WITH (m = 8, ef_construction = 80);
 ANALYZE hnsw_traversal_priority_t;
+SET client_min_messages = warning;
 SELECT vector_hnsw_fragment_tracking_enable(
     'hnsw_traversal_priority_t'::regclass
 ) IS NOT NULL AS tracking_enabled;
+RESET client_min_messages;
 
 CREATE TEMP TABLE hnsw_traversal_observed (
     ordinal bigserial,
@@ -142,6 +144,7 @@ SELECT
         (prioritized->>'no_bridge_expansions')::bigint =
             (prioritized->>'no_bridge_frontier_pops')::bigint AS no_bridge_expands,
     (prioritized->>'no_bridge_deferred')::bigint > 0 AND
+        (prioritized->>'priority_reorders')::bigint > 0 AND
         (prioritized->>'max_no_bridge_debt')::bigint BETWEEN 1 AND 1 AS burst_fair,
     (prioritized->>'dual_frontier_termination_checks')::bigint > 0 AND
         (prioritized->>'dual_frontier_termination_checks_with_both')::bigint > 0 AND
@@ -176,9 +179,57 @@ WITH profile AS (
 )
 SELECT value->>'final_path' = 'fresh_stock_fallback' AND
        value->>'fallback_reason' = 'insufficient_guided_matches' AND
+       (value->>'fallback_iterative_scan_enabled')::boolean AND
        (value->>'fallback_requests')::bigint = 1 AND
        (value->>'guided_attempt_distance_computations')::bigint > 0 AND
        (value->>'fallback_stock_distance_computations')::bigint > 0 AS fresh_underfill_fallback
+FROM profile;
+
+SELECT vector_hnsw_guidance_activate(
+    'hnsw_traversal_priority_idx'::regclass,
+    ARRAY['exact:sql:id > 0'],
+    'exact'
+) AS all_match_atoms;
+SELECT vector_hnsw_reset_scan_profile();
+SELECT count(*) = 10 AS all_match_rows
+FROM (
+    SELECT id
+    FROM hnsw_traversal_priority_t
+    WHERE (SELECT vector_hnsw_guidance_bind(
+               'hnsw_traversal_priority_idx'::regclass,
+               ARRAY['exact:sql:id > 0'],
+               'exact'
+           ) OFFSET 0)
+      AND id > 0
+    ORDER BY val <-> '[500,500]'::vector
+    LIMIT 10
+) AS all_match;
+WITH profile AS (
+    SELECT vector_hnsw_last_scan_profile()::jsonb AS value
+)
+SELECT value->>'final_path' = 'approximate_traversal_prioritization' AND
+       (value->>'approximate_prioritization_attempted')::boolean AND
+       (value->>'match_frontier_pops')::bigint > 0 AND
+       (value->>'no_bridge_frontier_pops')::bigint = 0 AND
+       (value->>'priority_reorders')::bigint = 0 AND
+       NOT (value->>'traversal_order_changed')::boolean
+       AS no_op_prioritization_does_not_claim_order_change
+FROM profile;
+WITH profile AS (
+    SELECT vector_hnsw_last_scan_profile()::jsonb AS value
+)
+SELECT value->>'final_path' = 'approximate_traversal_prioritization'
+           AS no_op_approximate_path,
+       (value->>'approximate_prioritization_attempted')::boolean
+           AS no_op_attempted,
+       (value->>'match_frontier_pops')::bigint > 0
+           AS no_op_match_pops,
+       (value->>'no_bridge_frontier_pops')::bigint = 0
+           AS no_op_no_bridge_pops,
+       (value->>'priority_reorders')::bigint = 0
+           AS no_op_no_reorders,
+       NOT (value->>'traversal_order_changed')::boolean
+           AS no_op_no_order_change
 FROM profile;
 
 SELECT vector_hnsw_guidance_activate(

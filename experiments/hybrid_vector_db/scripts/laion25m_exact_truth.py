@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -9,7 +10,10 @@ from typing import Any
 
 import numpy as np
 
-from prepare_laion25m_pgvector import DIM, PROCESSED, QUERY_ROWS, base_plan, img_path, npy
+try:
+    from .prepare_laion25m_pgvector import DIM, PROCESSED, QUERY_ROWS, base_plan, img_path, npy
+except ImportError:
+    from prepare_laion25m_pgvector import DIM, PROCESSED, QUERY_ROWS, base_plan, img_path, npy
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -29,13 +33,27 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def distance_tolerance(distance_sq: float) -> float:
+    return max(1e-9, abs(float(distance_sq)) * 1e-6)
+
+
+def truth_boundary(distances: list[float], k: int) -> tuple[float, float, int, bool]:
+    if len(distances) < k:
+        raise ValueError(f"exact result has {len(distances)} distances, expected at least {k}")
+    kth = float(distances[k - 1])
+    tolerance = distance_tolerance(kth)
+    strict = sum(value < kth - tolerance for value in distances[:k])
+    boundary_tied = len(distances) > k and distances[k] <= kth + tolerance
+    return kth, tolerance, strict, boundary_tied
+
+
 def parse_labels(text: Any) -> tuple[int, ...]:
     value = str(text or "").strip()
     if not value:
         return ()
     value = value.strip("{}[]")
     sep = "," if "," in value else None
-    return tuple(sorted({int(x) for x in value.split(sep) if str(x).strip()}))
+    return tuple(dict.fromkeys(int(x) for x in value.split(sep) if str(x).strip()))
 
 
 def parse_optional_int(text: Any) -> int | None:
@@ -94,6 +112,53 @@ def load_selected(path: Path, args: argparse.Namespace) -> list[dict[str, Any]]:
     if not filtered:
         raise SystemExit("no selected rows after filtering")
     return filtered
+
+
+def stable_query_ids(population: int, count: int) -> list[int]:
+    if count > population:
+        raise ValueError(f"requested {count} queries from a population of {population}")
+    return sorted(
+        range(population),
+        key=lambda query_id: hashlib.md5(str(query_id).encode("ascii")).hexdigest(),
+    )[:count]
+
+
+def formalize_selected(rows: list[dict[str, Any]], query_count: int) -> list[dict[str, Any]]:
+    unique: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        name = str(row["filter_name"])
+        previous = unique.setdefault(name, row)
+        if str(previous["predicate"]) != str(row["predicate"]):
+            raise ValueError(f"filter {name} maps to multiple predicates")
+    if len(unique) != 14:
+        raise ValueError(f"formal LAION workload requires 14 filters, found {len(unique)}")
+    filters = sorted(unique.values(), key=lambda row: float(row["target_band_pct"]), reverse=True)
+    return [
+        {**row, "qid": query_id}
+        for query_id in stable_query_ids(QUERY_ROWS, query_count)
+        for row in filters
+    ]
+
+
+def formal_filter_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        unique.setdefault(str(row["filter_name"]), row)
+    ordered = sorted(unique.values(), key=lambda row: float(row["target_band_pct"]), reverse=True)
+    return [
+        {
+            "filter_name": row["filter_name"],
+            "target_rate": row["target_band_pct"],
+            "actual_pct": row["actual_pct"],
+            "expected_rows": row["filter_rows"],
+            "predicate": row["predicate"],
+            "atoms": "||OR||".join(
+                f"sql:labels @> ARRAY[{int(label)}]::int[]"
+                for label in row["labels_tuple"]
+            ),
+        }
+        for row in ordered
+    ]
 
 
 def update_topk(
@@ -199,6 +264,9 @@ def generate_truth(rows: list[dict[str, Any]], args: argparse.Namespace) -> list
 
     out: list[dict[str, Any]] = []
     started = time.perf_counter()
+    formal_query_order = stable_query_ids(QUERY_ROWS, args.formal_query_count) if args.formal_matched_recall else []
+    query_no_by_id = {query_id: query_no for query_no, query_id in enumerate(formal_query_order)}
+    top_width = args.k + 1 if args.formal_matched_recall else args.k
     for batch_start in range(0, len(qids), args.query_batch):
         batch_qids = qids[batch_start : batch_start + args.query_batch]
         specs = [row for qid in batch_qids for row in rows_by_qid[qid]]
@@ -206,8 +274,8 @@ def generate_truth(rows: list[dict[str, Any]], args: argparse.Namespace) -> list
         q = np.asarray(query_fbin[batch_qids], dtype=np.float32)
         q_t = np.ascontiguousarray(q.T)
         q_norm = np.einsum("ij,ij->i", q, q)
-        top_dist = np.full((len(specs), args.k), np.inf, dtype=np.float32)
-        top_ids = np.full((len(specs), args.k), -1, dtype=np.int32)
+        top_dist = np.full((len(specs), top_width), np.inf, dtype=np.float32)
+        top_ids = np.full((len(specs), top_width), -1, dtype=np.int32)
 
         row_base = 0
         chunk_no = 0
@@ -228,7 +296,14 @@ def generate_truth(rows: list[dict[str, Any]], args: argparse.Namespace) -> list
                 for spec_pos, row in enumerate(specs):
                     mask = row_mask(row, width_chunk, offsets, labels_flat, global_start, global_end, label_cache, range_cache)
                     if np.any(mask):
-                        update_topk(top_dist, top_ids, spec_pos, dist[mask, qid_pos[int(row["qid"])]], candidate_ids[mask], args.k)
+                        update_topk(
+                            top_dist,
+                            top_ids,
+                            spec_pos,
+                            dist[mask, qid_pos[int(row["qid"])]],
+                            candidate_ids[mask],
+                            top_width,
+                        )
                 chunk_no += 1
                 if args.progress_chunks and chunk_no % args.progress_chunks == 0:
                     elapsed = (time.perf_counter() - started) / 60.0
@@ -241,19 +316,67 @@ def generate_truth(rows: list[dict[str, Any]], args: argparse.Namespace) -> list
 
         for spec_pos, row in enumerate(specs):
             ids = [int(x) for x in top_ids[spec_pos] if int(x) >= 0]
-            out.append(
-                {
-                    "truth_key": truth_key(row),
-                    "workload": row["workload"],
-                    "target_band_pct": row["target_band_pct"],
-                    "actual_pct": row["actual_pct"],
-                    "filter_rows": row["filter_rows"],
-                    "qid": row["qid"],
-                    "filter_name": row["filter_name"],
-                    "predicate": row["predicate"],
-                    "gt": " ".join(str(x) for x in ids),
-                }
-            )
+            distances = [
+                float(value)
+                for item_id, value in zip(top_ids[spec_pos], top_dist[spec_pos])
+                if int(item_id) >= 0
+            ]
+            result_ids = ids[: args.k]
+            result_distances = distances[: args.k]
+            if args.formal_matched_recall:
+                kth, tolerance, strict, boundary_tied = truth_boundary(distances, args.k)
+                query_no = query_no_by_id[int(row["qid"])]
+                out.append(
+                    {
+                        "query_no": query_no,
+                        "query_id": row["qid"],
+                        "query_split": (
+                            "calibration" if query_no < args.calibration_queries else "final"
+                        ),
+                        "filter_name": row["filter_name"],
+                        "target_rate": row["target_band_pct"],
+                        "predicate": row["predicate"],
+                        "candidate_validity_predicate": "TRUE",
+                        "candidate_validity_provenance": "full_hnsw_index_and_source_metadata",
+                        "query_validity_predicate": "TRUE",
+                        "query_validity_provenance": "external_query_table",
+                        "actual_selectivity": row["actual_pct"],
+                        "method": "pre_filter_exact",
+                        "k": args.k,
+                        "latency_ms": "",
+                        "recall_at_10_exact_filtered": 1.0,
+                        "returned": len(result_ids),
+                        "candidates": row["filter_rows"],
+                        "filtered_rows": row["filter_rows"],
+                        "search_candidate_rows": row["filter_rows"],
+                        "result_ids": ",".join(str(value) for value in result_ids),
+                        "exact_filtered_topk_ids": ",".join(str(value) for value in result_ids),
+                        "exact_filtered_topk_distances_sq": ",".join(
+                            f"{value:.9g}" for value in result_distances
+                        ),
+                        "kth_distance_sq": f"{kth:.9g}",
+                        "tie_tolerance": f"{tolerance:.9g}",
+                        "strict_closer_count": strict,
+                        "boundary_tied": boundary_tied,
+                        "self_excluded": False,
+                        "candidate_rows": row["filter_rows"],
+                        "self_excluded_rows": 0,
+                    }
+                )
+            else:
+                out.append(
+                    {
+                        "truth_key": truth_key(row),
+                        "workload": row["workload"],
+                        "target_band_pct": row["target_band_pct"],
+                        "actual_pct": row["actual_pct"],
+                        "filter_rows": row["filter_rows"],
+                        "qid": row["qid"],
+                        "filter_name": row["filter_name"],
+                        "predicate": row["predicate"],
+                        "gt": " ".join(str(x) for x in result_ids),
+                    }
+                )
         write_csv(args.truth_out, out)
         elapsed = (time.perf_counter() - started) / 60.0
         print(f"finished truth qids {batch_start + len(batch_qids)}/{len(qids)} elapsed={elapsed:.1f} min", flush=True)
@@ -264,6 +387,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate exact filtered L2 top-k truth for LAION25M selected predicates.")
     parser.add_argument("--selected-queries-in", type=Path, required=True)
     parser.add_argument("--truth-out", type=Path, default=Path("results/hybrid_vector_db/laion25m_truth_20260714.csv"))
+    parser.add_argument("--filters-out", type=Path)
     parser.add_argument("--query-fbin", type=Path, default=PROCESSED / "query.text_emb_10k.fbin")
     parser.add_argument("--workloads", nargs="*", default=[])
     parser.add_argument("--target-bands", type=float, nargs="*", default=[])
@@ -272,9 +396,27 @@ def main() -> None:
     parser.add_argument("--chunk-rows", type=int, default=100000)
     parser.add_argument("--progress-chunks", type=int, default=25)
     parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--formal-matched-recall", action="store_true")
+    parser.add_argument("--filters-only", action="store_true")
+    parser.add_argument("--formal-query-count", type=int, default=180)
+    parser.add_argument("--calibration-queries", type=int, default=80)
     args = parser.parse_args()
 
     rows = load_selected(args.selected_queries_in, args)
+    if args.formal_matched_recall:
+        if args.formal_query_count != 180:
+            raise SystemExit("formal matched-recall truth requires --formal-query-count=180")
+        if args.calibration_queries != 80:
+            raise SystemExit("formal matched-recall truth requires --calibration-queries=80")
+        if args.filters_out is None:
+            raise SystemExit("formal matched-recall truth requires --filters-out")
+        rows = formalize_selected(rows, args.formal_query_count)
+        write_csv(args.filters_out, formal_filter_rows(rows))
+        print(f"wrote filters {args.filters_out}", flush=True)
+        if args.filters_only:
+            return
+    elif args.filters_only:
+        raise SystemExit("--filters-only requires --formal-matched-recall")
     print(
         json.dumps(
             {

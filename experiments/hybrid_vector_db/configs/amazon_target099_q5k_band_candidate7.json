@@ -1,0 +1,9 @@
+{
+  "amazon": {
+    "popular_ge1780": {
+      "guidance": false,
+      "stock": {"ef_search": 135, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 125, "iterative_scan": "off"}
+    }
+  }
+}

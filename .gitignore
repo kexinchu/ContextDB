@@ -8,6 +8,7 @@ env/
 venv/
 .venv/
 .pgvector-data/
+.worktrees/
 ENV/
 build/
 develop-eggs/

@@ -1,0 +1,54 @@
+{
+  "amazon": {
+    "long_review_ge500": {
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {
+        "ef_search": 80,
+        "max_scan_tuples": 100000,
+        "traversal_guided_target": 25,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.99
+      }
+    },
+    "grocery_rating5": {
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {
+        "ef_search": 80,
+        "max_scan_tuples": 40000,
+        "traversal_guided_target": 26,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.975
+      }
+    },
+    "grocery_helpful": {
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {
+        "ef_search": 80,
+        "max_scan_tuples": 100000,
+        "traversal_guided_target": 30,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.99
+      }
+    },
+    "helpful_ge20": {
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {
+        "ef_search": 80,
+        "max_scan_tuples": 200000,
+        "traversal_guided_target": 35,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.99
+      }
+    },
+    "grocery_long500": {
+      "stock": {"ef_search": 20, "iterative_scan": "off"},
+      "sqlens": {
+        "ef_search": 50,
+        "max_scan_tuples": 250000,
+        "traversal_guided_target": 25,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.99
+      }
+    }
+  }
+}

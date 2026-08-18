@@ -174,8 +174,10 @@ BEGIN
     RAISE EXCEPTION 'resident Bloom did not reactivate';
   END IF;
   p := vector_hnsw_guidance_profile()::jsonb;
-  IF (p ->> 'fragment_cache_hits')::bigint < 1 THEN
-    RAISE EXCEPTION 'repeated adaptive request missed the backend cache: %', p;
+  IF (p ->> 'fast_reactivation_hits')::bigint < 1 OR
+     (p ->> 'adaptive_admissions')::bigint <> 2 OR
+     (p ->> 'adaptive_bloom_builds')::bigint <> 1 THEN
+    RAISE EXCEPTION 'repeated adaptive request rebuilt instead of using the resident guide: %', p;
   END IF;
 END $$;
 
@@ -275,6 +277,77 @@ BEGIN
   SELECT ids INTO actual_ids FROM d3_adaptive_results WHERE phase = 'stale_bypass';
   IF actual_ids IS DISTINCT FROM stock_ids THEN
     RAISE EXCEPTION 'stale fail-open result diverged from stock SQL: stock %, actual %', stock_ids, actual_ids;
+  END IF;
+END $$;
+
+-- An explicitly exact adaptive predicate must preserve the D1 representation:
+-- two inactive probes, one exact materialization, then resident reuse.  It must
+-- never detour through page or Bloom guidance.
+DO $$
+DECLARE
+  atoms text[] := ARRAY['exact:sql:tenant_id = 1 AND id <= 101'];
+  stock_ids bigint[];
+  guided_ids bigint[];
+  p jsonb;
+BEGIN
+  PERFORM vector_hnsw_guidance_reset();
+  PERFORM vector_hnsw_metadata_cache_reset();
+  SELECT array_agg(id ORDER BY distance) INTO stock_ids
+  FROM (
+    SELECT id, embedding <-> '[0,0,0]' AS distance
+    FROM pgvector_d3_adaptive_smoke
+    WHERE tenant_id = 1 AND id <= 101
+    ORDER BY embedding <-> '[0,0,0]' LIMIT 10
+  ) AS q;
+
+  IF vector_hnsw_guidance_activate(
+       'pgvector_d3_adaptive_smoke_hnsw'::regclass, atoms, 'adaptive') <> 0 THEN
+    RAISE EXCEPTION 'first exact adaptive request was not a probe';
+  END IF;
+  PERFORM id FROM pgvector_d3_adaptive_smoke
+  WHERE tenant_id = 1 AND id <= 101
+  ORDER BY embedding <-> '[0,0,0]' LIMIT 10;
+
+  IF vector_hnsw_guidance_activate(
+       'pgvector_d3_adaptive_smoke_hnsw'::regclass, atoms, 'adaptive') <> 0 THEN
+    RAISE EXCEPTION 'second exact adaptive request was not a probe';
+  END IF;
+  PERFORM id FROM pgvector_d3_adaptive_smoke
+  WHERE tenant_id = 1 AND id <= 101
+  ORDER BY embedding <-> '[0,0,0]' LIMIT 10;
+
+  IF vector_hnsw_guidance_activate(
+       'pgvector_d3_adaptive_smoke_hnsw'::regclass, atoms, 'adaptive') <= 0 THEN
+    RAISE EXCEPTION 'third exact adaptive request did not admit guidance';
+  END IF;
+  SELECT array_agg(id ORDER BY distance) INTO guided_ids
+  FROM (
+    SELECT id, embedding <-> '[0,0,0]' AS distance
+    FROM pgvector_d3_adaptive_smoke
+    WHERE tenant_id = 1 AND id <= 101
+      AND (SELECT vector_hnsw_guidance_bind(
+             'pgvector_d3_adaptive_smoke_hnsw'::regclass, atoms, 'adaptive'
+           ) OFFSET 0)
+    ORDER BY embedding <-> '[0,0,0]' LIMIT 10
+  ) AS q;
+  p := vector_hnsw_guidance_profile()::jsonb;
+  IF guided_ids IS DISTINCT FROM stock_ids OR
+     p ->> 'adaptive_state' <> 'exact' OR
+     (p ->> 'adaptive_exact_builds')::bigint <> 1 OR
+     (p ->> 'adaptive_page_builds')::bigint <> 0 OR
+     (p ->> 'adaptive_bloom_builds')::bigint <> 0 THEN
+    RAISE EXCEPTION 'exact adaptive admission was not representation preserving: stock %, guided %, profile %',
+      stock_ids, guided_ids, p;
+  END IF;
+
+  IF vector_hnsw_guidance_activate(
+       'pgvector_d3_adaptive_smoke_hnsw'::regclass, atoms, 'adaptive') <= 0 THEN
+    RAISE EXCEPTION 'resident exact adaptive guide did not reactivate';
+  END IF;
+  p := vector_hnsw_guidance_profile()::jsonb;
+  IF (p ->> 'adaptive_exact_builds')::bigint <> 1 OR
+     (p ->> 'adaptive_fast_reactivation_hits')::bigint < 1 THEN
+    RAISE EXCEPTION 'resident exact adaptive guide rebuilt: %', p;
   END IF;
 END $$;
 

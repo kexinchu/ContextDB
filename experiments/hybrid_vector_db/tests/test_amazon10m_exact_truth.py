@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -14,9 +15,138 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import amazon10m_exact_truth as truth  # noqa: E402
+import amazon10m_exact_truth_postgres_audit as postgres_audit  # noqa: E402
 
 
 class AmazonExactTruthTest(unittest.TestCase):
+    def test_postgres_audit_query_sample_parser(self) -> None:
+        self.assertEqual(postgres_audit.parse_query_nos("0,1999,4999,9999"), (0, 1999, 4999, 9999))
+        with self.assertRaises(argparse.ArgumentTypeError):
+            postgres_audit.parse_query_nos("")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            postgres_audit.parse_query_nos("0,-1")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            postgres_audit.parse_query_nos("0,0")
+
+    def test_postgres_audit_cli_exposes_query_sample(self) -> None:
+        args = postgres_audit.create_argument_parser().parse_args(
+            ["--query-nos", "0,2499,4999,7499,9999"]
+        )
+        self.assertEqual(args.query_nos, (0, 2499, 4999, 7499, 9999))
+
+    def test_external_unique_query_cohort_is_fully_bound(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fbin = root / "vectors.fbin"
+            fbin.write_bytes(b"formal-fbin")
+            cohort = root / "cohort.csv"
+            cohort.write_text(
+                "query_no,query_id,query_split,candidate_validity_predicate,query_validity_predicate\n"
+                "0,19,calibration,embedding_valid,embedding_valid\n"
+                "1,23,final,embedding_valid,embedding_valid\n",
+                encoding="utf-8",
+            )
+            query_ids = np.asarray([19, 23], dtype=np.int64)
+            manifest = {
+                "schema_version": truth.EXTERNAL_QUERY_COHORT_SCHEMA_VERSION,
+                "artifact_valid": True,
+                "method": truth.EXTERNAL_QUERY_COHORT_METHOD,
+                "candidate_validity_predicate": "embedding_valid",
+                "query_validity_predicate": "embedding_valid",
+                "uniqueness_contract": {
+                    "all_rows_fingerprinted": True,
+                    "duplicate_admission_false_negative_only": True,
+                    "hashes": 2,
+                },
+                "eligible_query_population": {
+                    "rows": 90,
+                    "embedding_valid_rows": 95,
+                    "ids_sha256": "a" * 64,
+                    "provenance": "singleton-test",
+                },
+                "selection": {
+                    "calibration": {
+                        "queries": 1,
+                        "seed": 57,
+                        "ordered_ids_sha256": truth.ordered_ids_sha256(query_ids[:1]),
+                    },
+                    "final": {
+                        "queries": 1,
+                        "seed": 58,
+                        "ordered_ids_sha256": truth.ordered_ids_sha256(query_ids[1:]),
+                    },
+                    "disjoint": True,
+                    "query_ids_sha256": truth.ordered_ids_sha256(query_ids),
+                },
+                "inputs": {
+                    "fbin": {
+                        "sha256": truth.sha256_file(fbin),
+                        "rows": 100,
+                    },
+                    "postgres": {
+                        "rows": 100,
+                        "min_id": 0,
+                        "max_id": 99,
+                        "table_oid": 7,
+                        "table_relfilenode": 8,
+                    },
+                },
+                "outputs": {
+                    "cohort_csv": {
+                        "sha256": truth.sha256_file(cohort),
+                        "rows": 2,
+                    }
+                },
+            }
+            manifest_path = root / "cohort_manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            loaded = truth.load_external_query_cohort(
+                cohort,
+                manifest_path,
+                calibration_queries=1,
+                calibration_seed=57,
+                final_queries=1,
+                final_seed=58,
+                candidate_validity_predicate="embedding_valid",
+                query_validity_predicate="embedding_valid",
+                fbin_contract={"path": str(fbin), "sha256": truth.sha256_file(fbin)},
+                vector_rows=100,
+                table_identity={
+                    "name": "reviews",
+                    "rows": 100,
+                    "min_id": 0,
+                    "max_id": 99,
+                    "oid": 7,
+                    "relfilenode": 8,
+                },
+            )
+            self.assertEqual(loaded["query_ids"].tolist(), [19, 23])
+            self.assertEqual(loaded["eligible_query_population"]["rows"], 90)
+
+            manifest["inputs"]["postgres"]["table_relfilenode"] = 9
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "inputs.postgres"):
+                truth.load_external_query_cohort(
+                    cohort,
+                    manifest_path,
+                    calibration_queries=1,
+                    calibration_seed=57,
+                    final_queries=1,
+                    final_seed=58,
+                    candidate_validity_predicate="embedding_valid",
+                    query_validity_predicate="embedding_valid",
+                    fbin_contract={"path": str(fbin), "sha256": truth.sha256_file(fbin)},
+                    vector_rows=100,
+                    table_identity={
+                        "name": "reviews",
+                        "rows": 100,
+                        "min_id": 0,
+                        "max_id": 99,
+                        "oid": 7,
+                        "relfilenode": 8,
+                    },
+                )
+
     def test_validity_predicates_reject_statement_and_comment_markers(self) -> None:
         self.assertEqual(
             truth.safe_sql_predicate(" embedding_valid AND price IS NOT NULL "),
@@ -70,6 +200,31 @@ class AmazonExactTruthTest(unittest.TestCase):
             distances[candidate_ids == query_id] = np.inf
             expected_pos = np.lexsort((candidate_ids, distances))[:10]
             self.assertEqual(actual[position][:10], candidate_ids[expected_pos].tolist())
+
+    def test_parallel_candidate_chunks_match_sequential_exactly(self) -> None:
+        rng = np.random.default_rng(19)
+        vectors = rng.normal(size=(240, 12)).astype("<f4")
+        query_ids = np.asarray([0, 11, 87, 199], dtype=np.int64)
+        candidate_ids = np.arange(len(vectors), dtype=np.int64)
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vectors.fbin"
+            with path.open("wb") as target:
+                np.asarray(vectors.shape, dtype="<i4").tofile(target)
+                vectors.tofile(target)
+            mapped = np.memmap(
+                path, dtype="<f4", mode="r", offset=8, shape=vectors.shape
+            )
+            sequential = truth.exact_topk_batch(
+                mapped, query_ids, candidate_ids, 10, 31, 0, "sequential", 1
+            )
+            parallel = truth.exact_topk_batch(
+                mapped, query_ids, candidate_ids, 10, 31, 0, "parallel", 3
+            )
+
+        self.assertEqual(sequential[0], parallel[0])
+        np.testing.assert_array_equal(
+            np.asarray(sequential[1]), np.asarray(parallel[1])
+        )
 
     def test_exact_topk_excludes_self_and_breaks_ties_by_id(self) -> None:
         vectors = np.asarray(
@@ -384,6 +539,215 @@ class AmazonExactTruthTest(unittest.TestCase):
                 candidate_validity_provenance="formal_default_embedding_valid",
                 query_validity_provenance="inherits_candidate_validity",
             )
+
+    def _extension_fixture(self) -> dict[str, object]:
+        filters = [
+            {"filter_name": "cheap", "target_rate": "0.1", "predicate": "price <= 10"},
+            {"filter_name": "popular", "target_rate": "0.2", "predicate": "helpful >= 20"},
+        ]
+        base_ids = np.asarray([11, 19], dtype=np.int64)
+        extended_ids = np.asarray([11, 19, 23], dtype=np.int64)
+        population = {
+            "cheap": {"candidate_rows": 90, "candidate_ids_sha256": "a" * 64},
+            "popular": {"candidate_rows": 180, "candidate_ids_sha256": "b" * 64},
+        }
+
+        def rows_for(query_ids: np.ndarray) -> list[dict[str, object]]:
+            rows: list[dict[str, object]] = []
+            for filter_spec in filters:
+                for query_no, query_id in enumerate(query_ids):
+                    candidate = population[filter_spec["filter_name"]]
+                    rows.append(
+                        truth.truth_row(
+                            query_no,
+                            int(query_id),
+                            filter_spec,
+                            0.1,
+                            int(candidate["candidate_rows"]),
+                            [1, 2, 3],
+                            [0.1, 0.2, 0.3],
+                            1.0,
+                            57 if query_no == 0 else 58,
+                            "calibration" if query_no == 0 else "final",
+                            False,
+                            2,
+                            "embedding_valid",
+                            "embedding_valid",
+                            100,
+                            "e" * 64,
+                            "postgres:fixture",
+                            "formal_default_embedding_valid",
+                            "inherits_candidate_validity",
+                            str(candidate["candidate_ids_sha256"]),
+                        )
+                    )
+            return rows
+
+        return {
+            "filters": filters,
+            "base_ids": base_ids,
+            "extended_ids": extended_ids,
+            "population": population,
+            "base_rows": rows_for(base_ids),
+            "extended_rows": rows_for(extended_ids),
+        }
+
+    def test_strict_prefix_extension_checkpoint_happy_path(self) -> None:
+        fixture = self._extension_fixture()
+        filters = fixture["filters"]
+        base_ids = fixture["base_ids"]
+        extended_ids = fixture["extended_ids"]
+        population = fixture["population"]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_truth = root / "base_q2.csv"
+            base_checkpoint = root / "base_q2.checkpoint.json"
+            base_truth.write_text("base", encoding="utf-8")
+            base_checkpoint.write_text("checkpoint", encoding="utf-8")
+            fbin = {"path": str(root / "vectors.fbin"), "sha256": "f" * 64}
+            filters_csv = {"path": str(root / "filters.csv"), "sha256": "g" * 64}
+            table = {"name": "reviews", "rows": 100, "min_id": 0, "max_id": 99, "oid": 7, "relfilenode": 8}
+            eligible = {"rows": 100, "ids_sha256": "e" * 64, "provenance": "postgres:fixture"}
+            source = {"kind": "fixture", "method": "fixture-v1", "uniqueness_contract": {"hashes": 2}}
+            checkpoint = truth.extension_checkpoint_payload(
+                k=2,
+                query_ids=extended_ids,
+                candidate_validity_predicate="embedding_valid",
+                candidate_validity_provenance="formal_default_embedding_valid",
+                query_validity_predicate="embedding_valid",
+                query_validity_provenance="inherits_candidate_validity",
+                fbin=fbin,
+                filters_csv=filters_csv,
+                filters=filters,
+                table=table,
+                eligible_population=eligible,
+                query_source=source,
+                candidate_populations=population,
+                completed_filters={row["filter_name"] for row in filters},
+                base_truth=base_truth,
+                base_checkpoint=base_checkpoint,
+                base_query_ids=base_ids,
+            )
+            completed = truth.validate_extension_checkpoint(
+                checkpoint,
+                fixture["extended_rows"],
+                extended_ids,
+                filters,
+                base_query_count=2,
+                k=2,
+                fbin=fbin,
+                filters_csv=filters_csv,
+                table_identity=table,
+                eligible_population=eligible,
+                candidate_validity_predicate="embedding_valid",
+                query_validity_predicate="embedding_valid",
+                candidate_validity_provenance="formal_default_embedding_valid",
+                query_validity_provenance="inherits_candidate_validity",
+                query_source=source,
+                base_truth=base_truth,
+                base_checkpoint=base_checkpoint,
+                base_query_ids=base_ids,
+                base_rows=fixture["base_rows"],
+            )
+        self.assertEqual(completed, {"cheap", "popular"})
+
+    def test_strict_prefix_extension_rejects_non_prefix_and_wrong_width(self) -> None:
+        base = np.asarray([11, 19], dtype=np.int64)
+        with self.assertRaisesRegex(SystemExit, "not a strict query-ID prefix"):
+            truth.validate_prefix_query_cohort(
+                base, np.asarray([11, 23, 19], dtype=np.int64), required_added_queries=1
+            )
+        with self.assertRaisesRegex(SystemExit, "exactly 1 new query"):
+            truth.validate_prefix_query_cohort(
+                base, np.asarray([11, 19, 23, 31], dtype=np.int64), required_added_queries=1
+            )
+
+    def test_strict_truth_rejects_partial_filter_and_candidate_hash_drift(self) -> None:
+        fixture = self._extension_fixture()
+        filters = fixture["filters"]
+        populations = fixture["population"]
+        with self.assertRaisesRegex(SystemExit, "row count mismatch"):
+            truth.validate_strict_truth_rows(
+                fixture["base_rows"][:2],
+                fixture["base_ids"],
+                filters,
+                k=2,
+                candidate_validity_predicate="embedding_valid",
+                query_validity_predicate="embedding_valid",
+                expected_candidate_populations=populations,
+            )
+        changed = {name: dict(record) for name, record in populations.items()}
+        changed["cheap"]["candidate_ids_sha256"] = "c" * 64
+        with self.assertRaisesRegex(SystemExit, "candidate hash mismatch"):
+            truth.validate_strict_truth_rows(
+                fixture["base_rows"],
+                fixture["base_ids"],
+                filters,
+                k=2,
+                candidate_validity_predicate="embedding_valid",
+                query_validity_predicate="embedding_valid",
+                expected_candidate_populations=changed,
+            )
+
+    def test_strict_prefix_extension_rejects_stable_cohort_contract_drift(self) -> None:
+        prior = {
+            "eligible_query_population": {"rows": 100, "ids_sha256": "e" * 64, "provenance": "p"},
+            "candidate_universe_rows": 95,
+            "source_contract": {
+                "method": "cohort-v1",
+                "uniqueness_contract": {"hashes": 2},
+            },
+        }
+        changed = json.loads(json.dumps(prior))
+        changed["candidate_universe_rows"] = 96
+        with self.assertRaisesRegex(SystemExit, "candidate_universe_rows"):
+            truth.validate_stable_cohort_contract(prior, changed)
+
+    def test_truth_manifest_eligible_population_uses_current_manifest_schema(self) -> None:
+        manifest = {
+            "eligible_query_population": {
+                "eligible_rows": 8_561_203,
+                "eligible_ids_sha256": "e" * 64,
+                "provenance": "cohort:fixture",
+                "query_source": {"kind": "external"},
+            }
+        }
+        self.assertEqual(
+            truth.truth_manifest_eligible_population(manifest),
+            {
+                "rows": 8_561_203,
+                "ids_sha256": "e" * 64,
+                "provenance": "cohort:fixture",
+            },
+        )
+
+    def test_truth_manifest_postgres_identity_ignores_nonidentity_provenance(self) -> None:
+        manifest = {
+            "inputs": {
+                "postgres": {
+                    "table": "reviews",
+                    "rows": 10_000_000,
+                    "min_id": 0,
+                    "max_id": 9_999_999,
+                    "table_oid": 24577,
+                    "table_relfilenode": 24577,
+                    "query_population": {"eligible_rows": 8_561_203},
+                    "query_vector_mapping": {"checked_query_rows": 10_000},
+                }
+            }
+        }
+        self.assertEqual(
+            truth.truth_manifest_postgres_identity(manifest),
+            {
+                "table": "reviews",
+                "rows": 10_000_000,
+                "min_id": 0,
+                "max_id": 9_999_999,
+                "table_oid": 24577,
+                "table_relfilenode": 24577,
+            },
+        )
+
 
 
 if __name__ == "__main__":

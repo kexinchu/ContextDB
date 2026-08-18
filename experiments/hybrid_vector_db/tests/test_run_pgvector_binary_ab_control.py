@@ -41,6 +41,8 @@ def controller_args(temporary: str) -> object:
     Path(temporary, "truth.csv").write_text("truth\n", encoding="utf-8")
     args = controller.build_parser().parse_args([
         "--server-container", "pgvector",
+        "--dsn", "postgresql://postgres@127.0.0.1:55432/hybrid_vector",
+        "--planner-mode", "auto",
         "--official-vector-so", f"{temporary}/official-vector.so",
         "--sqlens-vector-so", f"{temporary}/sqlens-vector.so",
         "--sqlens-vector-so-sha256", SQLENS_DIGEST,
@@ -72,7 +74,51 @@ def controller_args(temporary: str) -> object:
     return args
 
 
+def frozen_controller_args(temporary: str) -> object:
+    args = controller_args(temporary)
+    calibration = Path(temporary) / "calibration.csv"
+    measurement = Path(temporary) / "measurement.csv"
+    index_build = Path(temporary) / "official-index-build.json"
+    calibration.write_text(
+        "request_no,query_no,query_id,filter_name\n0,0,100,f00\n",
+        encoding="utf-8",
+    )
+    measurement.write_text(
+        "request_no,query_no,query_id,filter_name\n0,200,200,f00\n",
+        encoding="utf-8",
+    )
+    index_build.write_text('{"artifact_valid":true}\n', encoding="utf-8")
+    args.calibration_workload_csv = calibration
+    args.measurement_workload_csv = measurement
+    args.official_index_build_manifest = index_build
+    args.graph_identity_json = None
+    args.clone_index = None
+    args.index = args.source_index
+    args.formal_family = "all"
+    args.final_repeats = 3
+    args.screen_repeats = 1
+    args.verification_repeats = 2
+    args.expected_sqlens_build_id = controller.DEFAULT_SQLENS_BUILD_ID
+    args.official_vector_source_tag = "v0.8.2"
+    return args
+
+
 class RunPgvectorBinaryAbControlTests(unittest.TestCase):
+    def test_default_ladder_hash_includes_low_ef_release_points(self):
+        self.assertEqual(
+            controller.OFFICIAL_RELEASE_EF_SEARCH_VALUES,
+            (20, 40, 60, 80, 100, 150, 200, 250, 500, 750, 1000),
+        )
+
+    def test_default_sqlens_identity_requires_current_v16_r27_family(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = controller_args(temporary)
+
+            self.assertEqual(
+                args.required_sqlens_build_prefix,
+                "sqlens-v16-d3-full-materialization-persisted-reuse-",
+            )
+
     def test_controller_forwards_each_relation_prewarm_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = controller_args(temporary)
@@ -138,6 +184,127 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
         self.assertEqual(
             controller.counterbalanced_final_schedule("run-123", 17),
             (schedule, audit),
+        )
+
+    def test_frozen_protocol_uses_three_pairable_ab_ba_seeded_rounds(self) -> None:
+        schedule, audit = controller.three_round_final_schedule("run-123", 17)
+
+        self.assertEqual(len(schedule), 6)
+        self.assertEqual(
+            [item["final_block"] for item in schedule],
+            [0, 0, 1, 1, 2, 2],
+        )
+        self.assertEqual(
+            [item["repeat"] for item in schedule],
+            [0, 0, 1, 1, 2, 2],
+        )
+        self.assertEqual(audit["pair_orders"][:2], ["AB", "BA"])
+        self.assertIn(audit["pair_orders"][2], {"AB", "BA"})
+        self.assertEqual(
+            audit["arm_counts"], {"official": 3, "sqlens_disabled": 3}
+        )
+        self.assertEqual(audit["pairable_by"], ["request_no", "repeat"])
+        self.assertTrue(audit["seeded_balance_verified"])
+
+    def test_frozen_controller_forwards_dsn_planner_workloads_and_exact_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = frozen_controller_args(temporary)
+
+            official = controller.build_runner_argv(args, "official")
+            sqlens = controller.build_runner_argv(args, "sqlens_disabled")
+
+            for argv in (official, sqlens):
+                pairs = list(zip(argv, argv[1:]))
+                self.assertIn(("--dsn", args.dsn), pairs)
+                self.assertIn(("--planner-mode", "auto"), pairs)
+                self.assertIn(
+                    (
+                        "--calibration-workload-csv",
+                        str(args.calibration_workload_csv),
+                    ),
+                    pairs,
+                )
+                self.assertIn(
+                    (
+                        "--measurement-workload-csv",
+                        str(args.measurement_workload_csv),
+                    ),
+                    pairs,
+                )
+                self.assertIn(
+                    (
+                        "--official-index-build-manifest",
+                        str(args.official_index_build_manifest),
+                    ),
+                    pairs,
+                )
+                self.assertNotIn("--graph-identity-json", argv)
+                self.assertNotIn("--clone-index", argv)
+            self.assertIn(
+                (
+                    "--expected-sqlens-build-id",
+                    controller.DEFAULT_SQLENS_BUILD_ID,
+                ),
+                list(zip(sqlens, sqlens[1:])),
+            )
+            redacted = controller.redact_runner_argv(sqlens)
+            self.assertNotIn(args.dsn, redacted)
+            self.assertEqual(
+                redacted[redacted.index("--dsn") + 1],
+                "<redacted; see controller dsn_sha256>",
+            )
+
+    def test_frozen_controller_gate_requires_all_r3_single_index_and_exact_r36(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = frozen_controller_args(temporary)
+
+            controller.validate_runtime_args(args)
+
+            for field, value, message in (
+                ("formal_family", "off", "formal-family=all"),
+                ("final_repeats", 5, "equal 3"),
+                ("clone_index", "public.bfs_idx", "must not require"),
+                ("expected_sqlens_build_id", "r36-prefix-only", "exact equality"),
+            ):
+                changed = frozen_controller_args(temporary)
+                setattr(changed, field, value)
+                with self.assertRaisesRegex(controller.ControllerError, message):
+                    controller.validate_runtime_args(changed)
+
+    def test_final_pair_contract_is_request_no_cross_r3_not_q100_or_even(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workload = Path(temporary) / "measurement.csv"
+            workload.write_text(
+                "request_no,query_no,query_id,filter_name\n"
+                "0,700,1700,f0\n"
+                "1,900,1900,f1\n"
+                "2,850,1850,f0\n",
+                encoding="utf-8",
+            )
+
+            requests = controller.load_measurement_request_contract(
+                workload, expected_requests=3
+            )
+            all_keys = controller.expected_request_repeat_keys(requests, 3)
+            f0_keys = controller.expected_request_repeat_keys(
+                requests, 3, filter_name="f0"
+            )
+
+        self.assertEqual(
+            all_keys,
+            {
+                (request_no, repeat)
+                for request_no in range(3)
+                for repeat in range(3)
+            },
+        )
+        self.assertEqual(
+            f0_keys,
+            {
+                (request_no, repeat)
+                for request_no in (0, 2)
+                for repeat in range(3)
+            },
         )
 
     def test_new_manifest_claim_never_overwrites_an_old_run(self) -> None:
@@ -289,7 +456,7 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                         "compiler_flags": "-O3",
                         "source_repo": str(root),
                         "required_sqlens_build_prefix": "sqlens-v11-",
-                        "minimum_sqlens_profile_semantics": 7.0,
+                        "minimum_sqlens_profile_semantics": 8.0,
                     },
                 },
                 "formal_family": "off",
@@ -397,7 +564,7 @@ class RunPgvectorBinaryAbControlTests(unittest.TestCase):
                         "vector_compiler_flags": "-O3",
                         "vector_source_repo": str(root),
                         "required_sqlens_build_prefix": "sqlens-v11-",
-                        "minimum_sqlens_profile_semantics": 7.0,
+                        "minimum_sqlens_profile_semantics": 8.0,
                     },
                     "config_ladder": {
                         "source": "deterministic_default",

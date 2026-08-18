@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 HNSW_SOURCE = ROOT / "third_party/pgvector-sqlens/src/hnsw.c"
+VECTOR_SOURCE = ROOT / "third_party/pgvector-sqlens/src/vector.c"
 SMOKE_SQL = ROOT / "experiments/hybrid_vector_db/sql/pgvector_traversal_guidance_binding_smoke.sql"
 
 
@@ -20,11 +21,12 @@ def test_traversal_guided_guc_help_separates_default_validation_from_prioritizat
     assert "bounded bridge expansion" not in source
 
 
-def test_legacy_traversal_gucs_are_explicitly_deprecated() -> None:
+def test_target_is_active_and_only_legacy_bridge_gucs_are_deprecated() -> None:
     source = HNSW_SOURCE.read_text(encoding="utf-8")
 
-    assert "Deprecated compatibility target for legacy traversal_guided search" in source
-    assert "native candidate admission ignores this value and collects the hnsw.ef_search result batch" in source
+    assert "Sets the result target for predicate-prioritized traversal" in source
+    assert "retains this many predicate-matching candidates, capped by hnsw.ef_search" in source
+    assert "larger values trade latency for recall" in source
     assert "Deprecated compatibility limit for legacy traversal_guided bridge hops" in source
     assert "native candidate admission ignores this value and does not bound predicate-miss graph expansion" in source
     assert "Deprecated compatibility limit for legacy traversal_guided bridge work" in source
@@ -47,3 +49,24 @@ def test_binding_smoke_asserts_r6_semantics_without_legacy_bridge_claims() -> No
     assert "(guided_profile->>'miss_bridge_nodes')::bigint <= 0" not in sql
     assert "(guided_profile->>'miss_bridge_edges')::bigint <= 0" not in sql
     assert "(guided_profile->>'traversal_bridge_expanded')::bigint" not in sql
+
+
+def test_planner_proof_uses_structural_fast_path_before_generic_implication() -> None:
+    source = VECTOR_SOURCE.read_text(encoding="utf-8")
+    structural = source.index(
+        "implied = HnswGuidanceStructuralSubset(predicateClauses, actualClauses);"
+    )
+    generic = source.index(
+        "implied = predicate_implied_by(predicateClauses, actualClauses, false);"
+    )
+
+    assert structural < generic
+
+
+def test_relation_version_check_reuses_a_kept_spi_plan() -> None:
+    source = VECTOR_SOURCE.read_text(encoding="utf-8")
+
+    assert "static SPIPlanPtr hnsw_relation_version_plan = NULL;" in source
+    assert "SPI_prepare(" in source
+    assert "SPI_keepplan(hnsw_relation_version_plan)" in source
+    assert "SPI_execute_plan(hnsw_relation_version_plan" in source

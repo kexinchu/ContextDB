@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "pairs": [
+    {
+      "config_id": "yfcc-r41-target090-r0975",
+      "pair_id": "yfcc-r41-target090-r0975",
+      "target_recall": 0.90,
+      "stock": {
+        "ef_search": 250,
+        "iterative_scan": "strict_order",
+        "max_scan_tuples": 5000000,
+        "scan_mem_multiplier": 32.0,
+        "guided_collect_target": 250,
+        "traversal_guided_target": 10,
+        "traversal_guided_burst": 1,
+        "traversal_guided_early_stop": false,
+        "traversal_guided_early_stop_distance_ratio": 0.0
+      },
+      "sqlens": {
+        "ef_search": 250,
+        "iterative_scan": "off",
+        "max_scan_tuples": 5000000,
+        "scan_mem_multiplier": 32.0,
+        "guided_collect_target": 100,
+        "traversal_guided_target": 10,
+        "traversal_guided_burst": 1,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.975
+      }
+    },
+    {
+      "config_id": "yfcc-r41-target095-low-bypass1-t20-r0995",
+      "pair_id": "yfcc-r41-target095-low-bypass1-t20-r0995",
+      "target_recall": 0.95,
+      "stock": {
+        "ef_search": 2000,
+        "iterative_scan": "strict_order",
+        "max_scan_tuples": 5000000,
+        "scan_mem_multiplier": 32.0,
+        "guided_collect_target": 2000,
+        "traversal_guided_target": 10,
+        "traversal_guided_burst": 1,
+        "traversal_guided_early_stop": false,
+        "traversal_guided_early_stop_distance_ratio": 0.0
+      },
+      "sqlens": {
+        "ef_search": 500,
+        "iterative_scan": "off",
+        "max_scan_tuples": 5000000,
+        "scan_mem_multiplier": 32.0,
+        "guided_collect_target": 500,
+        "traversal_guided_target": 20,
+        "traversal_guided_burst": 1,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.995
+      },
+      "guidance_policy": {
+        "guidance_selectivity_min_pct": 1.0,
+        "guidance_selectivity_max_pct": 6.0,
+        "guidance_bypass_ef_search": 500,
+        "guidance_low_selectivity_bypass_ef_search": 2000,
+        "d2_source_on_guidance_bypass": true
+      }
+    },
+    {
+      "config_id": "yfcc-r41-target099-bounded-guidance",
+      "pair_id": "yfcc-r41-target099-bounded-guidance",
+      "target_recall": 0.99,
+      "stock": {
+        "ef_search": 50000,
+        "iterative_scan": "strict_order",
+        "max_scan_tuples": 5000000,
+        "scan_mem_multiplier": 32.0,
+        "guided_collect_target": 50000,
+        "traversal_guided_target": 10,
+        "traversal_guided_burst": 1,
+        "traversal_guided_early_stop": false,
+        "traversal_guided_early_stop_distance_ratio": 0.0
+      },
+      "sqlens": {
+        "ef_search": 500,
+        "iterative_scan": "off",
+        "max_scan_tuples": 5000000,
+        "scan_mem_multiplier": 32.0,
+        "guided_collect_target": 500,
+        "traversal_guided_target": 160,
+        "traversal_guided_burst": 8,
+        "traversal_guided_early_stop": false,
+        "traversal_guided_early_stop_distance_ratio": 0.0
+      },
+      "guidance_policy": {
+        "guidance_selectivity_min_pct": 0.5,
+        "guidance_selectivity_max_pct": 6.0,
+        "guidance_bypass_ef_search": 2000,
+        "guidance_low_selectivity_bypass_ef_search": 50000,
+        "d2_source_on_guidance_bypass": true
+      }
+    }
+  ]
+}

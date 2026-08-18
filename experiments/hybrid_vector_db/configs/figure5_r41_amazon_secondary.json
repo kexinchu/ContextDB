@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "release_contract": "experiments/hybrid_vector_db/configs/p0_release_contract_r41.json",
+  "search_grid": {
+    "ef_search": [
+      20,
+      40,
+      60,
+      80,
+      100,
+      150,
+      200,
+      250,
+      500,
+      750,
+      1000,
+      1500,
+      2000,
+      3000,
+      4000,
+      5000,
+      7000,
+      8500,
+      10000
+    ],
+    "extension_ef_search": [
+      20000,
+      50000,
+      100000
+    ],
+    "iterative_scan": [
+      "off",
+      "strict_order"
+    ],
+    "max_scan_tuples": 5000000,
+    "scan_mem_multiplier": 32
+  },
+  "protocol": {
+    "modes": [
+      "original",
+      "design1_bloom_bfs_layout_d3"
+    ],
+    "execution_order": "interleaved",
+    "latency_repeats": 3,
+    "throughput_repeats": 6,
+    "measurement_requests": 10000,
+    "calibration_requests": 2800,
+    "calibration_protocol": "formal_per_predicate_cartesian_v1",
+    "calibration_observations_per_predicate": 200,
+    "qualification_scope": "global_min_predicate_lcb",
+    "guidance_filter_strategy": "traversal_guided",
+    "guidance_max_atoms": 160,
+    "d3_measurement_policy": "workload_driven_adaptive",
+    "d2_page_access": "off",
+    "d2_index_page_access": "off",
+    "schedule_seed": 20260728
+  },
+  "datasets": {
+    "amazon": {
+      "label": "Amazon-10M",
+      "table": "public.amazon_grocery_reviews_10m_pgvector",
+      "query_table": "public.amazon_grocery_reviews_10m_pgvector",
+      "query_id_column": "id",
+      "query_vector_column": "embedding",
+      "source_index": "public.amazon10m_hnsw_m32ef200_dupbridge_r29_source_idx",
+      "bfs_index": "public.amazon10m_hnsw_m32ef200_dupbridge_r29_bfs_idx",
+      "candidate_validity_predicate": "embedding_valid",
+      "truth_self_excluded": true,
+      "filters_csv": "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_valid_embeddings_filters.csv",
+      "query_cohort_csv": "results/hybrid_vector_db/amazon10m_unique_embedding_query_cohort_q10200.csv",
+      "truth_csv": "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q10200_unique_embeddings_formal.csv",
+      "calibration_workload_csv": "results/hybrid_vector_db/figure5_r37_formal_workloads/figure5_r37_amazon_calibration.csv",
+      "measurement_workload_csv": "results/hybrid_vector_db/figure5_r37_formal_workloads/figure5_r37_amazon_measurement.csv",
+      "workload_manifest_json": "results/hybrid_vector_db/figure5_r37_formal_workloads/figure5_r37_amazon_manifest.json",
+      "d2_graph_proof_json": "results/hybrid_vector_db/amazon10m_r41_secondary_source_bfs_graph_proof.json"
+    }
+  }
+}

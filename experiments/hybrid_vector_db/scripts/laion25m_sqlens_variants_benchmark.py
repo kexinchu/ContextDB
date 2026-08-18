@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import math
 import statistics
 import subprocess
@@ -19,9 +20,13 @@ from prepare_laion25m_pgvector import INDEX, QUERY_TABLE, TABLE
 
 
 METHODS = ["stock", "d1", "d1_d2", "d1_d2_d3"]
-SQLENS_V11_BUILD_PREFIX = "sqlens-v11-"
-SQLENS_MIN_PROFILE_SEMANTICS = 7.0
+SQLENS_REQUIRED_BUILD_PREFIX = "sqlens-v14-"
+SQLENS_REQUIRED_BUILD_MAJOR = 14
+SQLENS_MIN_PROFILE_SEMANTICS = 9.0
 SQLENS_PROFILE_FIELDS = (
+    "traversal_result_target",
+    "traversal_guided_result_count",
+    "traversal_max_scan_reached",
     "graph_elements_visited",
     "raw_index_tids_returned",
     "hnsw_am_callback_ms",
@@ -37,8 +42,12 @@ SQLENS_PROFILE_FIELDS = (
     "heap_tid_distinct_pages_exact",
     "heap_tid_sequence_scope",
     "heap_blks_are_exact_heap_io",
+    "priority_reorders",
 )
 SQLENS_RAW_PROFILE_FIELDS = (
+    "traversal_result_target",
+    "traversal_guided_result_count",
+    "traversal_max_scan_reached",
     "executor_residual_ms",
     "heap_fetch_ms",
     "heap_fetch_ms_is_residual_proxy",
@@ -94,6 +103,25 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def parse_sqlens_build_major(build_id: str) -> int | None:
+    match = re.search(r"sqlens-v(\d+)-", build_id)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def validate_traversal_guided_target(args: argparse.Namespace) -> None:
+    min_target = int(args.k) + (1 if bool(getattr(args, "client_self_exclusion", False)) else 0)
+    target = int(args.traversal_guided_target)
+    ef_search = int(args.ef_search)
+    if target < min_target or target > ef_search:
+        raise ValueError(
+            f"{args.k=}, self_exclusion={getattr(args, 'client_self_exclusion', False)!r}, "
+            f"target={target}, ef_search={ef_search}. "
+            f"Require k(+self_exclusion) <= target <= ef_search."
+        )
+
+
 def require_sqlens_provenance(cur: psycopg.Cursor) -> tuple[str, dict[str, Any]]:
     """Verify the loaded SQLens ABI before installing any C-backed SQL wrappers."""
     try:
@@ -102,14 +130,15 @@ def require_sqlens_provenance(cur: psycopg.Cursor) -> tuple[str, dict[str, Any]]
         build_id = str(row[0]) if row and row[0] is not None else ""
     except Exception as exc:  # noqa: BLE001 - the gate must turn missing SQL into an actionable failure
         raise SqlensProvenanceGateError(
-            "SQLens v11 provenance gate failed: vector_sqlens_build_id() is unavailable. "
-            "Install/reload the SQLens v11 extension (and reconnect) before running this formal benchmark."
+            "SQLens ABI gate failed: vector_sqlens_build_id() is unavailable. "
+            "Install/reload the SQLens extension (and reconnect) before running this formal benchmark."
         ) from exc
-    if not build_id.startswith(SQLENS_V11_BUILD_PREFIX):
+    major = parse_sqlens_build_major(build_id)
+    if major is None or major < SQLENS_REQUIRED_BUILD_MAJOR:
         raise SqlensProvenanceGateError(
-            f"SQLens v11 provenance gate failed: vector_sqlens_build_id() returned {build_id!r}; "
-            f"expected the {SQLENS_V11_BUILD_PREFIX!r} prefix. "
-            "Rebuild/reload the SQLens v11 extension and reconnect before running this formal benchmark."
+            f"SQLens ABI gate failed: vector_sqlens_build_id() returned {build_id!r}; "
+            f"expected at least {SQLENS_REQUIRED_BUILD_PREFIX!r} (major>={SQLENS_REQUIRED_BUILD_MAJOR}). "
+            "Rebuild/reload the SQLens extension and reconnect before running this formal benchmark."
         )
 
     try:
@@ -119,20 +148,20 @@ def require_sqlens_provenance(cur: psycopg.Cursor) -> tuple[str, dict[str, Any]]
         profile = json.loads(raw_profile) if isinstance(raw_profile, str) else dict(raw_profile)
     except Exception as exc:  # noqa: BLE001 - profile absence/ABI errors must fail closed
         raise SqlensProvenanceGateError(
-            "SQLens v11 provenance gate failed: vector_hnsw_last_scan_profile() is unavailable or is not valid JSON. "
-            "Load the SQLens v11 extension and reconnect before running this formal benchmark."
+            "SQLens ABI gate failed: vector_hnsw_last_scan_profile() is unavailable or is not valid JSON. "
+            "Load the SQLens extension and reconnect before running this formal benchmark."
         ) from exc
     if not isinstance(profile, dict):
         raise SqlensProvenanceGateError(
-            "SQLens v11 provenance gate failed: vector_hnsw_last_scan_profile() did not return a JSON object. "
-            "Load the SQLens v11 extension and reconnect before running this formal benchmark."
+            "SQLens ABI gate failed: vector_hnsw_last_scan_profile() did not return a JSON object. "
+            "Load the SQLens extension and reconnect before running this formal benchmark."
         )
     try:
         profile_version = float(profile["profile_semantics_version"])
     except (KeyError, TypeError, ValueError) as exc:
         raise SqlensProvenanceGateError(
-            "SQLens v11 provenance gate failed: vector_hnsw_last_scan_profile() is missing a numeric "
-            "profile_semantics_version. Load the SQLens v11 extension and reconnect."
+            "SQLens ABI gate failed: vector_hnsw_last_scan_profile() is missing a numeric "
+            "profile_semantics_version. Load the SQLens extension and reconnect."
         ) from exc
     missing = [field for field in SQLENS_PROFILE_FIELDS if field not in profile]
     if not math.isfinite(profile_version) or profile_version < SQLENS_MIN_PROFILE_SEMANTICS or missing:
@@ -145,9 +174,9 @@ def require_sqlens_provenance(cur: psycopg.Cursor) -> tuple[str, dict[str, Any]]
         if missing:
             details.append(f"missing fields={missing!r}")
         raise SqlensProvenanceGateError(
-            "SQLens v11 provenance gate failed: vector_hnsw_last_scan_profile() is incompatible: "
+            "SQLens ABI gate failed: vector_hnsw_last_scan_profile() is incompatible: "
             + "; ".join(details)
-            + ". Load the SQLens v11 extension and reconnect before running this formal benchmark."
+            + ". Load the SQLens extension and reconnect before running this formal benchmark."
         )
     return build_id, profile
 
@@ -162,7 +191,8 @@ def ensure_functions(cur: psycopg.Cursor) -> None:
         "CREATE OR REPLACE FUNCTION vector_hnsw_guidance_reset() "
         "RETURNS void AS 'vector' LANGUAGE C VOLATILE PARALLEL SAFE",
         "CREATE OR REPLACE FUNCTION vector_hnsw_fragment_epoch_bump_trigger() "
-        "RETURNS trigger AS 'vector' LANGUAGE C",
+        "RETURNS trigger AS 'vector' LANGUAGE C SECURITY DEFINER "
+        "SET search_path = pg_catalog, pg_temp",
         "CREATE OR REPLACE FUNCTION vector_hnsw_fragment_tracking_enable(regclass) "
         "RETURNS int8 AS 'vector' LANGUAGE C VOLATILE PARALLEL UNSAFE",
         "CREATE OR REPLACE FUNCTION vector_hnsw_guidance_profile() "
@@ -329,6 +359,10 @@ def configure(cur: psycopg.Cursor, args: argparse.Namespace, method: str) -> Non
         if method == "d1_d2_d3" and args.require_compose_exact_guc:
             raise
         cur.connection.rollback()
+    traversal_prioritization = bool(args.traversal_guided_prioritization) and method != "stock"
+    cur.execute(f"SET hnsw.traversal_guided_prioritization = {'on' if traversal_prioritization else 'off'}")
+    cur.execute(f"SET hnsw.traversal_guided_target = {int(args.traversal_guided_target)}")
+    cur.execute(f"SET hnsw.traversal_guided_burst = {int(args.traversal_guided_burst)}")
     cur.execute(f"SET hnsw.page_access = {args.d2_page_access if method_uses_d2(method) else 'off'}")
     cur.execute(f"SET hnsw.index_page_access = {args.d2_index_page_access if method_uses_d2(method) else 'off'}")
     cur.execute(f"SET hnsw.page_window = {int(args.d2_page_window)}")
@@ -462,15 +496,20 @@ def build_hybrid_query(
     )
 
 
-def guidance_scan_contract_satisfied(profile: dict[str, Any], strategy: str) -> bool:
+def guidance_scan_contract_satisfied(
+    profile: dict[str, Any], strategy: str, expected_priority_burst: int | None = None
+) -> bool:
     if int(profile.get("guidance_checks", 0) or 0) <= 0:
         return False
     if strategy == "traversal_guided":
         return (
-            profile.get("final_path") == "guided"
+            profile.get("final_path") == "approximate_traversal_prioritization"
+            and profile.get("planner_proof_attempted") is True
             and profile.get("planner_proof_succeeded") is True
+            and profile.get("approximate_ann_path") is True
+            and profile.get("approximate_prioritization_attempted") is True
             and profile.get("traversal_guidance_scope")
-            == "candidate_admission_and_validation"
+            == "approximate_traversal_prioritization_and_candidate_admission"
             and profile.get("graph_expansion_pruned") is False
             and profile.get("distance_computations_pruned") is False
             and int(profile.get("pre_distance_membership_checks", 0) or 0) == 0
@@ -480,6 +519,14 @@ def guidance_scan_contract_satisfied(profile: dict[str, Any], strategy: str) -> 
             and int(profile.get("traversal_guided_suppressions", 0) or 0) > 0
             and int(profile.get("stock_bypass_requests", 0) or 0) == 0
             and int(profile.get("fallback_requests", 0) or 0) == 0
+            and (expected_priority_burst is None or int(profile.get("traversal_prioritization_burst", 0) or 0) == int(expected_priority_burst))
+            and (
+                not bool(profile.get("traversal_order_changed", False))
+                or int(profile.get("priority_reorders", 0) or 0) > 0
+            )
+            and (
+                int(profile.get("priority_reorders", 0) or 0) <= 0 or profile.get("traversal_order_changed", False) is True
+            )
         )
     return strategy != "guided_collect" or int(
         profile.get("traversal_guidance_checks", 0) or 0
@@ -506,7 +553,9 @@ def run_query(
         profile = fetch_json(cur, "SELECT vector_hnsw_last_scan_profile()")
         error = ""
         if activation_profile.get("guidance_enabled") is True and not guidance_scan_contract_satisfied(
-            profile, args.guidance_filter_strategy
+            profile,
+            args.guidance_filter_strategy,
+            expected_priority_burst=args.traversal_guided_burst,
         ):
             error = "GuidanceBindingInactive"
         return ids, latency_ms, profile, error
@@ -542,6 +591,9 @@ def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "max_scan_tuples": items[0].get("max_scan_tuples", ""),
                 "guided_collect_target": items[0].get("guided_collect_target", ""),
                 "scan_mem_multiplier": items[0].get("scan_mem_multiplier", ""),
+                "traversal_guided_prioritization": items[0].get("traversal_guided_prioritization", ""),
+                "traversal_guided_target": items[0].get("traversal_guided_target", ""),
+                "priority_burst": items[0].get("priority_burst", ""),
                 "filter_name": ok[0].get("filter_name", ""),
                 "queries": len(ok),
                 "actual_pct_mean": statistics.fmean(vals("actual_pct")),
@@ -629,6 +681,19 @@ def main() -> None:
     parser.add_argument("--ef-search", type=int, default=1000)
     parser.add_argument("--iterative-scan", default="strict_order", choices=["off", "strict_order", "relaxed_order"])
     parser.add_argument("--guidance-iterative-scan", default="off", choices=["off", "strict_order", "relaxed_order"])
+    parser.add_argument(
+        "--traversal-guided-prioritization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--traversal-guided-target", type=int, default=40)
+    parser.add_argument("--traversal-guided-burst", type=int, default=8)
+    parser.add_argument(
+        "--priority-burst",
+        type=int,
+        default=0,
+        help="Alias for --traversal-guided-burst; takes precedence when > 0.",
+    )
     parser.add_argument("--max-scan-tuples", type=int, default=500000)
     parser.add_argument("--guided-collect-target", type=int, default=100)
     parser.add_argument("--scan-mem-multiplier", type=float, default=8.0)
@@ -693,9 +758,20 @@ def main() -> None:
         default=False,
         help="Run one unmeasured pass over every selected query for each method before recording latency.",
     )
+    parser.add_argument(
+        "--client-self-exclusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If true, enforce traversal target >= k+1 because client-side self-exclusion is active.",
+    )
     parser.add_argument("--progress-queries", type=int, default=50)
     parser.add_argument("--backend-cpu-list", default="")
     args = parser.parse_args()
+    if int(args.priority_burst) > 0:
+        args.traversal_guided_burst = int(args.priority_burst)
+    if int(args.traversal_guided_burst) <= 0:
+        raise ValueError("--traversal-guided-burst must be positive")
+    validate_traversal_guided_target(args)
 
     selected = parse_selected(args.selected_queries_in, args.target_bands, args.limit_per_group)
     truth = load_truth(args.truth)
@@ -726,6 +802,9 @@ def main() -> None:
                 "max_scan_tuples",
                 "guided_collect_target",
                 "scan_mem_multiplier",
+                "traversal_guided_prioritization",
+                "traversal_guided_target",
+                "priority_burst",
                 "repeat",
                 "recall",
                 "latency_ms",
@@ -866,6 +945,9 @@ def main() -> None:
                             "max_scan_tuples": int(args.max_scan_tuples),
                             "guided_collect_target": int(args.guided_collect_target),
                             "scan_mem_multiplier": float(args.scan_mem_multiplier),
+                            "traversal_guided_prioritization": bool(args.traversal_guided_prioritization and method != "stock"),
+                            "traversal_guided_target": int(args.traversal_guided_target),
+                            "priority_burst": int(args.traversal_guided_burst),
                             "repeat": repeat,
                             "recall": recall_at_k(ids, expected or [], args.k) if not error else 0.0,
                             "latency_ms": latency_ms,

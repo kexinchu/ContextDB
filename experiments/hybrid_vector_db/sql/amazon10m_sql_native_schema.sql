@@ -148,6 +148,8 @@ CREATE INDEX IF NOT EXISTS amazon_product_dim_tenant_asin_idx
     ON public.amazon_product_dim (tenant_id, parent_asin);
 CREATE INDEX IF NOT EXISTS amazon_product_dim_category_rating_count_idx
     ON public.amazon_product_dim (main_category, item_rating_number, parent_asin);
+CREATE INDEX IF NOT EXISTS amazon_product_dim_rating_count_asin_idx
+    ON public.amazon_product_dim (item_rating_number, parent_asin);
 CREATE INDEX IF NOT EXISTS amazon_principal_tenant_grants_tenant_idx
     ON public.amazon_principal_tenant_grants (tenant_id, principal_name);
 CREATE INDEX IF NOT EXISTS amazon_sql_native_buckets_as_of_idx

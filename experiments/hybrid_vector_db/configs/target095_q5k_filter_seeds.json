@@ -1,0 +1,34 @@
+{
+  "amazon": {
+    "popular_ge1000": {"guidance": false, "stock": {"ef_search": 32, "iterative_scan": "off"}, "sqlens": {"ef_search": 32, "iterative_scan": "off"}},
+    "popular_ge1340": {"guidance": false, "stock": {"ef_search": 36, "iterative_scan": "off"}, "sqlens": {"ef_search": 36, "iterative_scan": "off"}},
+    "popular_ge1780": {"guidance": false, "stock": {"ef_search": 42, "iterative_scan": "off"}, "sqlens": {"ef_search": 42, "iterative_scan": "off"}},
+    "popular_ge2428": {"guidance": false, "stock": {"ef_search": 48, "iterative_scan": "off"}, "sqlens": {"ef_search": 48, "iterative_scan": "off"}},
+    "popular_ge3284": {"guidance": false, "stock": {"ef_search": 58, "iterative_scan": "off"}, "sqlens": {"ef_search": 58, "iterative_scan": "off"}},
+    "popular_ge4559": {"guidance": false, "stock": {"ef_search": 70, "iterative_scan": "off"}, "sqlens": {"ef_search": 70, "iterative_scan": "off"}},
+    "price_10_to_20": {"guidance": false, "stock": {"ef_search": 78, "iterative_scan": "off"}, "sqlens": {"ef_search": 78, "iterative_scan": "off"}},
+    "popular_ge10066": {"guidance": false, "stock": {"ef_search": 130, "iterative_scan": "off"}, "sqlens": {"ef_search": 130, "iterative_scan": "off"}},
+    "rating5_price_le10": {"guidance": false, "stock": {"ef_search": 600, "iterative_scan": "off"}, "sqlens": {"ef_search": 600, "iterative_scan": "off"}},
+    "long_review_ge500": {"stock": {"ef_search": 60, "iterative_scan": "strict_order", "max_scan_tuples": 500000}, "sqlens": {"ef_search": 60, "max_scan_tuples": 50000, "traversal_guided_target": 20}},
+    "grocery_rating5": {"stock": {"ef_search": 60, "iterative_scan": "strict_order", "max_scan_tuples": 100000}, "sqlens": {"ef_search": 20, "max_scan_tuples": 10000, "traversal_guided_target": 20}},
+    "grocery_helpful": {"stock": {"ef_search": 60, "iterative_scan": "strict_order", "max_scan_tuples": 150000}, "sqlens": {"ef_search": 20, "max_scan_tuples": 15000, "traversal_guided_target": 20}},
+    "helpful_ge20": {"stock": {"ef_search": 60, "iterative_scan": "strict_order", "max_scan_tuples": 300000}, "sqlens": {"ef_search": 20, "max_scan_tuples": 40000, "traversal_guided_target": 20}},
+    "grocery_long500": {"stock": {"ef_search": 60, "iterative_scan": "strict_order", "max_scan_tuples": 250000}, "sqlens": {"ef_search": 20, "max_scan_tuples": 150000, "traversal_guided_target": 20}}
+  },
+  "yfcc": {
+    "tagor_23_29": {"guidance": false, "stock": {"ef_search": 150, "iterative_scan": "off"}, "sqlens": {"ef_search": 150, "iterative_scan": "off"}},
+    "tagor_23_89": {"guidance": false, "stock": {"ef_search": 180, "iterative_scan": "off"}, "sqlens": {"ef_search": 180, "iterative_scan": "off"}},
+    "tagor_23_3": {"guidance": false, "stock": {"ef_search": 220, "iterative_scan": "off"}, "sqlens": {"ef_search": 220, "iterative_scan": "off"}},
+    "tagor_23_90": {"guidance": false, "stock": {"ef_search": 160, "iterative_scan": "off"}, "sqlens": {"ef_search": 160, "iterative_scan": "off"}},
+    "tagor_29_8": {"guidance": false, "stock": {"ef_search": 180, "iterative_scan": "off"}, "sqlens": {"ef_search": 180, "iterative_scan": "off"}},
+    "tagor_89_18": {"guidance": false, "stock": {"ef_search": 250, "iterative_scan": "off"}, "sqlens": {"ef_search": 250, "iterative_scan": "off"}},
+    "tagor_8_28": {"guidance": false, "stock": {"ef_search": 200, "iterative_scan": "off"}, "sqlens": {"ef_search": 200, "iterative_scan": "off"}},
+    "tagor_20_12": {"guidance": false, "stock": {"ef_search": 300, "iterative_scan": "off"}, "sqlens": {"ef_search": 300, "iterative_scan": "off"}},
+    "tagor_3_515": {"guidance": false, "stock": {"ef_search": 500, "iterative_scan": "off"}, "sqlens": {"ef_search": 500, "iterative_scan": "off"}},
+    "tagor_24": {"stock": {"ef_search": 1600, "iterative_scan": "off"}, "sqlens": {"ef_search": 300, "traversal_guided_target": 15, "traversal_guided_early_stop_distance_ratio": 0.985}},
+    "tagor_36_414": {"stock": {"ef_search": 2500, "iterative_scan": "off"}, "sqlens": {"ef_search": 250, "traversal_guided_target": 15, "traversal_guided_early_stop_distance_ratio": 0.975}},
+    "tagor_430_3076": {"stock": {"ef_search": 1000, "iterative_scan": "strict_order", "max_scan_tuples": 600000}, "sqlens": {"ef_search": 150, "max_scan_tuples": 50000, "traversal_guided_target": 15, "traversal_guided_early_stop_distance_ratio": 0.975}},
+    "tagor_902": {"stock": {"ef_search": 1000, "iterative_scan": "strict_order", "max_scan_tuples": 100000}, "sqlens": {"ef_search": 50, "max_scan_tuples": 60000, "traversal_guided_target": 15, "traversal_guided_early_stop_distance_ratio": 0.975}},
+    "tagor_990": {"stock": {"ef_search": 1000, "iterative_scan": "strict_order", "max_scan_tuples": 350000}, "sqlens": {"ef_search": 50, "max_scan_tuples": 160000, "traversal_guided_target": 15, "traversal_guided_early_stop_distance_ratio": 0.975}}
+  }
+}

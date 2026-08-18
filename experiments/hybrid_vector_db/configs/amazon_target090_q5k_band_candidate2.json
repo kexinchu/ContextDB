@@ -1,0 +1,49 @@
+{
+  "amazon": {
+    "popular_ge1000": {
+      "guidance": true,
+      "stock": {"ef_search": 21, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 21, "iterative_scan": "off", "traversal_guided_target": 12}
+    },
+    "popular_ge1340": {
+      "guidance": true,
+      "stock": {"ef_search": 24, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 24, "iterative_scan": "off", "traversal_guided_target": 12}
+    },
+    "popular_ge1780": {
+      "guidance": true,
+      "stock": {"ef_search": 31, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 31, "iterative_scan": "off", "traversal_guided_target": 12}
+    },
+    "popular_ge3284": {
+      "guidance": true,
+      "stock": {"ef_search": 40, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 40, "iterative_scan": "off", "traversal_guided_target": 12}
+    },
+    "popular_ge10066": {
+      "guidance": false,
+      "stock": {"ef_search": 83, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 85, "iterative_scan": "off"}
+    },
+    "long_review_ge500": {
+      "stock": {"ef_search": 10500, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 130, "max_scan_tuples": 14300, "traversal_guided_target": 11}
+    },
+    "grocery_rating5": {
+      "stock": {"ef_search": 750, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 11, "max_scan_tuples": 4500, "traversal_guided_target": 11}
+    },
+    "grocery_helpful": {
+      "stock": {"ef_search": 1350, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 11, "max_scan_tuples": 6700, "traversal_guided_target": 11}
+    },
+    "helpful_ge20": {
+      "stock": {"ef_search": 8500, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 11, "max_scan_tuples": 20000, "traversal_guided_target": 11}
+    },
+    "grocery_long500": {
+      "stock": {"ef_search": 20, "iterative_scan": "strict_order", "max_scan_tuples": 75000},
+      "sqlens": {"ef_search": 11, "max_scan_tuples": 69000, "traversal_guided_target": 11}
+    }
+  }
+}

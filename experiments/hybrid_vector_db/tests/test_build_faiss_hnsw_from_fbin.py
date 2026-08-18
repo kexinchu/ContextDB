@@ -10,6 +10,9 @@ import pytest
 from experiments.hybrid_vector_db.scripts import build_faiss_hnsw_from_fbin as builder
 
 
+pytest.importorskip("faiss")
+
+
 def write_fbin(path: Path, vectors: np.ndarray) -> None:
     with path.open("wb") as target:
         target.write(struct.pack("<ii", *vectors.shape))

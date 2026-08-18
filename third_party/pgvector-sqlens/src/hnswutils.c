@@ -5,6 +5,7 @@
 #include "access/genam.h"
 #include "access/generic_xlog.h"
 #include "common/hashfn.h"
+#include "executor/instrument.h"
 #include "fmgr.h"
 #include "hnsw.h"
 #include "lib/pairingheap.h"
@@ -75,7 +76,63 @@ CompareBlockNumbers(const void *a, const void *b)
 }
 
 static bool HnswIndexPageSetAdd(HnswIndexPageProfileState *state,
-								HnswIndexPageSet *set, BlockNumber block);
+									HnswIndexPageSet *set, BlockNumber block);
+static void HnswRecordIndexPage(HnswIndexPageProfileState *state,
+								BlockNumber block);
+
+/*
+ * Keep ReadBuffer accounting at the actual buffer-manager call.  The
+ * shared-buffer counters classify the call without replacing the physical
+ * operation: a call with exactly one shared read is a read, one shared hit is
+ * a hit, and all other deltas remain explicitly unclassified.
+ */
+static Buffer
+HnswReadBufferTracked(Relation index, BlockNumber block,
+					 HnswIndexPageProfileState *state)
+{
+	Buffer		buf;
+	int64		hitsBefore = pgBufferUsage.shared_blks_hit;
+	int64		readsBefore = pgBufferUsage.shared_blks_read;
+	instr_time	start;
+	instr_time	end;
+	instr_time	elapsed;
+	double		elapsedMs;
+	int64		hitDelta;
+	int64		readDelta;
+
+	INSTR_TIME_SET_CURRENT(start);
+	buf = ReadBuffer(index, block);
+	INSTR_TIME_SET_CURRENT(end);
+	elapsed = end;
+	INSTR_TIME_SUBTRACT(elapsed, start);
+	elapsedMs = INSTR_TIME_GET_MILLISEC(elapsed);
+
+	if (state != NULL)
+	{
+		hitDelta = pgBufferUsage.shared_blks_hit - hitsBefore;
+		readDelta = pgBufferUsage.shared_blks_read - readsBefore;
+		state->profile.indexReadBufferCalls++;
+		state->profile.indexReadBufferMs += elapsedMs;
+		if (readDelta == 1 && hitDelta == 0)
+		{
+			state->profile.indexReadBufferSharedReadCalls++;
+			state->profile.indexReadBufferSharedReadMs += elapsedMs;
+		}
+		else if (hitDelta == 1 && readDelta == 0)
+		{
+			state->profile.indexReadBufferSharedHitCalls++;
+			state->profile.indexReadBufferSharedHitMs += elapsedMs;
+		}
+		else
+		{
+			state->profile.indexReadBufferUnclassifiedCalls++;
+			state->profile.indexReadBufferUnclassifiedMs += elapsedMs;
+		}
+		HnswRecordIndexPage(state, block);
+	}
+
+	return buf;
+}
 
 void
 HnswInitIndexPageProfile(HnswIndexPageProfileState *state,
@@ -161,8 +218,35 @@ HnswRecordIndexNeighborPage(HnswIndexPageProfileState *state,
 static void
 HnswRecordIndexPage(HnswIndexPageProfileState *state, BlockNumber block)
 {
+	uint64		blockDelta;
+
 	if (state == NULL || !BlockNumberIsValid(block))
 		return;
+	if (state->profile.traceSampleCount < HNSW_INDEX_PAGE_TRACE_SAMPLE_LIMIT)
+		state->profile.traceSample[state->profile.traceSampleCount++] = block;
+	else
+		state->profile.traceSampleTruncated = true;
+	if (BlockNumberIsValid(state->profile.lastBlock))
+	{
+		BlockNumber previous = state->profile.lastBlock;
+
+		state->profile.transitions++;
+		blockDelta = block >= previous ?
+			(uint64) (block - previous) : (uint64) (previous - block);
+		if (blockDelta == 0)
+			state->profile.sameBlockTransitions++;
+		if (blockDelta <= 1)
+			state->profile.withinOneTransitions++;
+		if (blockDelta <= 4)
+			state->profile.withinFourTransitions++;
+		if (blockDelta <= 16)
+			state->profile.withinSixteenTransitions++;
+		if (block < previous)
+			state->profile.backwardTransitions++;
+		state->profile.totalAbsBlockDelta += blockDelta;
+		state->profile.maxAbsBlockDelta = Max(
+			state->profile.maxAbsBlockDelta, blockDelta);
+	}
 	state->profile.loads++;
 	if (block != state->profile.lastBlock)
 		state->profile.runs++;
@@ -203,6 +287,8 @@ HnswPrefetchUnvisitedIndexPages(Relation index, HnswUnvisited *unvisited,
 
 	if (blockCount == 0)
 		return;
+	if (hnsw_index_page_access != HNSW_INDEX_PAGE_ACCESS_PREFETCH)
+		return;
 
 	qsort(blocks, blockCount, sizeof(BlockNumber), CompareBlockNumbers);
 	for (int i = 0; i < blockCount; i++)
@@ -212,11 +298,8 @@ HnswPrefetchUnvisitedIndexPages(Relation index, HnswUnvisited *unvisited,
 		if (i > 0 && block == previousBlock)
 			continue;
 
-		if (hnsw_index_page_access == HNSW_INDEX_PAGE_ACCESS_PREFETCH)
-		{
-			PrefetchBuffer(index, MAIN_FORKNUM, block);
-			state->profile.prefetches++;
-		}
+		PrefetchBuffer(index, MAIN_FORKNUM, block);
+		state->profile.prefetches++;
 		previousBlock = block;
 	}
 }
@@ -509,8 +592,7 @@ HnswGetMetaPageInfoTracked(Relation index, int *m, HnswElement * entryPoint,
 	Page		page;
 	HnswMetaPage metap;
 
-	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
-	HnswRecordIndexPage(profile, HNSW_METAPAGE_BLKNO);
+	buf = HnswReadBufferTracked(index, HNSW_METAPAGE_BLKNO, profile);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	metap = HnswPageGetMeta(page);
@@ -730,9 +812,26 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
  * Calculate the distance between values
  */
 static inline double
-HnswGetDistance(Datum a, Datum b, HnswSupport * support)
+HnswGetDistance(Datum a, Datum b, HnswSupport * support,
+				HnswIndexPageProfileState *profile)
 {
-	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
+	Datum		result;
+	instr_time	start;
+	instr_time	end;
+	instr_time	elapsed;
+
+	if (profile == NULL)
+		return DatumGetFloat8(FunctionCall2Coll(support->procinfo,
+																 support->collation, a, b));
+
+	INSTR_TIME_SET_CURRENT(start);
+	result = FunctionCall2Coll(support->procinfo, support->collation, a, b);
+	INSTR_TIME_SET_CURRENT(end);
+	elapsed = end;
+	INSTR_TIME_SUBTRACT(elapsed, start);
+	profile->profile.distanceComputeMs += INSTR_TIME_GET_MILLISEC(elapsed);
+	profile->profile.distanceComputeTimedCalls++;
+	return DatumGetFloat8(result);
 }
 
 /*
@@ -746,8 +845,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	HnswElementTuple etup;
 
 	/* Read vector */
-	buf = ReadBuffer(index, blkno);
-	HnswRecordIndexPage(profile, blkno);
+	buf = HnswReadBufferTracked(index, blkno, profile);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
@@ -761,7 +859,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 		if (DatumGetPointer(q->value) == NULL)
 			*distance = 0;
 		else
-			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
+			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support, profile);
 	}
 
 	/* Load element */
@@ -789,11 +887,12 @@ HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation i
  * Get the distance for an element
  */
 static double
-GetElementDistance(char *base, HnswElement element, HnswQuery * q, HnswSupport * support)
+GetElementDistance(char *base, HnswElement element, HnswQuery * q,
+					 HnswSupport * support, HnswIndexPageProfileState *profile)
 {
 	Datum		value = HnswGetValue(base, element);
 
-	return HnswGetDistance(q->value, value, support);
+	return HnswGetDistance(q->value, value, support, profile);
 }
 
 /*
@@ -826,7 +925,7 @@ HnswEntryCandidateTracked(char *base, HnswElement entryPoint, HnswQuery * q, Rel
 	double		distance;
 
 	if (inMemory)
-		distance = GetElementDistance(base, entryPoint, q, support);
+		distance = GetElementDistance(base, entryPoint, q, support, profile);
 	else
 		HnswLoadElementImpl(entryPoint->blkno, entryPoint->offno, &distance, q,
 							index, support, loadVec, NULL, &entryPoint, profile);
@@ -1058,8 +1157,7 @@ HnswLoadNeighborTidsTracked(HnswElement element, ItemPointerData *indextids, Rel
 	HnswNeighborTuple ntup;
 	int			start;
 
-	buf = ReadBuffer(index, element->neighborPage);
-	HnswRecordIndexPage(profile, element->neighborPage);
+	buf = HnswReadBufferTracked(index, element->neighborPage, profile);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
@@ -1189,6 +1287,17 @@ HnswDualFrontierPop(HnswDualFrontier *frontier)
 	Assert(hasMatch || hasNoBridge);
 	if (hasMatch && (!hasNoBridge || frontier->noBridgeDebt < frontier->burst))
 	{
+		if (hasNoBridge && frontier->profile != NULL)
+		{
+			HnswSearchCandidate *match = HnswGetSearchCandidate(c_node,
+				pairingheap_first(frontier->match));
+			HnswSearchCandidate *noBridge = HnswGetSearchCandidate(c_node,
+				pairingheap_first(frontier->noBridge));
+
+			/* Stock's single frontier would pop the nearer NO bridge first. */
+			if (match->distance > noBridge->distance)
+				frontier->profile->priorityReorders++;
+		}
 		if (frontier->profile != NULL)
 			frontier->profile->matchFrontierPops++;
 		if (hasNoBridge)
@@ -1264,6 +1373,10 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	bool		trackTraversal = !inserting && lc == 0 && traversalProfile != NULL;
 	bool		terminationRecorded = false;
 	int			guidedTarget = hnsw_guided_collect_target;
+	int			resultTarget = useTraversalPrioritization ?
+		traversalGuidance->target : ef;
+
+	Assert(resultTarget >= 1 && resultTarget <= ef);
 
 	if (useTraversalPrioritization)
 		HnswDualFrontierInit(&dualFrontier, heapCompareArg,
@@ -1370,7 +1483,30 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		if (useTraversalPrioritization)
 		{
-			if (f != NULL && wlen >= ef)
+			if (traversalGuidance->earlyStop && wlen >= resultTarget)
+			{
+				bool		stopNow =
+					traversalGuidance->earlyStopDistanceRatio <= 0;
+
+				if (!stopNow && f != NULL)
+				{
+					double		frontierMin =
+						HnswDualFrontierMinDistance(&dualFrontier);
+					double		relaxedWorst = f->distance -
+						fabs(f->distance) *
+						(1.0 - traversalGuidance->earlyStopDistanceRatio);
+
+					stopNow = frontierMin > relaxedWorst;
+				}
+				if (stopNow)
+				{
+					if (trackTraversal)
+						traversalProfile->guidedEarlyStopTerminations++;
+					terminationRecorded = true;
+					break;
+				}
+			}
+			if (f != NULL && wlen >= resultTarget)
 			{
 				double		frontierMin =
 					HnswDualFrontierMinDistance(&dualFrontier);
@@ -1395,6 +1531,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 					terminationRecorded = true;
 					break;
 				}
+			}
+			if (tuples != NULL && hnsw_max_scan_tuples > 0 &&
+				*tuples >= hnsw_max_scan_tuples)
+			{
+				traversalGuidance->maxScanReached = true;
+				if (trackTraversal)
+					traversalProfile->maxScanTerminations++;
+				terminationRecorded = true;
+				break;
 			}
 			c = HnswDualFrontierPop(&dualFrontier);
 		}
@@ -1472,7 +1617,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			HnswElement eElement;
 			HnswSearchCandidate *e;
 			double		eDistance;
-			bool		alwaysAdd = wlen < ef;
+			bool		alwaysAdd = wlen < resultTarget;
 			bool		matchesGuidance = true;
 
 			CHECK_FOR_INTERRUPTS();
@@ -1482,7 +1627,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (inMemory)
 			{
 				eElement = unvisited[i].element;
-				eDistance = GetElementDistance(base, eElement, q, support);
+				eDistance = GetElementDistance(base, eElement, q, support, indexPageProfile);
 				if (distanceComputations != NULL)
 					(*distanceComputations)++;
 			}
@@ -1586,7 +1731,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				wlen++;
 
 				/* No need to decrement wlen */
-				if (wlen > ef)
+				if (wlen > resultTarget)
 				{
 					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
 
@@ -1608,7 +1753,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		traversalProfile->exhaustedTerminations++;
 	if (useTraversalPrioritization)
 	{
-		traversalGuidance->guidedResultCount = Min(wlen, ef);
+		traversalGuidance->guidedResultCount = Min(wlen, resultTarget);
 		traversalGuidance->bridgePendingAtTermination =
 			dualFrontier.noBridgePending;
 		if (trackTraversal)
@@ -1785,7 +1930,7 @@ CheckElementCloser(char *base, HnswCandidate * e, List *r, HnswSupport * support
 		HnswCandidate *ri = lfirst(lc2);
 		HnswElement riElement = HnswPtrAccess(base, ri->element);
 		Datum		riValue = HnswGetValue(base, riElement);
-		float		distance = HnswGetDistance(eValue, riValue, support);
+		float		distance = HnswGetDistance(eValue, riValue, support, NULL);
 
 		if (distance <= e->distance)
 			return false;
@@ -1937,6 +2082,7 @@ HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newE
 		/* Shrink connections */
 		List	   *c = NIL;
 		HnswCandidate *pruned = NULL;
+		int			positiveDistanceConnections = 0;
 
 		/* Add candidates */
 		for (int i = 0; i < neighbors->length; i++)
@@ -1948,6 +2094,23 @@ HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newE
 		/* Should not happen */
 		if (pruned == NULL)
 			return;
+
+		/*
+		 * An exact-vector duplicate can otherwise evict every outward edge from
+		 * a saturated duplicate clique. Keep the last nonzero-distance edge as
+		 * a bridge; the new element already has outgoing links into the clique.
+		 */
+		if (distance == 0.0)
+		{
+			for (int i = 0; i < neighbors->length; i++)
+			{
+				if (neighbors->items[i].distance > 0.0)
+					positiveDistanceConnections++;
+			}
+
+			if (pruned->distance > 0.0 && positiveDistanceConnections == 1)
+				return;
+		}
 
 		/* Find and replace the pruned element */
 		for (int i = 0; i < neighbors->length; i++)

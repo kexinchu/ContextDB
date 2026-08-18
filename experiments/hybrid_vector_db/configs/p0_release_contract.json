@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "contract_id": "sigmod-p0-r36-20260729",
+  "purpose": "immutable SQLens P0 matched-recall release identity",
+  "expected_sqlens_build_id": "sqlens-v16-d3-sticky-rejection-mixed-predicate-reuse-d2-edge-trace-readbuffer-profile-orderchangefix-ef500k-20260729-r36",
+  "expected_vector_so_sha256": "5ab03631a5167dd56c1c74638475fec9282508c87f26218d44440b23f98f1679"
+}

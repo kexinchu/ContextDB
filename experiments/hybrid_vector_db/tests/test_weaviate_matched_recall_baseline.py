@@ -140,6 +140,7 @@ def schema_definition(strategy="acorn", ef=500):
         "vectorIndexType": "hnsw",
         "vectorIndexConfig": {
             "distance": "l2-squared",
+            "efConstruction": 128,
             "flatSearchCutoff": 0,
             "filterStrategy": strategy,
             "ef": ef,
@@ -186,6 +187,11 @@ def truth_entry(query_no=0, query_id=99, filter_name="f", kth=1.0, tolerance=1e-
 
 
 class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
+    def test_formal_default_ef_grid_includes_low_budget_points(self):
+        args = runner.build_parser().parse_args(["--out", "/unused/out.csv"])
+        self.assertEqual(args.ef_values[:7], [20, 40, 60, 80, 100, 150, 200])
+        self.assertEqual(args.targets, [0.90, 0.95, 0.99])
+
     def test_formal_query_split_reserves_pgvector_screen(self):
         self.assertEqual(runner.CALIBRATION_QUERY_NOS, tuple(range(20, 100)))
         self.assertEqual(runner.FINAL_QUERY_NOS, tuple(range(100, 200)))
@@ -268,7 +274,8 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
 
     def test_query_uses_k_plus_one_and_removes_query_object(self):
         objects = [
-            {"row_id": row_id, "_additional": {"distance": float(position), "id": str(row_id)}}
+            {"row_id": row_id, "item_rating_number": 1000, "embedding_valid": True,
+             "_additional": {"distance": float(position), "id": str(row_id)}}
             for position, row_id in enumerate([99, *range(10)])
         ]
         payload = {"data": {"Get": {runner.CLASS_NAME: objects}}}
@@ -281,8 +288,10 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
 
     def test_query_preserves_short_ann_result_as_recall_evidence(self):
         objects = [
-            {"row_id": 99, "_additional": {"distance": 0.0, "id": "99"}},
-            {"row_id": 7, "_additional": {"distance": 0.25, "id": "7"}},
+            {"row_id": 99, "item_rating_number": 1000, "embedding_valid": True,
+             "_additional": {"distance": 0.0, "id": "99"}},
+            {"row_id": 7, "item_rating_number": 1000, "embedding_valid": True,
+             "_additional": {"distance": 0.25, "id": "7"}},
         ]
         payload = {"data": {"Get": {runner.CLASS_NAME: objects}}}
         with mock.patch.object(runner, "graphql", return_value=(payload, 0)):
@@ -303,6 +312,22 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
         self.assertTrue(row["valid"])
         self.assertEqual(row["recall_at_10"], 0.1)
         self.assertEqual((row["returned_count"], row["shortfall"]), (2, 9))
+
+    def test_query_rejects_result_outside_filter_even_when_distance_is_good(self):
+        objects = [{
+            "row_id": 7,
+            "item_rating_number": 999,
+            "embedding_valid": True,
+            "_additional": {"distance": 0.0, "id": "7"},
+        }]
+        payload = {"data": {"Get": {runner.CLASS_NAME: objects}}}
+        with mock.patch.object(runner, "graphql", return_value=(payload, 0)):
+            result = runner.query_once(
+                "http://unused", [0.0, 1.0], runner.FILTERS[0].where, 99,
+                timeout=1, retries=0,
+            )
+        self.assertFalse(result.filter_membership_valid)
+        self.assertIn("outside the requested filter", result.error)
 
     def test_tie_aware_recall_uses_exact_fbin_squared_l2_not_id_intersection(self):
         vectors = np.arange(11, dtype=np.float32).reshape(-1, 1)
@@ -347,7 +372,7 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
             (spec.name, query_no): truth_entry(query_no, query_no, spec.name)
             for query_no in range(200)
         }
-        args = runner.build_parser().parse_args(["--ef-values", "100", "--out", "/unused/out.csv"])
+        args = runner.build_parser().parse_args(["--ef-values", "100", "--debug-nonformal-protocol", "--out", "/unused/out.csv"])
         total = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": runner.EXPECTED_ROWS}}]}}}
         valid = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": runner.EXPECTED_VALID_ROWS}}]}}}
         filtered = {"data": {"Aggregate": {runner.CLASS_NAME: [{"meta": {"count": spec.expected_rows}}]}}}
@@ -366,7 +391,7 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
             (spec.name, query_no): truth_entry(query_no, query_no, spec.name)
             for query_no in range(200)
         }
-        args = runner.build_parser().parse_args(["--ef-values", "100", "--out", "/unused/out.csv"])
+        args = runner.build_parser().parse_args(["--ef-values", "100", "--debug-nonformal-protocol", "--out", "/unused/out.csv"])
         with mock.patch.object(runner, "isolate_existing_outputs", return_value=None), mock.patch.object(runner, "load_filter_specs", return_value=(spec,)), mock.patch.object(runner, "read_fbin_memmap", return_value=(vectors, len(vectors), 2)), mock.patch.object(runner, "load_truth", return_value=(truth, query_ids)), mock.patch.object(runner, "request_json", side_effect=[(initial, 0), ({"version": "test"}, 0)]), mock.patch.object(runner, "get_ready_nodes", return_value=(ready_nodes(), 0)), mock.patch.object(runner, "graphql", side_effect=RuntimeError("count failed")), mock.patch.object(runner, "put_schema_definition") as restore:
             with self.assertRaisesRegex(RuntimeError, "count failed"):
                 runner.run(args)
@@ -478,13 +503,12 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
             "unattainable_on_grid": 1,
         })
 
-    def test_monotone_calibration_stops_pair_after_highest_target_and_keeps_fastest_low_target(self):
+    def test_full_grid_selection_keeps_fastest_configuration_for_each_target(self):
         candidates = [
             {"ef": 100, "complete": True, "recall_mean": 0.91, "recall_lcb95": 0.50, "latency_mean_ms": 4.0},
             {"ef": 250, "complete": True, "recall_mean": 0.99, "recall_lcb95": 0.50, "latency_mean_ms": 9.0},
         ]
-        self.assertFalse(runner.pair_reached_highest_target(candidates[:1], 0.99))
-        self.assertTrue(runner.pair_reached_highest_target(candidates, 0.99))
+        self.assertTrue(runner.calibration_grid_proof(candidates, [100, 250])["grid_exhausted_without_errors"])
         self.assertEqual(runner.select_fastest_config(candidates, 0.90)["ef"], 100)
         self.assertEqual(runner.select_fastest_config(candidates, 0.99)["ef"], 250)
 
@@ -506,6 +530,19 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
             raw_rows=[],
         )
         self.assertEqual(errors, [])
+
+    def test_artifact_gate_requires_every_configured_ef_cell(self):
+        spec = runner.FILTERS[0]
+        errors = runner.artifact_gate_errors(
+            strategies=["acorn"], filters=[spec], targets=[], selections={},
+            final_summaries=[], raw_rows=[], ef_values=[20, 40],
+            calibration_summaries=[{
+                "configured_filter_strategy": "acorn",
+                "filter_name": spec.name,
+                "ef": 20,
+            }],
+        )
+        self.assertTrue(any("calibration grid coverage mismatch" in error for error in errors))
 
     def test_checkpoint_run_spec_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -544,10 +581,10 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
         result = runner.QueryResult(tuple(range(10)), 1.0, 0, "", "")
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner, "CALIBRATION_QUERY_NOS", (0,)), mock.patch.object(runner, "FINAL_QUERY_NOS", (1,)), mock.patch.object(runner, "CALIBRATION_REPEATS", 1), mock.patch.object(runner, "FINAL_REPEATS", 1):
             out = Path(tmp) / "run.csv"
-            args = runner.build_parser().parse_args(["--ef-values", "100", "250", "--targets", "0.9", "--warmup-queries", "1", "--out", str(out)])
+            args = runner.build_parser().parse_args(["--ef-values", "100", "250", "--targets", "0.9", "--debug-nonformal-protocol", "--warmup-queries", "1", "--out", str(out)])
             with mock.patch.object(runner, "load_filter_specs", return_value=(spec,)), mock.patch.object(runner, "read_fbin_memmap", return_value=(vectors, len(vectors), 2)), mock.patch.object(runner, "load_truth", return_value=(truth, query_ids)), mock.patch.object(runner, "sha256_file", return_value="hash"), mock.patch.object(runner, "request_json", side_effect=[(initial, 0), ({"version": "test"}, 0)]), mock.patch.object(runner, "get_ready_nodes", return_value=(ready_nodes(), 0)), mock.patch.object(runner, "graphql", side_effect=[(total, 0), (valid, 0), (filtered, 0)]), mock.patch.object(runner, "put_hnsw_config", return_value=(initial, 0.0, 0)) as put_config, mock.patch.object(runner, "put_schema_definition", return_value=(initial, 0)), mock.patch.object(runner, "query_once", return_value=result):
                 self.assertEqual(runner.run(args), 0)
-            self.assertEqual([call.args[2] for call in put_config.call_args_list], [100, 100])
+            self.assertEqual([call.args[2] for call in put_config.call_args_list], [100, 250, 100])
             self.assertTrue(out.is_file())
             raw_text = runner.sibling_outputs(out)["raw_csv"].read_text(encoding="utf-8")
             summary_text = runner.sibling_outputs(out)["summary_csv"].read_text(encoding="utf-8")
@@ -590,6 +627,12 @@ class WeaviateMatchedRecallBaselineTests(unittest.TestCase):
             runner.build_parser().parse_args(["--k", "9"])
         with mock.patch.object(runner, "urlopen", side_effect=AssertionError("network")), mock.patch.object(Path, "open", side_effect=AssertionError("file")), mock.patch.object(Path, "write_text", side_effect=AssertionError("write")):
             self.assertEqual(runner.main(["--dry-run", "--filters-csv", "/missing/filters.csv", "--truth-csv", "/missing/truth.csv", "--fbin", "/missing/vectors.fbin", "--out", "/missing/out.csv"]), 0)
+        payload = runner.dry_run_payload(runner.build_parser().parse_args(["--dry-run"]))
+        self.assertTrue(payload["formal_protocol_valid"])
+        self.assertEqual(payload["calibration"]["repeats"], 2)
+        self.assertEqual(payload["final"]["repeats"], 5)
+        self.assertEqual(payload["index_provenance"]["max_connections_m"], 32)
+        self.assertEqual(payload["index_provenance"]["ef_construction"], 128)
 
 
 if __name__ == "__main__":

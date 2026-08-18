@@ -22,11 +22,22 @@ except ImportError:  # Direct script execution puts this directory on sys.path.
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_FBIN = ROOT / "data/amazon_reviews_2023/processed/grocery_reviews_10m_tfidf_svd128.fbin"
-DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
-DEFAULT_QUERY_IDS = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal.csv"
+DEFAULT_FILTERS = (
+    ROOT
+    / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_valid_embeddings_filters.csv"
+)
+DEFAULT_QUERY_IDS = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_unique_embeddings_formal.csv"
 DEFAULT_QUERY_COHORT_MANIFEST = (
     ROOT
-    / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal_manifest.json"
+    / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_unique_embeddings_formal_manifest.json"
+)
+DEFAULT_Q10200_QUERY_IDS = (
+    ROOT
+    / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q10200_unique_embeddings_formal.csv"
+)
+DEFAULT_Q10200_QUERY_COHORT_MANIFEST = (
+    ROOT
+    / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q10200_unique_embeddings_formal_manifest.json"
 )
 DEFAULT_ARTIFACT_DIR = (
     ROOT / "results/hybrid_vector_db/amazon10m_sql_native_exact_truth_valid_embeddings"
@@ -38,7 +49,30 @@ DEFAULT_CALIBRATION_QUERIES = 100
 DEFAULT_FINAL_QUERIES = 100
 DEFAULT_BASE_TABLE_MAPPING_SAMPLE_SIZE = 1024
 DEFAULT_CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
-CHECKPOINT_VERSION = 4
+FORMAL_FILTERS_SHA256 = "ae07c4d94450958f2071bf54f5db48d26c55328538087629cb1375c09bd4bcec"
+FORMAL_QUERY_COHORT_SHA256 = "9c457ca6bc178c66e112f1f72bd94f23178e110311c2d3aa8418a5c3eced887f"
+FORMAL_QUERY_COHORT_MANIFEST_SHA256 = "4522beb62e1afe3f0e7b07d0ef82fac8a702b4991a57a83f7d00ff3cb3947e7b"
+FORMAL_Q10200_QUERY_COHORT_SHA256 = (
+    "62e7f280f953828b680b2ae069de221bd6d593e42b241cd3d699ea870a1bfb5b"
+)
+FORMAL_Q10200_QUERY_COHORT_MANIFEST_SHA256 = (
+    "0a6ab22579a8cf01eaa29889bf6ee2e822336d6d1c580b15697b7148a149bff2"
+)
+PROTOCOL_Q200 = "q200"
+PROTOCOL_Q10200 = "q10200"
+PROTOCOLS = (PROTOCOL_Q200, PROTOCOL_Q10200)
+MAIN_WORKLOAD_NAMES = (
+    "acl_only",
+    "grant_temporal_selectivity",
+    "fact_temporal_selectivity",
+)
+MAIN_FILTER_NAMES = (
+    "popular_ge1000",
+    "price_10_to_20",
+    "rating5_price_le10",
+    "helpful_ge20",
+)
+CHECKPOINT_VERSION = 5
 QUERY_COHORT_PARSER_VERSION = 1
 QUERY_COHORT_HASH_CONTRACT = (
     "sha256(canonical-json [[query_no,query_id,query_split],...]), ordered by query_no"
@@ -85,6 +119,8 @@ class WorkloadSpec:
     description: str
     bucket_pct: float
     temporal_kind: str
+    width: str = "base"
+    boolean_predicate: str = ""
 
 
 @dataclass(frozen=True)
@@ -109,7 +145,90 @@ WORKLOADS = (
         5.0,
         "fact",
     ),
+    WorkloadSpec(
+        "boolean_complex_wide_exists",
+        "non-temporal correlated EXISTS over the product dimension",
+        50.0,
+        "none",
+        "wide",
+        (
+            "EXISTS (SELECT 1 FROM public.amazon_product_dim AS product_exists "
+            "WHERE product_exists.parent_asin = fact.parent_asin "
+            "AND product_exists.item_rating_number >= 1000)"
+        ),
+    ),
+    WorkloadSpec(
+        "boolean_complex_wide_or",
+        "non-temporal OR anchored at the observed 45% popularity threshold",
+        50.0,
+        "none",
+        "wide",
+        "(v.item_rating_number >= 1340 OR v.rating = 5)",
+    ),
+    WorkloadSpec(
+        "boolean_complex_medium_not",
+        "non-temporal NOT form of the observed 15% popularity threshold",
+        50.0,
+        "none",
+        "medium",
+        "(NOT (v.item_rating_number < 10066))",
+    ),
+    WorkloadSpec(
+        "boolean_complex_medium_or",
+        "non-temporal OR combining disjoint observed price/rating bands",
+        50.0,
+        "none",
+        "medium",
+        (
+            "((v.has_price AND v.price > 10 AND v.price <= 20) "
+            "OR (v.has_price AND v.price <= 10 AND v.rating = 5))"
+        ),
+    ),
+    WorkloadSpec(
+        "boolean_complex_narrow_not_exists",
+        "observed sub-1% helpful band plus a non-temporal user-history anti-semijoin",
+        50.0,
+        "none",
+        "narrow",
+        (
+            "v.helpful_vote >= 20 AND NOT EXISTS "
+            "(SELECT 1 FROM public.amazon_review_facts AS prior_fact "
+            "WHERE prior_fact.user_id = fact.user_id "
+            "AND prior_fact.valid_from < fact.valid_from)"
+        ),
+    ),
+    WorkloadSpec(
+        "boolean_complex_narrow_exists",
+        "non-temporal helpful-review predicate with a correlated sibling EXISTS",
+        50.0,
+        "none",
+        "narrow",
+        (
+            "v.helpful_vote >= 20 AND EXISTS "
+            "(SELECT 1 FROM public.amazon_review_facts AS sibling_fact "
+            "WHERE sibling_fact.parent_asin = fact.parent_asin "
+            "AND sibling_fact.review_id <> fact.review_id "
+            "AND sibling_fact.valid_from <= fact.valid_from)"
+        ),
+    ),
 )
+
+
+def select_workloads(
+    names: Sequence[str], protocol: str = PROTOCOL_Q200
+) -> list[WorkloadSpec]:
+    selected = set(names)
+    if not selected:
+        selected = (
+            set(MAIN_WORKLOAD_NAMES)
+            if protocol == PROTOCOL_Q10200
+            else {workload.name for workload in WORKLOADS}
+        )
+    result = [workload for workload in WORKLOADS if workload.name in selected]
+    observed = {workload.name for workload in result}
+    if observed != selected:
+        raise ValueError(f"unknown workloads: {sorted(selected - observed)}")
+    return result
 
 
 def canonical_sha256(value: Any) -> str:
@@ -127,6 +246,44 @@ def sha256_file(path: Path) -> str:
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def require_formal_input_hashes(
+    filters_csv: Path,
+    query_ids_csv: Path,
+    query_cohort_manifest: Path,
+    protocol: str = PROTOCOL_Q200,
+) -> dict[str, str]:
+    actual = {
+        "filters_csv": sha256_file(filters_csv),
+        "query_ids_csv": sha256_file(query_ids_csv),
+        "query_cohort_manifest": sha256_file(query_cohort_manifest),
+    }
+    if protocol == PROTOCOL_Q200:
+        expected = {
+            "filters_csv": FORMAL_FILTERS_SHA256,
+            "query_ids_csv": FORMAL_QUERY_COHORT_SHA256,
+            "query_cohort_manifest": FORMAL_QUERY_COHORT_MANIFEST_SHA256,
+        }
+    elif protocol == PROTOCOL_Q10200:
+        expected = {
+            "filters_csv": FORMAL_FILTERS_SHA256,
+            "query_ids_csv": FORMAL_Q10200_QUERY_COHORT_SHA256,
+            "query_cohort_manifest": FORMAL_Q10200_QUERY_COHORT_MANIFEST_SHA256,
+        }
+    else:
+        raise ValueError(f"unknown exact-truth protocol: {protocol}")
+    mismatches = {
+        name: {"actual": actual[name], "expected": digest}
+        for name, digest in expected.items()
+        if actual[name] != digest
+    }
+    if mismatches:
+        raise RuntimeError(
+            "formal unique-embedding cohort/filter hashes do not match: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+    return actual
 
 
 def validate_candidate_validity_predicate(value: str) -> str:
@@ -584,6 +741,15 @@ def temporal_predicate(workload: WorkloadSpec) -> str:
     raise ValueError(f"unknown temporal workload kind: {workload.temporal_kind}")
 
 
+def boolean_predicate(workload: WorkloadSpec) -> str:
+    predicate = " ".join(workload.boolean_predicate.strip().split())
+    if not predicate:
+        return ""
+    if any(marker in predicate.lower() for marker in (";", "--", "/*", "*/")):
+        raise ValueError(f"unsafe boolean workload predicate: {workload.name}")
+    return f"\n  AND ({predicate})"
+
+
 def build_candidate_sql(
     table: str,
     predicate: str,
@@ -605,6 +771,7 @@ WHERE ({qualify_predicate(predicate)})
   AND grant_row.principal_name = CURRENT_USER::text
   AND grant_row.can_read
 {temporal_predicate(workload)}
+{boolean_predicate(workload)}
 ORDER BY v.id
 """.strip()
 
@@ -638,6 +805,7 @@ WITH query_vector AS (
       AND grant_row.principal_name = CURRENT_USER::text
       AND grant_row.can_read
 {temporal_predicate(workload)}
+{boolean_predicate(workload)}
 )
 SELECT valid.id, valid.embedding <-> query_vector.embedding AS distance
 FROM valid
@@ -1160,7 +1328,7 @@ def relation_fingerprint(cur: Any, relation: str) -> dict[str, Any]:
     cur.execute(
         """
         SELECT c.oid::bigint, c.relfilenode::bigint, c.reltuples::bigint,
-               pg_total_relation_size(c.oid)::bigint, c.relkind,
+               pg_table_size(c.oid)::bigint, c.relkind,
                c.relrowsecurity, c.relforcerowsecurity,
                coalesce(epoch.epoch, 0)::bigint
         FROM pg_catalog.pg_class AS c
@@ -1548,6 +1716,7 @@ def build_run_spec(
     backend_config: dict[str, Any],
     base_table_mapping: dict[str, Any],
     query_cohort_provenance: dict[str, Any] | None = None,
+    workloads: Sequence[WorkloadSpec] = WORKLOADS,
 ) -> dict[str, Any]:
     query_splits = {
         query_no: query_split(query_no, args.calibration_queries)
@@ -1559,6 +1728,7 @@ def build_run_spec(
     )
     return {
         "version": CHECKPOINT_VERSION,
+        "protocol": args.protocol,
         "vector_table": args.vector_table,
         "principal": args.principal,
         "k": args.k,
@@ -1585,7 +1755,7 @@ def build_run_spec(
             "predicate_sha256": candidate_universe_predicate_sha256(validity_predicate),
             "sql_role": "candidate_relation_only; separate from workload scalar predicate",
         },
-        "workloads": [asdict(workload) for workload in WORKLOADS],
+        "workloads": [asdict(workload) for workload in workloads],
         "query_ids": query_ids,
         "query_splits": query_splits,
         "query_cohort_sha256": cohort_hash,
@@ -1806,6 +1976,12 @@ def execute_pair(
 
 def create_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Precompute SQL-native exact ground truth for the Amazon-10M workload.")
+    parser.add_argument(
+        "--protocol",
+        choices=PROTOCOLS,
+        default=PROTOCOL_Q200,
+        help="q10200 selects the paper mainline q100 calibration + q10100 final cohort",
+    )
     parser.add_argument("--fbin", type=Path, default=DEFAULT_FBIN)
     parser.add_argument("--filters-csv", type=Path, default=DEFAULT_FILTERS)
     parser.add_argument("--query-ids-csv", type=Path, default=DEFAULT_QUERY_IDS)
@@ -1831,6 +2007,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration-queries", type=positive_int, default=DEFAULT_CALIBRATION_QUERIES)
     parser.add_argument("--final-queries", type=positive_int, default=DEFAULT_FINAL_QUERIES)
     parser.add_argument("--filter-names", nargs="*", default=[])
+    parser.add_argument("--workload-names", nargs="*", default=[])
     parser.add_argument("--chunk-rows", type=positive_int, default=20_000)
     parser.add_argument("--query-batch-size", type=positive_int, default=8)
     parser.add_argument(
@@ -1858,14 +2035,48 @@ def create_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_protocol_args(args: argparse.Namespace) -> argparse.Namespace:
+    if args.protocol == PROTOCOL_Q10200:
+        if args.query_ids_csv == DEFAULT_QUERY_IDS:
+            args.query_ids_csv = DEFAULT_Q10200_QUERY_IDS
+        if args.query_cohort_manifest == DEFAULT_QUERY_COHORT_MANIFEST:
+            args.query_cohort_manifest = DEFAULT_Q10200_QUERY_COHORT_MANIFEST
+        if args.calibration_queries == DEFAULT_CALIBRATION_QUERIES:
+            args.calibration_queries = 100
+        if args.final_queries == DEFAULT_FINAL_QUERIES:
+            args.final_queries = 10_100
+        if not args.filter_names:
+            args.filter_names = list(MAIN_FILTER_NAMES)
+        if not args.workload_names:
+            args.workload_names = list(MAIN_WORKLOAD_NAMES)
+        if args.artifact_dir == DEFAULT_ARTIFACT_DIR:
+            args.artifact_dir = (
+                ROOT / "results/hybrid_vector_db/amazon10m_sql_native_q10200_r43"
+            )
+    return args
+
+
 def validate_formal_dimensions(
-    args: argparse.Namespace, filters: Sequence[FilterSpec]
+    args: argparse.Namespace,
+    filters: Sequence[FilterSpec],
+    workloads: Sequence[WorkloadSpec] | None = None,
+    source_filters: Sequence[FilterSpec] | None = None,
 ) -> None:
     problems: list[str] = []
-    if len(filters) != 14 or len({spec.name for spec in filters}) != 14:
-        problems.append("exactly 14 distinct registered filters are required")
-    if args.calibration_queries != 100 or args.final_queries != 100:
-        problems.append("exact GT must contain disjoint calibration q100 and final q100")
+    source_filters = source_filters or filters
+    workloads = workloads or list(WORKLOADS)
+    if len(source_filters) != 14 or len({spec.name for spec in source_filters}) != 14:
+        problems.append("the source cohort must retain all 14 registered filters")
+    if args.protocol == PROTOCOL_Q200:
+        if len(filters) != 14 or len(workloads) != len(WORKLOADS):
+            problems.append("q200 compatibility protocol requires the complete filter/workload matrix")
+        if args.calibration_queries != 100 or args.final_queries != 100:
+            problems.append("q200 exact GT requires disjoint calibration q100 and final q100")
+    elif args.protocol == PROTOCOL_Q10200:
+        if args.calibration_queries != 100 or args.final_queries != 10_100:
+            problems.append("q10200 exact GT requires calibration q100 and final q10100")
+        if not filters or not workloads:
+            problems.append("q10200 requires non-empty filter and workload slices")
     if args.backend != "faiss":
         problems.append("formal exact GT requires exhaustive Faiss IndexFlatL2")
     if problems:
@@ -1873,7 +2084,9 @@ def validate_formal_dimensions(
 
 
 def print_dry_run(args: argparse.Namespace) -> None:
+    workloads = select_workloads(args.workload_names, args.protocol)
     print("mode=dry-run")
+    print(f"protocol={args.protocol}")
     print("database=not_opened")
     print("inputs=not_read")
     print("backend_imports=not_loaded")
@@ -1881,7 +2094,8 @@ def print_dry_run(args: argparse.Namespace) -> None:
         "execution=one unbounded pure relational ID export per workload/filter; "
         "exhaustive Faiss IndexFlatL2 squared-L2"
     )
-    print("workloads=" + ",".join(workload.name for workload in WORKLOADS))
+    print("workloads=" + ",".join(workload.name for workload in workloads))
+    print("filters=" + ",".join(args.filter_names or ["all_registered"]))
     print(f"queries=q{args.calibration_queries + args.final_queries}; calibration={args.calibration_queries}; final={args.final_queries}")
     print(f"k={args.k}; retained=k+1; self_excluded=true; spot_checks_per_pair={args.spot_check_queries}")
     print(f"backend={args.backend}; faiss_threads={args.faiss_threads}; cpu_affinity={available_cpu_count()}")
@@ -1981,16 +2195,24 @@ def build_artifact_manifest(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = create_argument_parser().parse_args(argv)
+    args = resolve_protocol_args(create_argument_parser().parse_args(argv))
     if args.dry_run:
         print_dry_run(args)
         return 0
     if not args.execute:
         raise SystemExit("refusing to execute without --execute (use --dry-run to inspect the contract)")
+    require_formal_input_hashes(
+        args.filters_csv,
+        args.query_ids_csv,
+        args.query_cohort_manifest,
+        args.protocol,
+    )
     backend_config = configure_exact_backend(args)
     require_psycopg()
+    source_filters = read_filters(args.filters_csv)
     filters = read_filters(args.filters_csv, set(args.filter_names))
-    validate_formal_dimensions(args, filters)
+    workloads = select_workloads(args.workload_names, args.protocol)
+    validate_formal_dimensions(args, filters, workloads, source_filters)
     expected_splits = {
         query_no: query_split(query_no, args.calibration_queries)
         for query_no in range(args.calibration_queries + args.final_queries)
@@ -2000,7 +2222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_splits,
         args.candidate_validity_predicate,
         source_manifest_path=args.query_cohort_manifest,
-        expected_filters=filters,
+        expected_filters=source_filters,
     )
     query_ids = query_cohort.query_ids
     vectors, vector_rows, dimensions = read_fbin_memmap(args.fbin)
@@ -2054,15 +2276,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 backend_config,
                 base_table_mapping,
                 query_cohort.provenance,
+                workloads,
             )
             run_spec_hash = canonical_sha256(run_spec)
             args.artifact_dir.mkdir(parents=True, exist_ok=True)
-            out = args.out or args.artifact_dir / "amazon10m_sql_native_exact_truth_q200.csv"
+            default_name = (
+                "amazon10m_sql_native_exact_truth_q10200.csv"
+                if args.protocol == PROTOCOL_Q10200
+                else "amazon10m_sql_native_exact_truth_q200.csv"
+            )
+            out = args.out or args.artifact_dir / default_name
             manifest_path = args.manifest or args.artifact_dir / "amazon10m_sql_native_exact_truth_manifest.json"
             checkpoint_dir = args.checkpoint_dir or args.artifact_dir / "checkpoints"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             completed: list[dict[str, Any]] = []
-            for workload in WORKLOADS:
+            for workload in workloads:
                 for filter_spec in filters:
                     checkpoint_path = _checkpoint_path(checkpoint_dir, workload.name, filter_spec.name)
                     if checkpoint_path.exists():
@@ -2095,7 +2323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             guard_cur.close()
     rows = sorted((row for payload in completed for row in payload["rows"]),
                   key=lambda row: (str(row["workload"]), str(row["filter_name"]), int(row["query_no"])))
-    expected_rows = len(WORKLOADS) * len(filters) * len(query_ids)
+    expected_rows = len(workloads) * len(filters) * len(query_ids)
     if len(rows) != expected_rows:
         raise RuntimeError(f"incomplete GT artifact: rows={len(rows)} expected={expected_rows}")
     csv_payload = render_csv(rows)
@@ -2121,6 +2349,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         data_version_proof=data_version_proof,
         rls_security_proof=rls_security_proof,
     )
+    requested_slice = {
+        "protocol": args.protocol,
+        "workloads": [workload.name for workload in workloads],
+        "filters": [spec.name for spec in filters],
+        "queries": len(query_ids),
+        "expected_rows": expected_rows,
+        "observed_rows": len(rows),
+        "complete": len(rows) == expected_rows,
+        "keyspace_sha256": canonical_sha256(
+            [
+                [row["workload"], row["filter_name"], int(row["query_no"])]
+                for row in rows
+            ]
+        ),
+    }
+    mainline_slice = (
+        args.protocol == PROTOCOL_Q10200
+        and tuple(workload.name for workload in workloads) == MAIN_WORKLOAD_NAMES
+        and tuple(spec.name for spec in filters) == MAIN_FILTER_NAMES
+        and args.calibration_queries == 100
+        and args.final_queries == 10_100
+    )
+    manifest["requested_slice_completion"] = requested_slice
+    manifest["paper_eligible"] = bool(
+        manifest["artifact_valid"]
+        and requested_slice["complete"]
+        and mainline_slice
+    )
+    manifest["paper_eligibility_gate"] = {
+        "mainline_3x4_q10200": mainline_slice,
+        "requested_slice_complete": requested_slice["complete"],
+        "external_database_execution_required": True,
+    }
     publish_exact_artifact(out, manifest_path, rows, manifest)
     print(f"wrote {out} rows={len(rows)} manifest={manifest_path}", flush=True)
     return 0

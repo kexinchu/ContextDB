@@ -34,6 +34,14 @@ CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
 EXPECTED_TARGETS = (0.90, 0.95, 0.99)
 EXPECTED_CALIBRATION_QUERY_NOS = tuple(range(20, 100))
 EXPECTED_FINAL_QUERY_NOS = tuple(range(100, 200))
+FORMAL_CALIBRATION_QUERY_NOS = tuple(range(200))
+FORMAL_FINAL_QUERY_NOS = tuple(range(200, 10_200))
+FORMAL_CALIBRATION_REQUEST_NOS = tuple(range(200))
+FORMAL_FINAL_REQUEST_NOS = tuple(range(10_000))
+LEGACY_EXECUTION_PROTOCOL = "legacy-q100-r5"
+FORMAL_EXECUTION_PROTOCOL = "current-q10k-r3"
+FORMAL_CALIBRATION_REPEATS = 2
+FORMAL_FINAL_REPEATS = 3
 EXPECTED_K = 10
 MANIFEST_PATTERN = "weaviate_production_matched_recall_*_manifest.json"
 DATA_OUTPUTS = ("raw_csv", "summary_csv", "schema_json", "config_json")
@@ -49,23 +57,36 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_DIGEST_RE = re.compile(r"^(?:[^@\s]+@)?sha256:[0-9a-f]{64}$")
 LATENCY_DEFINITION = "end_to_end_http_json_parse_row_id_transfer"
 LATENCY_SCOPE = "end_to_end"
-QPS_DEFINITION = "single_client_sequential_completed_requests_per_measured_service_time"
+QPS_DEFINITION = "not_measured_by_single_client_latency_run"
 RECALL_CONTRACT = "distance_threshold_tie_aware_v1"
 MEASUREMENT_MODE = "single_client_sequential"
-MIN_CALIBRATION_LCB_MARGIN = 0.03
-ALLOWED_CALIBRATION_SELECTION_RULES = {
-    "fastest measured LCB-qualified configuration",
-    "HNSW: per strategy/filter ascending ef at cutoff 0 with highest-target or recomputable guarded flat-dominance early-stop; flat: one source-equivalent representative per filter; system target winner: lowest mean-latency measured LCB-qualified semantic configuration",
-    "calibration-only: select lowest mean-latency complete configuration with recall LCB95 >= target + min(predeclared absolute margin, remaining recall headroom / 2); fallback only to complete calibration exact-flat representative; held-out final evidence cannot reselect",
-}
-ALLOWED_TARGET_STATUSES = {"selected", "unattainable_on_grid"}
-ALLOWED_TARGET_OUTCOMES = {
-    "selected_and_confirmed",
-    "selected_but_final_unconfirmed",
-}
+CALIBRATION_SELECTION_POLICY = "calibration_lcb95_then_max_mean_recall_v1"
+CALIBRATION_SELECTION_RULE = (
+    "calibration-only: select the lowest mean-latency complete HNSW configuration "
+    "with bootstrap recall LCB95 >= target; only when no LCB-qualified HNSW "
+    "configuration exists and both strategy EF grids are fully exhausted, select "
+    "the highest calibration mean recall with latency as the tie-break; held-out "
+    "final evidence cannot reselect"
+)
+CALIBRATION_STOP_METRIC = "recall_lcb95"
+CALIBRATION_FALLBACK = "max_calibration_mean_recall_after_full_hnsw_grid"
+LCB_SELECTION_MODE = "calibration_lcb95_qualified_fastest"
+FALLBACK_SELECTION_MODE = "calibration_max_mean_recall_fallback"
+ALLOWED_TARGET_STATUSES = {"selected"}
+ALLOWED_TARGET_OUTCOMES = {"selected_and_confirmed"}
 REQUIRED_SOURCE_HASHES = {
-    "runner", "baseline_runner", "filters_csv", "truth_csv", "fbin",
+    "runner", "baseline_runner", "filters_csv", "truth_csv", "truth_manifest",
+    "fbin", "import_manifest", "query_cohort_csv", "query_cohort_manifest",
+    "import_attributes_csv",
 }
+FORMAL_REQUIRED_SOURCE_HASHES = {
+    *REQUIRED_SOURCE_HASHES,
+    "calibration_workload_csv",
+    "measurement_workload_csv",
+}
+CURRENT_PROTOCOL = "amazon10m_current_corpus_q10200_truth_weaviate_v2"
+LEGACY_CURRENT_PROTOCOL = "amazon10m_current_corpus_q10200_truth_weaviate_v1"
+TIMED_RESPONSE_FIELDS = ["row_id", "_additional.distance"]
 
 
 class ValidationFailure(ValueError):
@@ -172,6 +193,13 @@ def _csv_true(value: Any, label: str) -> None:
         raise ValidationFailure(f"{label} must be true, got {value!r}")
 
 
+def _csv_bool_value(value: Any, label: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized not in {"true", "false"}:
+        raise ValidationFailure(f"{label} must be true or false, got {value!r}")
+    return normalized == "true"
+
+
 def _csv_zero(value: Any, label: str) -> None:
     try:
         result = int(str(value))
@@ -234,10 +262,19 @@ def _expected_filters(path: Path) -> tuple[list[str], str]:
 
 def _validate_hashes(value: Any, label: str) -> dict[str, str]:
     hashes = dict(_mapping(value, label))
-    if set(hashes) != REQUIRED_SOURCE_HASHES:
+    keys = frozenset(hashes)
+    if keys not in {
+        frozenset(REQUIRED_SOURCE_HASHES),
+        frozenset(FORMAL_REQUIRED_SOURCE_HASHES),
+    }:
+        expected = (
+            FORMAL_REQUIRED_SOURCE_HASHES
+            if {"calibration_workload_csv", "measurement_workload_csv"} & set(hashes)
+            else REQUIRED_SOURCE_HASHES
+        )
         raise ValidationFailure(
-            f"{label} keys mismatch: missing={sorted(REQUIRED_SOURCE_HASHES - set(hashes))} "
-            f"extra={sorted(set(hashes) - REQUIRED_SOURCE_HASHES)}"
+            f"{label} keys mismatch: missing={sorted(expected - set(hashes))} "
+            f"extra={sorted(set(hashes) - expected)}"
         )
     for name, digest in hashes.items():
         if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
@@ -383,7 +420,7 @@ def _candidate_universe(
 
 
 def _query_cohorts(
-    manifest_path: Path, config: Mapping[str, Any]
+    manifest_path: Path, config: Mapping[str, Any], execution_protocol: str
 ) -> dict[str, list[int] | bool]:
     calibration = _mapping(config.get("calibration"), f"{manifest_path}: config.calibration")
     final = _mapping(config.get("final"), f"{manifest_path}: config.final")
@@ -397,15 +434,120 @@ def _query_cohorts(
         f"{manifest_path}: config.final.query_nos",
         allow_zero=True,
     )
-    if calibration_query_nos != list(EXPECTED_CALIBRATION_QUERY_NOS):
-        raise ValidationFailure(f"{manifest_path}: calibration cohort is not exactly q20..99")
-    if final_query_nos != list(EXPECTED_FINAL_QUERY_NOS):
-        raise ValidationFailure(f"{manifest_path}: final cohort is not exactly q100..199")
+    if execution_protocol == FORMAL_EXECUTION_PROTOCOL:
+        expected_calibration = list(FORMAL_CALIBRATION_QUERY_NOS)
+        expected_final = list(FORMAL_FINAL_QUERY_NOS)
+        expected_calibration_requests = list(FORMAL_CALIBRATION_REQUEST_NOS)
+        expected_final_requests = list(FORMAL_FINAL_REQUEST_NOS)
+        calibration_request_nos = _normal_int_list(
+            calibration.get("request_nos"),
+            f"{manifest_path}: config.calibration.request_nos",
+            allow_zero=True,
+        )
+        final_request_nos = _normal_int_list(
+            final.get("request_nos"),
+            f"{manifest_path}: config.final.request_nos",
+            allow_zero=True,
+        )
+        if calibration_request_nos != expected_calibration_requests:
+            raise ValidationFailure(
+                f"{manifest_path}: formal calibration request_no coverage is not q200"
+            )
+        if final_request_nos != expected_final_requests:
+            raise ValidationFailure(
+                f"{manifest_path}: formal final request_no coverage is not q10k"
+            )
+    else:
+        expected_calibration = list(EXPECTED_CALIBRATION_QUERY_NOS)
+        expected_final = list(EXPECTED_FINAL_QUERY_NOS)
+        calibration_request_nos = expected_calibration
+        final_request_nos = expected_final
+    if calibration_query_nos != expected_calibration:
+        raise ValidationFailure(f"{manifest_path}: calibration query cohort is incompatible")
+    if final_query_nos != expected_final:
+        raise ValidationFailure(f"{manifest_path}: final query cohort is incompatible")
     return {
-        "reserved_query_nos": list(range(20)),
+        "reserved_query_nos": (
+            [] if execution_protocol == FORMAL_EXECUTION_PROTOCOL else list(range(20))
+        ),
+        "calibration_request_nos": calibration_request_nos,
+        "final_request_nos": final_request_nos,
         "calibration_query_nos": calibration_query_nos,
         "final_query_nos": final_query_nos,
-        "query_no_overlap": False,
+        "query_no_overlap": not bool(
+            set(calibration_query_nos) & set(final_query_nos)
+        ),
+    }
+
+
+def _frozen_workload_contract(
+    manifest_path: Path,
+    record: Mapping[str, Any],
+    *,
+    label: str,
+    expected_split: str,
+    expected_requests: int,
+    expected_query_nos: Sequence[int],
+    expected_sha256: str,
+) -> dict[str, Any]:
+    path = _resolve_recorded_path(manifest_path, record.get("path"), label)
+    if record.get("sha256") != expected_sha256 or sha256_file(path) != expected_sha256:
+        raise ValidationFailure(f"{manifest_path}: {label} SHA256 mismatch")
+    fields, rows = _read_csv(path, label)
+    required = {"request_no", "query_no", "query_id", "filter_name", "split"}
+    if not required <= set(fields):
+        raise ValidationFailure(
+            f"{manifest_path}: {label} lacks fields {sorted(required - set(fields))}"
+        )
+    if len(rows) != expected_requests:
+        raise ValidationFailure(
+            f"{manifest_path}: {label} expected {expected_requests} rows, got {len(rows)}"
+        )
+    requests: list[dict[str, Any]] = []
+    for number, row in enumerate(rows, start=2):
+        try:
+            request = {
+                "request_no": int(row["request_no"]),
+                "query_no": int(row["query_no"]),
+                "query_id": int(row["query_id"]),
+                "filter_name": str(row["filter_name"]),
+            }
+        except (TypeError, ValueError) as exc:
+            raise ValidationFailure(
+                f"{manifest_path}: malformed {label} row {number}"
+            ) from exc
+        if row["split"] != expected_split or not request["filter_name"]:
+            raise ValidationFailure(
+                f"{manifest_path}: invalid split/filter in {label} row {number}"
+            )
+        requests.append(request)
+    expected_request_nos = set(range(expected_requests))
+    expected_queries = {int(value) for value in expected_query_nos}
+    observed_request_nos = {request["request_no"] for request in requests}
+    observed_query_nos = {request["query_no"] for request in requests}
+    if (
+        observed_request_nos != expected_request_nos
+        or len(observed_request_nos) != len(requests)
+        or observed_query_nos != expected_queries
+        or len(observed_query_nos) != len(requests)
+    ):
+        raise ValidationFailure(
+            f"{manifest_path}: {label} request/query coverage is incomplete"
+        )
+    filters = {request["filter_name"] for request in requests}
+    if len(filters) != EXPECTED_FILTERS:
+        raise ValidationFailure(
+            f"{manifest_path}: {label} must cover {EXPECTED_FILTERS} filters"
+        )
+    return {
+        "path": str(path),
+        "sha256": expected_sha256,
+        "split": expected_split,
+        "requests": requests,
+        "request_counts_by_filter": {
+            name: sum(request["filter_name"] == name for request in requests)
+            for name in sorted(filters)
+        },
     }
 
 
@@ -423,6 +565,146 @@ def _run_contract(
         raise ValidationFailure(f"{manifest_path}: config.filter_names is empty or duplicated")
     if config.get("source_hashes") != source_hashes:
         raise ValidationFailure(f"{manifest_path}: config source_hashes do not match manifest")
+    current_protocol = manifest.get("current_protocol")
+    execution_protocol = (
+        manifest.get("execution_protocol")
+        or config.get("execution_protocol")
+        or (
+            LEGACY_EXECUTION_PROTOCOL
+            if current_protocol == LEGACY_CURRENT_PROTOCOL else None
+        )
+    )
+    if execution_protocol not in {
+        FORMAL_EXECUTION_PROTOCOL, LEGACY_EXECUTION_PROTOCOL
+    }:
+        raise ValidationFailure(f"{manifest_path}: execution protocol is missing")
+    expected_current_protocol = (
+        CURRENT_PROTOCOL
+        if execution_protocol == FORMAL_EXECUTION_PROTOCOL
+        else LEGACY_CURRENT_PROTOCOL
+    )
+    if (
+        current_protocol != expected_current_protocol
+        or config.get("current_protocol") != expected_current_protocol
+    ):
+        raise ValidationFailure(f"{manifest_path}: current protocol identity is missing")
+    if (
+        execution_protocol == FORMAL_EXECUTION_PROTOCOL
+        and (
+            manifest.get("execution_protocol") != execution_protocol
+            or config.get("execution_protocol") != execution_protocol
+        )
+    ):
+        raise ValidationFailure(f"{manifest_path}: formal execution protocol is not explicit")
+    required_hashes = (
+        FORMAL_REQUIRED_SOURCE_HASHES
+        if execution_protocol == FORMAL_EXECUTION_PROTOCOL
+        else REQUIRED_SOURCE_HASHES
+    )
+    if set(source_hashes) != required_hashes:
+        raise ValidationFailure(
+            f"{manifest_path}: source hashes do not match execution protocol"
+        )
+    formal = execution_protocol == FORMAL_EXECUTION_PROTOCOL
+    manifest_inputs = _mapping(
+        manifest.get("input_provenance"), f"{manifest_path}: manifest.input_provenance"
+    )
+    config_inputs = _mapping(
+        config.get("input_provenance"), f"{manifest_path}: config.input_provenance"
+    )
+    if _canonical(manifest_inputs) != _canonical(config_inputs):
+        raise ValidationFailure(f"{manifest_path}: input provenance differs across outputs")
+    if manifest_inputs.get("protocol") != expected_current_protocol:
+        raise ValidationFailure(f"{manifest_path}: input provenance protocol is incompatible")
+    provenance_hash_fields = {
+        "truth_manifest": "truth_manifest",
+        "import_manifest": "import_manifest",
+        "truth_csv": "truth_csv",
+        "filters_csv": "filters_csv",
+        "vectors_fbin": "fbin",
+        "query_cohort_csv": "query_cohort_csv",
+        "query_cohort_manifest": "query_cohort_manifest",
+        "import_attributes_csv": "import_attributes_csv",
+    }
+    if execution_protocol == FORMAL_EXECUTION_PROTOCOL:
+        provenance_hash_fields.update({
+            "calibration_workload_csv": "calibration_workload_csv",
+            "measurement_workload_csv": "measurement_workload_csv",
+        })
+    for record_name, hash_name in provenance_hash_fields.items():
+        record = _mapping(
+            manifest_inputs.get(record_name),
+            f"{manifest_path}: input_provenance.{record_name}",
+        )
+        digest = record.get("sha256")
+        if digest != source_hashes[hash_name]:
+            raise ValidationFailure(
+                f"{manifest_path}: {record_name} hash is not bound to source_hashes"
+            )
+        if not isinstance(record.get("path"), str) or not record["path"]:
+            raise ValidationFailure(
+                f"{manifest_path}: input_provenance.{record_name}.path is missing"
+            )
+    workloads: dict[str, Any] | None = None
+    if formal:
+        workloads = {
+            "calibration": _frozen_workload_contract(
+                manifest_path,
+                _mapping(
+                    manifest_inputs.get("calibration_workload_csv"),
+                    f"{manifest_path}: calibration workload provenance",
+                ),
+                label="calibration workload",
+                expected_split="calibration",
+                expected_requests=len(FORMAL_CALIBRATION_REQUEST_NOS),
+                expected_query_nos=FORMAL_CALIBRATION_QUERY_NOS,
+                expected_sha256=source_hashes["calibration_workload_csv"],
+            ),
+            "measurement": _frozen_workload_contract(
+                manifest_path,
+                _mapping(
+                    manifest_inputs.get("measurement_workload_csv"),
+                    f"{manifest_path}: measurement workload provenance",
+                ),
+                label="measurement workload",
+                expected_split="measurement",
+                expected_requests=len(FORMAL_FINAL_REQUEST_NOS),
+                expected_query_nos=FORMAL_FINAL_QUERY_NOS,
+                expected_sha256=source_hashes["measurement_workload_csv"],
+            ),
+        }
+    corpus_gates = _mapping(
+        manifest_inputs.get("corpus_gates"),
+        f"{manifest_path}: input_provenance.corpus_gates",
+    )
+    for field, expected in (
+        ("rows", EXPECTED_ROWS),
+        ("candidate_rows", EXPECTED_CANDIDATE_ROWS),
+        ("filter_count_coverage", EXPECTED_FILTERS),
+        ("complete_filter_matrix", EXPECTED_FILTERS),
+    ):
+        _exact_int(
+            corpus_gates.get(field), expected,
+            f"{manifest_path}: input_provenance.corpus_gates.{field}",
+        )
+    timed_response = _mapping(
+        config.get("timed_graphql_response"),
+        f"{manifest_path}: config.timed_graphql_response",
+    )
+    if (
+        timed_response.get("fields") != TIMED_RESPONSE_FIELDS
+        or timed_response.get("all_scalar_properties_requested") is not False
+    ):
+        raise ValidationFailure(f"{manifest_path}: timed GraphQL payload is not minimal")
+    throughput = _mapping(
+        config.get("throughput"), f"{manifest_path}: config.throughput"
+    )
+    if (
+        throughput.get("qps_measured") is not False
+        or throughput.get("definition") != QPS_DEFINITION
+        or throughput.get("latency_reciprocal_is_not_measured_qps") is not True
+    ):
+        raise ValidationFailure(f"{manifest_path}: QPS reporting contract is invalid")
     run_spec_hash = manifest.get("run_spec_hash")
     if not isinstance(run_spec_hash, str) or not SHA256_RE.fullmatch(run_spec_hash):
         raise ValidationFailure(f"{manifest_path}: run_spec_hash is invalid")
@@ -464,46 +746,64 @@ def _run_contract(
     calibration = _mapping(config.get("calibration"), f"{manifest_path}: config.calibration")
     final = _mapping(config.get("final"), f"{manifest_path}: config.final")
     checkpoint = _mapping(config.get("checkpoint"), f"{manifest_path}: config.checkpoint")
+    calibration_queries = (
+        len(FORMAL_CALIBRATION_QUERY_NOS)
+        if formal else len(EXPECTED_CALIBRATION_QUERY_NOS)
+    )
+    final_queries = (
+        len(FORMAL_FINAL_QUERY_NOS) if formal else len(EXPECTED_FINAL_QUERY_NOS)
+    )
+    calibration_repeats = FORMAL_CALIBRATION_REPEATS if formal else 2
+    final_repeats = FORMAL_FINAL_REPEATS if formal else 5
     _exact_int(
         calibration.get("queries"),
-        len(EXPECTED_CALIBRATION_QUERY_NOS),
+        calibration_queries,
         f"{manifest_path}: calibration.queries",
     )
-    _exact_int(calibration.get("repeats"), 2, f"{manifest_path}: calibration.repeats")
-    _exact_int(final.get("queries"), 100, f"{manifest_path}: final.queries")
-    _exact_int(final.get("repeats"), 5, f"{manifest_path}: final.repeats")
-    calibration_margin = calibration.get("conservative_lcb_margin")
-    if calibration_margin is not None:
-        margin = _positive_finite(
-            calibration_margin,
-            f"{manifest_path}: calibration.conservative_lcb_margin",
-            allow_zero=True,
-        )
-        if margin < MIN_CALIBRATION_LCB_MARGIN:
+    _exact_int(
+        calibration.get("repeats"), calibration_repeats,
+        f"{manifest_path}: calibration.repeats",
+    )
+    _exact_int(final.get("queries"), final_queries, f"{manifest_path}: final.queries")
+    _exact_int(final.get("repeats"), final_repeats, f"{manifest_path}: final.repeats")
+    required_calibration_contract = {
+        "selection_rule": CALIBRATION_SELECTION_RULE,
+        "selection_policy": CALIBRATION_SELECTION_POLICY,
+        "qualification_metric": CALIBRATION_STOP_METRIC,
+        "qualification_operator": ">= target",
+        "bootstrap_ci_lcb": "qualification_and_early_stop",
+        "fallback": CALIBRATION_FALLBACK,
+        "fallback_requires_full_hnsw_grid": True,
+        "early_stop_metric": CALIBRATION_STOP_METRIC,
+        "early_stop_target": EXPECTED_TARGETS[-1],
+    }
+    for field, expected in required_calibration_contract.items():
+        actual = calibration.get(field)
+        if actual != expected:
             raise ValidationFailure(
-                f"{manifest_path}: calibration margin is below the publication minimum"
+                f"{manifest_path}: calibration.{field} does not prove the formal "
+                f"LCB95 selection protocol: expected={expected!r} actual={actual!r}"
             )
-        if calibration.get("selection_policy") != "calibration_lcb95_target_plus_headroom_capped_absolute_margin_v1":
-            raise ValidationFailure(f"{manifest_path}: calibration selection policy is invalid")
-        if calibration.get("fallback") != "complete_calibration_exact_flat_representative":
-            raise ValidationFailure(f"{manifest_path}: calibration fallback is invalid")
-    elif calibration.get("selection_policy") or calibration.get("fallback"):
-        raise ValidationFailure(f"{manifest_path}: incomplete calibration selection policy")
     for field, expected in (
         ("runs_selected_system_configs_plus_flat_exactness_controls", True),
-        ("reuses_one_exact_measurement_for_multiple_targets", True),
+        ("reuses_one_exact_measurement_for_multiple_targets", not formal),
         ("retunes_after_held_out_measurement", False),
     ):
         if final.get(field) is not expected:
             raise ValidationFailure(f"{manifest_path}: final.{field} is incompatible")
     dedupe = final.get("deduplication_key")
-    if dedupe != ["configured_filter_strategy", "filter_name", "flat_search_cutoff", "ef"]:
+    expected_dedupe = [
+        "configured_filter_strategy", "filter_name", "flat_search_cutoff", "ef",
+    ] + (["target_recall"] if formal else [])
+    if dedupe != expected_dedupe:
         raise ValidationFailure(f"{manifest_path}: final deduplication contract is incompatible")
+    if formal and final.get("target_specific_measurement") is not True:
+        raise ValidationFailure(
+            f"{manifest_path}: formal final must measure every target independently"
+        )
     for field in ("schedule_order", "selection_rule"):
         if not isinstance(calibration.get(field), str) or not calibration[field]:
             raise ValidationFailure(f"{manifest_path}: calibration.{field} is missing")
-    if calibration["selection_rule"] not in ALLOWED_CALIBRATION_SELECTION_RULES:
-        raise ValidationFailure(f"{manifest_path}: calibration selection rule is unknown")
     checkpoint_contract = {
         field: checkpoint.get(field)
         for field in ("persistence", "storage", "complete_block_boundary")
@@ -531,6 +831,9 @@ def _run_contract(
         "class": config.get("class"),
         "git_revision": config.get("git_revision"),
         "source_hashes": dict(source_hashes),
+        "current_protocol": expected_current_protocol,
+        "execution_protocol": execution_protocol,
+        "input_provenance": dict(manifest_inputs),
         "vector_rows": EXPECTED_ROWS,
         "dimensions": dimensions,
         "k": EXPECTED_K,
@@ -541,17 +844,25 @@ def _run_contract(
         "hnsw_dominance_guard": dominance_guard,
         "service_identity": dict(identity),
         "measurement_mode": MEASUREMENT_MODE,
+        "timed_graphql_response": dict(timed_response),
+        "throughput": dict(throughput),
         "calibration": {
-            "queries": len(EXPECTED_CALIBRATION_QUERY_NOS),
-            "repeats": 2,
+            "queries": calibration_queries,
+            "repeats": calibration_repeats,
             "schedule_order": calibration["schedule_order"],
             "selection_rule": calibration["selection_rule"],
-            "selection_policy": calibration.get("selection_policy", "legacy_unmargined"),
-            "conservative_lcb_margin": float(calibration_margin or 0.0),
-            "fallback": calibration.get("fallback", "none"),
+            "selection_policy": calibration["selection_policy"],
+            "qualification_metric": calibration["qualification_metric"],
+            "qualification_operator": calibration["qualification_operator"],
+            "bootstrap_ci_lcb": calibration["bootstrap_ci_lcb"],
+            "fallback": calibration["fallback"],
+            "fallback_requires_full_hnsw_grid": True,
+            "early_stop_metric": calibration["early_stop_metric"],
+            "early_stop_target": float(calibration["early_stop_target"]),
         },
         "final": dict(final),
         "checkpoint": checkpoint_contract,
+        "workloads": workloads,
     }
     if not isinstance(contract["class"], str) or not contract["class"]:
         raise ValidationFailure(f"{manifest_path}: config.class is missing")
@@ -561,7 +872,9 @@ def _run_contract(
         raise ValidationFailure(f"{manifest_path}: git_revision does not match config")
     contract["dataset"] = DATASET
     contract["candidate_universe"] = _candidate_universe(manifest_path, manifest, config)
-    contract["query_splits"] = _query_cohorts(manifest_path, config)
+    contract["query_splits"] = _query_cohorts(
+        manifest_path, config, execution_protocol
+    )
     contract["latency_scope"] = LATENCY_SCOPE
     contract["latency_definition"] = LATENCY_DEFINITION
     contract["runner_provenance"] = {
@@ -578,19 +891,52 @@ def _run_contract(
 
 
 def _validate_raw_rows(
-    manifest_path: Path, rows: Sequence[Mapping[str, str]], filters: set[str]
-) -> tuple[set[tuple[str, str, str, int, int]], dict[int, int]]:
+    manifest_path: Path,
+    rows: Sequence[Mapping[str, str]],
+    filters: set[str],
+    contract: Mapping[str, Any],
+) -> tuple[set[tuple[str, str, str, int, int, str]], dict[int, int]]:
+    formal = contract.get("execution_protocol") == FORMAL_EXECUTION_PROTOCOL
     required = {
         "phase", "configured_filter_strategy", "filter_name", "ef", "flat_search_cutoff",
         "query_no", "query_id", "repeat", "end_to_end_ms", "latency_definition",
         "recall_at_10", "recall_contract", "retry_count", "order_error", "valid", "error",
     }
+    if formal:
+        required.update({"request_no", "target_recall"})
     if not rows:
         raise ValidationFailure(f"{manifest_path}: raw CSV is empty")
     seen: set[tuple[str, ...]] = set()
-    final_blocks: set[tuple[str, str, str, int, int]] = set()
-    block_pairs: dict[tuple[str, str, str, int, int], set[tuple[int, int]]] = {}
+    final_blocks: set[tuple[str, str, str, int, int, str]] = set()
+    block_pairs: dict[
+        tuple[str, str, str, int, int, str], set[tuple[int, int, int]]
+    ] = {}
     query_ids: dict[int, int] = {}
+    workloads = contract.get("workloads")
+    expected_by_phase_filter: dict[
+        tuple[str, str], set[tuple[int, int]]
+    ] = {}
+    if formal:
+        if not isinstance(workloads, Mapping):
+            raise ValidationFailure(f"{manifest_path}: formal workload contract is missing")
+        for phase, workload_name in (
+            ("calibration", "calibration"),
+            ("final", "measurement"),
+        ):
+            workload = _mapping(
+                workloads.get(workload_name),
+                f"{manifest_path}: {workload_name} workload",
+            )
+            for request in _sequence(
+                workload.get("requests"),
+                f"{manifest_path}: {workload_name} requests",
+            ):
+                item = _mapping(request, f"{manifest_path}: workload request")
+                name = str(item["filter_name"])
+                if name in filters:
+                    expected_by_phase_filter.setdefault((phase, name), set()).add(
+                        (int(item["request_no"]), int(item["query_no"]))
+                    )
     for number, row in enumerate(rows, start=2):
         absent = sorted(field for field in required if field not in row)
         if absent:
@@ -601,7 +947,7 @@ def _validate_raw_rows(
         if missing:
             raise ValidationFailure(f"{manifest_path}: raw row {number} missing fields {missing}")
         phase = row["phase"]
-        if phase not in {"warmup", "calibration", "final"}:
+        if phase not in {"warmup", "final_warmup", "calibration", "final"}:
             raise ValidationFailure(f"{manifest_path}: raw row {number} has invalid phase {phase!r}")
         if row["filter_name"] not in filters:
             raise ValidationFailure(f"{manifest_path}: raw row {number} has foreign filter")
@@ -610,55 +956,75 @@ def _validate_raw_rows(
         if row["recall_contract"] != RECALL_CONTRACT:
             raise ValidationFailure(f"{manifest_path}: raw row {number} recall contract changed")
         _positive_finite(row["end_to_end_ms"], f"{manifest_path}: raw row {number} latency")
-        recall = _positive_finite(
-            row["recall_at_10"], f"{manifest_path}: raw row {number} recall", allow_zero=True
-        )
-        if recall > 1.0:
-            raise ValidationFailure(f"{manifest_path}: raw row {number} recall exceeds one")
-        _csv_true(row["valid"], f"{manifest_path}: raw row {number} valid")
-        _csv_zero(row["retry_count"], f"{manifest_path}: raw row {number} retry_count")
-        if row.get("error", "").strip() or row.get("order_error", "").strip():
-            raise ValidationFailure(f"{manifest_path}: raw row {number} records an error")
+        if phase in {"calibration", "final"}:
+            recall = _positive_finite(
+                row["recall_at_10"],
+                f"{manifest_path}: raw row {number} recall",
+                allow_zero=True,
+            )
+            if recall > 1.0:
+                raise ValidationFailure(f"{manifest_path}: raw row {number} recall exceeds one")
+            _csv_true(row["valid"], f"{manifest_path}: raw row {number} valid")
+            _csv_zero(row["retry_count"], f"{manifest_path}: raw row {number} retry_count")
+            if row.get("error", "").strip() or row.get("order_error", "").strip():
+                raise ValidationFailure(f"{manifest_path}: raw row {number} records an error")
         query_no = int(row["query_no"])
         query_id = int(row["query_id"])
+        request_no = int(row.get("request_no", query_no))
         repeat = int(row["repeat"])
         previous_query_id = query_ids.setdefault(query_no, query_id)
         if previous_query_id != query_id:
             raise ValidationFailure(
                 f"{manifest_path}: query_no {query_no} maps to multiple query_id values"
             )
+        target = str(row.get("target_recall", "N/A"))
+        if formal:
+            if phase == "calibration" and target != "N/A":
+                raise ValidationFailure(
+                    f"{manifest_path}: calibration row has a target"
+                )
+            if phase == "final" and target != "N/A":
+                _target(target, f"{manifest_path}: raw final target")
         block = (
             phase, row["configured_filter_strategy"], row["filter_name"],
             int(row["flat_search_cutoff"]), int(row["ef"]),
+            target if formal else "N/A",
         )
         key = (
             phase, row["configured_filter_strategy"], row["filter_name"],
-            row["flat_search_cutoff"], row["ef"], row["query_no"], row["repeat"],
+            row["flat_search_cutoff"], row["ef"], target if formal else "N/A",
+            str(request_no), row["query_no"], row["repeat"],
         )
         if key in seen:
             raise ValidationFailure(f"{manifest_path}: duplicate raw measurement pair {key!r}")
         seen.add(key)
         if phase in {"calibration", "final"}:
-            block_pairs.setdefault(block, set()).add((query_no, repeat))
+            block_pairs.setdefault(block, set()).add((request_no, query_no, repeat))
         if phase == "final":
             final_blocks.add(block)
     for block, pairs in block_pairs.items():
-        expected_queries, expected_repeats = (
-            (len(EXPECTED_CALIBRATION_QUERY_NOS), 2)
-            if block[0] == "calibration"
-            else (len(EXPECTED_FINAL_QUERY_NOS), 5)
+        phase, _, filter_name, _, _, _ = block
+        expected_repeats = (
+            int(contract["calibration"]["repeats"])
+            if phase == "calibration"
+            else int(contract["final"]["repeats"])
         )
-        expected_query_nos = (
-            EXPECTED_CALIBRATION_QUERY_NOS
-            if block[0] == "calibration"
-            else EXPECTED_FINAL_QUERY_NOS
-        )
+        if formal:
+            expected_requests = expected_by_phase_filter.get((phase, filter_name), set())
+        else:
+            expected_query_nos = (
+                EXPECTED_CALIBRATION_QUERY_NOS
+                if phase == "calibration" else EXPECTED_FINAL_QUERY_NOS
+            )
+            expected_requests = {
+                (query_no, query_no) for query_no in expected_query_nos
+            }
         expected_pairs = {
-            (query_no, repeat)
-            for query_no in expected_query_nos
+            (request_no, query_no, repeat)
+            for request_no, query_no in expected_requests
             for repeat in range(expected_repeats)
         }
-        if pairs != expected_pairs or len(pairs) != expected_queries * expected_repeats:
+        if pairs != expected_pairs or len(pairs) != len(expected_pairs):
             raise ValidationFailure(
                 f"{manifest_path}: missing/duplicate raw pairs for block {block!r}: "
                 f"expected={len(expected_pairs)} observed={len(pairs)}"
@@ -672,6 +1038,24 @@ def _validate_target_records(
     selection = _mapping(
         manifest.get("calibration_selection"), f"{manifest_path}: calibration_selection"
     )
+    required_selection_evidence = {
+        "rule": CALIBRATION_SELECTION_RULE,
+        "selection_policy": CALIBRATION_SELECTION_POLICY,
+        "qualification_metric": CALIBRATION_STOP_METRIC,
+        "qualification_operator": ">= target",
+        "bootstrap_ci_lcb": "qualification_and_early_stop",
+        "lcb_is_report_only": False,
+        "fallback": CALIBRATION_FALLBACK,
+        "fallback_requires_full_hnsw_grid": True,
+        "early_stop_metric": CALIBRATION_STOP_METRIC,
+        "early_stop_target": EXPECTED_TARGETS[-1],
+    }
+    for field, expected in required_selection_evidence.items():
+        if selection.get(field) != expected:
+            raise ValidationFailure(
+                f"{manifest_path}: calibration_selection.{field} does not prove "
+                f"the formal LCB95 protocol"
+            )
     records = _sequence(selection.get("targets"), f"{manifest_path}: calibration_selection.targets")
     target_map: dict[tuple[str, float], dict[str, Any]] = {}
     normalized: list[dict[str, Any]] = []
@@ -687,10 +1071,49 @@ def _validate_target_records(
         status = record.get("status")
         if status not in ALLOWED_TARGET_STATUSES:
             raise ValidationFailure(f"{manifest_path}: invalid target status for {key!r}: {status!r}")
-        if status == "selected":
-            for field in ("selected_filter_strategy", "selected_ef", "selected_flat_search_cutoff"):
-                if record.get(field) in (None, "", "N/A"):
-                    raise ValidationFailure(f"{manifest_path}: selected target {key!r} lacks {field}")
+        for field in (
+            "selected_filter_strategy", "selected_ef", "selected_flat_search_cutoff",
+            "selection_mode", "calibration_selection_policy",
+            "calibration_recall_mean", "calibration_recall_lcb95",
+            "calibration_lcb95_qualified", "fallback_used",
+        ):
+            if record.get(field) in (None, "", "N/A"):
+                raise ValidationFailure(f"{manifest_path}: selected target {key!r} lacks {field}")
+        if record["calibration_selection_policy"] != CALIBRATION_SELECTION_POLICY:
+            raise ValidationFailure(
+                f"{manifest_path}: selected target {key!r} has the wrong LCB policy"
+            )
+        mean = _positive_finite(
+            record["calibration_recall_mean"],
+            f"{manifest_path}: selected target {key!r} calibration_recall_mean",
+            allow_zero=True,
+        )
+        lcb = _positive_finite(
+            record["calibration_recall_lcb95"],
+            f"{manifest_path}: selected target {key!r} calibration_recall_lcb95",
+            allow_zero=True,
+        )
+        if mean > 1.0 or lcb > mean:
+            raise ValidationFailure(
+                f"{manifest_path}: selected target {key!r} has invalid recall evidence"
+            )
+        mode = record["selection_mode"]
+        if mode == LCB_SELECTION_MODE:
+            if (record["calibration_lcb95_qualified"] is not True
+                    or record["fallback_used"] is not False or lcb < target):
+                raise ValidationFailure(
+                    f"{manifest_path}: selected target {key!r} lacks LCB95 qualification"
+                )
+        elif mode == FALLBACK_SELECTION_MODE:
+            if (record["calibration_lcb95_qualified"] is not False
+                    or record["fallback_used"] is not True or lcb >= target):
+                raise ValidationFailure(
+                    f"{manifest_path}: selected target {key!r} has an invalid fallback claim"
+                )
+        else:
+            raise ValidationFailure(
+                f"{manifest_path}: selected target {key!r} has unknown selection mode {mode!r}"
+            )
         normalized_record = {**record, "filter_name": str(name), "target_recall": target}
         target_map[key] = normalized_record
         normalized.append(normalized_record)
@@ -708,7 +1131,21 @@ def _validate_summary_rows(
     rows: Sequence[Mapping[str, str]],
     filters: set[str],
     target_map: Mapping[tuple[str, float], Mapping[str, Any]],
+    contract: Mapping[str, Any],
 ) -> dict[str, int]:
+    formal = contract.get("execution_protocol") == FORMAL_EXECUTION_PROTOCOL
+    workload_counts: dict[tuple[str, str], int] = {}
+    if formal:
+        workloads = _mapping(contract.get("workloads"), "formal workload contract")
+        for phase, name in (("calibration", "calibration"), ("final", "measurement")):
+            workload = _mapping(workloads.get(name), f"{name} workload")
+            counts = _mapping(
+                workload.get("request_counts_by_filter"),
+                f"{name} request counts",
+            )
+            workload_counts.update(
+                {(phase, str(filter_name)): int(count) for filter_name, count in counts.items()}
+            )
     required = {
         "phase", "configured_filter_strategy", "filter_name", "ef", "flat_search_cutoff",
         "expected_queries", "expected_repeats", "expected_samples", "observed_samples",
@@ -718,10 +1155,16 @@ def _validate_summary_rows(
         "latency_p99_ms", "latency_ci95_low_ms", "latency_ci95_high_ms",
         "single_client_service_qps", "target_recall", "target_status", "target_outcome",
         "comparison_status", "selected_ef", "selected_flat_search_cutoff",
+        "calibration_recall_mean", "calibration_recall_lcb95",
+        "calibration_selection_policy", "selection_mode",
+        "calibration_lcb95_qualified", "fallback_used", "qps_measured",
     }
     if not rows:
         raise ValidationFailure(f"{manifest_path}: summary CSV is empty")
     calibration_blocks: set[tuple[str, str, int, int]] = set()
+    calibration_rows: dict[str, list[Mapping[str, str]]] = {
+        name: [] for name in filters
+    }
     final_pairs: dict[tuple[str, float], Mapping[str, str]] = {}
     outcomes = {
         "selected_and_confirmed": 0,
@@ -746,6 +1189,14 @@ def _validate_summary_rows(
             raise ValidationFailure(f"{manifest_path}: summary row {number} timing contract changed")
         if row["service_qps_definition"] != QPS_DEFINITION:
             raise ValidationFailure(f"{manifest_path}: summary row {number} QPS contract changed")
+        if _csv_bool_value(
+            row["qps_measured"], f"{manifest_path}: summary row {number} qps_measured"
+        ):
+            raise ValidationFailure(f"{manifest_path}: summary row {number} claims measured QPS")
+        if row["single_client_service_qps"] not in {"", "N/A"}:
+            raise ValidationFailure(
+                f"{manifest_path}: summary row {number} derives QPS from latency"
+            )
         expected_queries = int(row["expected_queries"])
         expected_repeats = int(row["expected_repeats"])
         expected_samples = int(row["expected_samples"])
@@ -753,9 +1204,17 @@ def _validate_summary_rows(
         if expected_samples != expected_queries * expected_repeats or observed_samples != expected_samples:
             raise ValidationFailure(f"{manifest_path}: summary row {number} sample pairs are incomplete")
         expected_contract = (
-            (len(EXPECTED_CALIBRATION_QUERY_NOS), 2)
-            if phase == "calibration"
-            else (len(EXPECTED_FINAL_QUERY_NOS), 5)
+            (
+                workload_counts[(phase, row["filter_name"])],
+                FORMAL_CALIBRATION_REPEATS
+                if phase == "calibration" else FORMAL_FINAL_REPEATS,
+            )
+            if formal else
+            (
+                (len(EXPECTED_CALIBRATION_QUERY_NOS), 2)
+                if phase == "calibration"
+                else (len(EXPECTED_FINAL_QUERY_NOS), 5)
+            )
         )
         if (expected_queries, expected_repeats) != expected_contract:
             raise ValidationFailure(
@@ -769,9 +1228,13 @@ def _validate_summary_rows(
             )
             if metric > 1.0:
                 raise ValidationFailure(f"{manifest_path}: summary row {number} {field} exceeds one")
+        if float(row["recall_lcb95"]) > float(row["recall_mean"]):
+            raise ValidationFailure(
+                f"{manifest_path}: summary row {number} recall_lcb95 exceeds recall_mean"
+            )
         for field in (
             "latency_mean_ms", "latency_p50_ms", "latency_p95_ms", "latency_p99_ms",
-            "latency_ci95_low_ms", "latency_ci95_high_ms", "single_client_service_qps",
+            "latency_ci95_low_ms", "latency_ci95_high_ms",
         ):
             _positive_finite(row[field], f"{manifest_path}: summary row {number} {field}")
 
@@ -783,6 +1246,7 @@ def _validate_summary_rows(
             if key in calibration_blocks:
                 raise ValidationFailure(f"{manifest_path}: duplicate calibration summary block {key!r}")
             calibration_blocks.add(key)
+            calibration_rows[row["filter_name"]].append(row)
             if row["target_recall"] not in {"", "N/A"}:
                 raise ValidationFailure(f"{manifest_path}: calibration summary has a target pair")
             continue
@@ -811,9 +1275,116 @@ def _validate_summary_rows(
             != int(record["selected_flat_search_cutoff"])
         ):
             raise ValidationFailure(f"{manifest_path}: final target {pair!r} selection changed")
+        if row["selection_mode"] != record["selection_mode"]:
+            raise ValidationFailure(f"{manifest_path}: final target {pair!r} selection mode changed")
+        if row["calibration_selection_policy"] != CALIBRATION_SELECTION_POLICY:
+            raise ValidationFailure(f"{manifest_path}: final target {pair!r} LCB policy changed")
+        if _csv_bool_value(
+            row["calibration_lcb95_qualified"],
+            f"{manifest_path}: final target {pair!r} calibration_lcb95_qualified",
+        ) is not record["calibration_lcb95_qualified"]:
+            raise ValidationFailure(f"{manifest_path}: final target {pair!r} LCB status changed")
+        if _csv_bool_value(
+            row["fallback_used"], f"{manifest_path}: final target {pair!r} fallback_used",
+        ) is not record["fallback_used"]:
+            raise ValidationFailure(f"{manifest_path}: final target {pair!r} fallback status changed")
+        for field in ("calibration_recall_mean", "calibration_recall_lcb95"):
+            if not math.isclose(
+                float(row[field]), float(record[field]), rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValidationFailure(
+                    f"{manifest_path}: final target {pair!r} {field} changed"
+                )
         final_pairs[pair] = row
         outcomes[outcome] += 1
-    selected_pairs = {key for key, record in target_map.items() if record["status"] == "selected"}
+
+    expected_efs = [int(value) for value in contract["ef_values"]]
+    strategies = [str(value) for value in contract["configured_filter_strategies"]]
+    highest_target = max(EXPECTED_TARGETS)
+    for filter_name, candidates in calibration_rows.items():
+        hnsw = [row for row in candidates if int(row["flat_search_cutoff"]) == 0]
+        route_full: dict[str, bool] = {}
+        for strategy in strategies:
+            route = sorted(
+                (row for row in hnsw if row["configured_filter_strategy"] == strategy),
+                key=lambda row: int(row["ef"]),
+            )
+            measured = [int(row["ef"]) for row in route]
+            if not route or measured != expected_efs[:len(measured)]:
+                raise ValidationFailure(
+                    f"{manifest_path}: {filter_name}/{strategy} is not an ascending EF prefix"
+                )
+            qualifying = [
+                index for index, row in enumerate(route)
+                if float(row["recall_lcb95"]) >= highest_target
+            ]
+            if qualifying and qualifying[0] != len(route) - 1:
+                raise ValidationFailure(
+                    f"{manifest_path}: {filter_name}/{strategy} continued after the "
+                    "highest-target LCB95 early stop"
+                )
+            route_full[strategy] = measured == expected_efs
+
+        flat = [row for row in candidates if int(row["flat_search_cutoff"]) != 0]
+        if (len(flat) != 1 or float(flat[0]["recall_mean"]) != 1.0
+                or float(flat[0]["recall_lcb95"]) != 1.0):
+            raise ValidationFailure(
+                f"{manifest_path}: {filter_name} lacks one exact flat calibration control"
+            )
+
+        for target in EXPECTED_TARGETS:
+            record = target_map[(filter_name, target)]
+            qualified = [
+                row for row in hnsw if float(row["recall_lcb95"]) >= target
+            ]
+            if qualified:
+                expected = min(
+                    qualified,
+                    key=lambda row: (
+                        float(row["latency_mean_ms"]), int(row["flat_search_cutoff"]),
+                        int(row["ef"]), str(row["configured_filter_strategy"]),
+                    ),
+                )
+                expected_mode = LCB_SELECTION_MODE
+            else:
+                if not all(route_full.values()):
+                    raise ValidationFailure(
+                        f"{manifest_path}: {filter_name}/{target} used max-recall fallback "
+                        "before both HNSW EF grids were exhausted"
+                    )
+                expected = min(
+                    hnsw,
+                    key=lambda row: (
+                        -float(row["recall_mean"]), float(row["latency_mean_ms"]),
+                        int(row["ef"]), str(row["configured_filter_strategy"]),
+                    ),
+                )
+                expected_mode = FALLBACK_SELECTION_MODE
+            expected_identity = (
+                expected["configured_filter_strategy"], int(expected["ef"]),
+                int(expected["flat_search_cutoff"]),
+            )
+            recorded_identity = (
+                record["selected_filter_strategy"], int(record["selected_ef"]),
+                int(record["selected_flat_search_cutoff"]),
+            )
+            if recorded_identity != expected_identity or record["selection_mode"] != expected_mode:
+                raise ValidationFailure(
+                    f"{manifest_path}: {filter_name}/{target} does not match the "
+                    "recomputed LCB95-then-max-recall selection"
+                )
+            if not math.isclose(
+                float(record["calibration_recall_mean"]), float(expected["recall_mean"]),
+                rel_tol=0.0, abs_tol=1e-12,
+            ) or not math.isclose(
+                float(record["calibration_recall_lcb95"]), float(expected["recall_lcb95"]),
+                rel_tol=0.0, abs_tol=1e-12,
+            ):
+                raise ValidationFailure(
+                    f"{manifest_path}: {filter_name}/{target} calibration evidence "
+                    "does not match the selected block"
+                )
+    selected_pairs = set(target_map)
     if set(final_pairs) != selected_pairs:
         raise ValidationFailure(
             f"{manifest_path}: final target pair coverage mismatch: "
@@ -863,7 +1434,7 @@ def _validate_flat_gate(
     manifest_path: Path,
     manifest: Mapping[str, Any],
     filters: set[str],
-    final_blocks: set[tuple[str, str, str, int, int]],
+    final_blocks: set[tuple[str, str, str, int, int, str]],
 ) -> None:
     gate = _mapping(
         manifest.get("flat_held_out_exactness_gate"),
@@ -887,6 +1458,7 @@ def _validate_flat_gate(
         block = (
             "final", str(representative.get("configured_filter_strategy")), str(name),
             int(representative.get("flat_search_cutoff")), int(representative.get("ef")),
+            "N/A",
         )
         if block not in final_blocks:
             raise ValidationFailure(f"{manifest_path}: flat exactness block is missing for {name}")
@@ -903,6 +1475,10 @@ def _load_shard(manifest_path: Path, expected_filters_sha256: str) -> Shard:
         raise ValidationFailure(
             f"{manifest_path}: artifact_valid/status must be true/'complete'"
         )
+    if manifest.get("paper_eligible") is not True:
+        raise ValidationFailure(f"{manifest_path}: shard is not paper_eligible")
+    if manifest.get("publication_errors") != []:
+        raise ValidationFailure(f"{manifest_path}: shard has publication errors")
     if manifest.get("manifest_commit") != "atomic_last":
         raise ValidationFailure(f"{manifest_path}: manifest was not committed atomic-last")
     source_hashes = _validate_hashes(
@@ -932,15 +1508,36 @@ def _load_shard(manifest_path: Path, expected_filters_sha256: str) -> Shard:
         if number <= 0 or number > EXPECTED_ROWS:
             raise ValidationFailure(f"{manifest_path}: invalid service filter count for {name}")
     targets, target_map = _validate_target_records(manifest_path, manifest, filters)
-    final_blocks, query_ids = _validate_raw_rows(manifest_path, raw_rows, set(filters))
-    outcomes = _validate_summary_rows(
-        manifest_path, summary_rows, set(filters), target_map
+    final_blocks, query_ids = _validate_raw_rows(
+        manifest_path, raw_rows, set(filters), contract
     )
+    outcomes = _validate_summary_rows(
+        manifest_path, summary_rows, set(filters), target_map, contract
+    )
+    if contract["execution_protocol"] == FORMAL_EXECUTION_PROTOCOL:
+        release = _mapping(
+            manifest.get("release_scope"), f"{manifest_path}: release_scope"
+        )
+        if (
+            release.get("kind") != "formal_filter_target_shard"
+            or release.get("requested_slice_complete") is not True
+            or int(release.get("expected_filter_target_cells", -1))
+            != len(filters) * len(EXPECTED_TARGETS)
+            or int(release.get("observed_filter_target_cells", -1))
+            != len(filters) * len(EXPECTED_TARGETS)
+        ):
+            raise ValidationFailure(
+                f"{manifest_path}: formal requested-slice release gate is incomplete"
+            )
     declared_outcomes = _mapping(
         manifest.get("target_outcomes"), f"{manifest_path}: target_outcomes"
     )
     if dict(declared_outcomes) != outcomes:
         raise ValidationFailure(f"{manifest_path}: target outcome counts do not match rows")
+    if outcomes["selected_but_final_unconfirmed"] != 0:
+        raise ValidationFailure(
+            f"{manifest_path}: selected_but_final_unconfirmed cannot be published"
+        )
     _validate_flat_gate(manifest_path, manifest, set(filters), final_blocks)
     original_hash = _validate_schema_restore(
         manifest_path, manifest, config, schema, source_hashes
@@ -996,7 +1593,7 @@ def _raw_sort_key(row: Mapping[str, str], order: Mapping[str, int]) -> tuple[Any
     phase_order = {"warmup": 0, "calibration": 1, "final": 2}
     fields = (
         "schedule_index", "configured_filter_strategy", "flat_search_cutoff", "ef",
-        "query_no", "repeat", "query_id",
+        "target_recall", "request_no", "query_no", "repeat", "query_id",
     )
     return (
         order[row["filter_name"]], phase_order[row["phase"]],
@@ -1083,10 +1680,30 @@ def combine(
         raise ValidationFailure("shards do not attest the same original Weaviate schema")
     if len({shard.manifest.get("run_spec_hash") for shard in shards}) != EXPECTED_SHARDS:
         raise ValidationFailure("shard run_spec_hash values are not distinct")
-    for shard in shards[1:]:
-        if shard.query_ids != shards[0].query_ids:
+    formal = reference_contract["execution_protocol"] == FORMAL_EXECUTION_PROTOCOL
+    if not formal:
+        for shard in shards[1:]:
+            if shard.query_ids != shards[0].query_ids:
+                raise ValidationFailure(
+                    f"{shard.manifest_path}: query_id mapping/run contract is incompatible"
+                )
+    else:
+        combined_query_ids: dict[int, int] = {}
+        for shard in shards:
+            for query_no, query_id in shard.query_ids.items():
+                previous = combined_query_ids.setdefault(query_no, query_id)
+                if previous != query_id:
+                    raise ValidationFailure(
+                        f"{shard.manifest_path}: query_id mapping conflicts across shards"
+                    )
+        expected_query_ids = {
+            int(request["query_no"]): int(request["query_id"])
+            for workload in reference_contract["workloads"].values()
+            for request in workload["requests"]
+        }
+        if combined_query_ids != expected_query_ids:
             raise ValidationFailure(
-                f"{shard.manifest_path}: query_id mapping/run contract is incompatible"
+                "combined formal query mapping does not cover the frozen q200+q10k workloads"
             )
 
     all_filters = [name for shard in shards for name in shard.filters]
@@ -1116,6 +1733,147 @@ def combine(
             "selected_and_confirmed", "selected_but_final_unconfirmed", "unattainable_on_grid"
         )
     }
+    raw_identity_fields = (
+        "phase", "configured_filter_strategy", "filter_name",
+        "flat_search_cutoff", "ef",
+        *(("target_recall", "request_no") if formal else ()),
+        "query_no", "repeat",
+    )
+    raw_identities = [
+        tuple(str(row.get(field, "")) for field in raw_identity_fields)
+        for row in raw_rows
+    ]
+    raw_duplicate_count = len(raw_identities) - len(set(raw_identities))
+    summary_identity_fields = (
+        "phase", "configured_filter_strategy", "filter_name",
+        "flat_search_cutoff", "ef", "target_recall",
+    )
+    summary_identities = [
+        tuple(str(row.get(field, "")) for field in summary_identity_fields)
+        for row in summary_rows
+    ]
+    summary_duplicate_count = len(summary_identities) - len(set(summary_identities))
+    target_identities = [
+        (str(record["filter_name"]), float(record["target_recall"]))
+        for record in target_records
+    ]
+    target_duplicate_count = len(target_identities) - len(set(target_identities))
+    expected_targets = {
+        (name, target) for name in expected_filters for target in EXPECTED_TARGETS
+    }
+    missing_targets = sorted(expected_targets - set(target_identities))
+    extra_targets = sorted(set(target_identities) - expected_targets)
+    formal_target_coverage: dict[str, Any] = {}
+    formal_coverage_errors: list[str] = []
+    if formal:
+        measurement_requests = {
+            int(request["request_no"]): request
+            for request in reference_contract["workloads"]["measurement"]["requests"]
+        }
+        expected_pairs = {
+            (request_no, repeat)
+            for request_no in FORMAL_FINAL_REQUEST_NOS
+            for repeat in range(FORMAL_FINAL_REPEATS)
+        }
+        for target in EXPECTED_TARGETS:
+            rows = [
+                row for row in raw_rows
+                if row["phase"] == "final"
+                and math.isclose(
+                    float(row.get("target_recall", "nan")),
+                    target,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ]
+            observed: set[tuple[int, int]] = set()
+            mismatched = 0
+            for row in rows:
+                pair = int(row["request_no"]), int(row["repeat"])
+                request = measurement_requests.get(pair[0])
+                if (
+                    request is None
+                    or int(row["query_no"]) != int(request["query_no"])
+                    or int(row["query_id"]) != int(request["query_id"])
+                    or row["filter_name"] != request["filter_name"]
+                ):
+                    mismatched += 1
+                observed.add(pair)
+            missing = len(expected_pairs - observed)
+            extra = len(observed - expected_pairs)
+            duplicates_for_target = len(rows) - len(observed)
+            complete = not (
+                missing or extra or duplicates_for_target or mismatched
+            )
+            formal_target_coverage[str(target)] = {
+                "expected_samples": len(expected_pairs),
+                "observed_samples": len(rows),
+                "unique_request_repeat_pairs": len(observed),
+                "missing_pairs": missing,
+                "extra_pairs": extra,
+                "duplicate_pairs": duplicates_for_target,
+                "workload_mismatches": mismatched,
+                "complete": complete,
+            }
+            if not complete:
+                formal_coverage_errors.append(
+                    f"target={target} missing={missing} extra={extra} "
+                    f"duplicates={duplicates_for_target} mismatched={mismatched}"
+                )
+    if (
+        raw_duplicate_count
+        or summary_duplicate_count
+        or target_duplicate_count
+        or missing_targets
+        or extra_targets
+        or outcomes["selected_but_final_unconfirmed"]
+        or formal_coverage_errors
+    ):
+        raise ValidationFailure(
+            "combined coverage is incomplete: "
+            f"raw_duplicates={raw_duplicate_count} "
+            f"summary_duplicates={summary_duplicate_count} "
+            f"target_duplicates={target_duplicate_count} "
+            f"missing_targets={missing_targets} extra_targets={extra_targets} "
+            f"unconfirmed={outcomes['selected_but_final_unconfirmed']} "
+            f"formal_coverage_errors={formal_coverage_errors}"
+        )
+    combined_coverage = {
+        "complete": True,
+        "expected_shards": EXPECTED_SHARDS,
+        "observed_shards": len(shards),
+        "expected_filters": EXPECTED_FILTERS,
+        "observed_filters": len(all_filters),
+        "missing_filters": [],
+        "duplicate_filters": [],
+        "expected_target_pairs": len(expected_targets),
+        "observed_target_pairs": len(target_identities),
+        "missing_target_pairs": [],
+        "extra_target_pairs": [],
+        "duplicate_target_pairs": 0,
+        "raw_rows": len(raw_rows),
+        "duplicate_raw_measurement_keys": 0,
+        "summary_rows": len(summary_rows),
+        "duplicate_summary_keys": 0,
+        "required_source_hashes": sorted(
+            FORMAL_REQUIRED_SOURCE_HASHES if formal else REQUIRED_SOURCE_HASHES
+        ),
+        "source_hash_coverage": {
+            name: all(name in shard.manifest["source_hashes"] for shard in shards)
+            for name in sorted(
+                FORMAL_REQUIRED_SOURCE_HASHES if formal else REQUIRED_SOURCE_HASHES
+            )
+        },
+        "formal_filter_target_cells": (
+            EXPECTED_FILTERS * len(EXPECTED_TARGETS) if formal else None
+        ),
+        "formal_target_trace_coverage": formal_target_coverage,
+        "samples_per_target": (
+            len(FORMAL_FINAL_REQUEST_NOS) * FORMAL_FINAL_REPEATS if formal else None
+        ),
+        "zero_missing": True,
+        "zero_duplicate": True,
+    }
 
     out_prefix = Path(out_prefix).resolve()
     destinations = {
@@ -1141,11 +1899,12 @@ def combine(
             "source_hashes": shard.manifest.get("source_hashes"),
             "filters": shard.filters,
             "calibration_selection_policy": shard.config.get("calibration", {}).get(
-                "selection_policy", "legacy_unmargined"
+                "selection_policy"
             ),
-            "calibration_lcb_margin": shard.config.get("calibration", {}).get(
-                "conservative_lcb_margin", 0.0
+            "calibration_qualification_metric": shard.config.get("calibration", {}).get(
+                "qualification_metric"
             ),
+            "calibration_fallback": shard.config.get("calibration", {}).get("fallback"),
             "outputs": {
                 name: {
                     "path": str(shard.paths[name]),
@@ -1164,6 +1923,9 @@ def combine(
         "artifact": "weaviate_production_matched_recall_combined",
         "dataset": DATASET,
         "source_hashes": reference_contract["source_hashes"],
+        "current_protocol": reference_contract["current_protocol"],
+        "execution_protocol": reference_contract["execution_protocol"],
+        "input_provenance": reference_contract["input_provenance"],
         "run_contract": reference_contract,
         "filter_names": expected_filters,
         "targets": list(EXPECTED_TARGETS),
@@ -1183,15 +1945,18 @@ def combine(
                 "run_spec_hash": shard.manifest["run_spec_hash"],
                 "filters": shard.filters,
                 "calibration_selection_policy": shard.config.get("calibration", {}).get(
-                    "selection_policy", "legacy_unmargined"
+                    "selection_policy"
                 ),
-                "calibration_lcb_margin": shard.config.get("calibration", {}).get(
-                    "conservative_lcb_margin", 0.0
+                "calibration_qualification_metric": shard.config.get("calibration", {}).get(
+                    "qualification_metric"
                 ),
             }
             for shard in shards
         ],
         "measurement_mode": MEASUREMENT_MODE,
+        "timed_graphql_response": reference_contract["timed_graphql_response"],
+        "throughput": reference_contract["throughput"],
+        "coverage": combined_coverage,
     }
     original_schema = _mapping(
         _sequence(shards[0].schema["records"], "schema records")[0], "original record"
@@ -1227,11 +1992,18 @@ def combine(
         combined_manifest = {
             "artifact": "weaviate_production_matched_recall_combined",
             "artifact_valid": True,
+            "paper_eligible": True,
+            "requested_slice_complete": True,
+            "full_release_complete": True,
             "status": "complete",
             "manifest_commit": "atomic_last",
             "validation_errors": [],
+            "publication_errors": [],
             "dataset": DATASET,
             "source_hashes": reference_contract["source_hashes"],
+            "current_protocol": reference_contract["current_protocol"],
+            "execution_protocol": reference_contract["execution_protocol"],
+            "input_provenance": reference_contract["input_provenance"],
             "measurement_runner_sha256": reference_contract["source_hashes"]["runner"],
             "expected_filters_csv": {
                 "path": str(Path(expected_filters_csv).resolve()),
@@ -1248,6 +2020,8 @@ def combine(
             },
             "latency_scope": LATENCY_SCOPE,
             "latency_definition": LATENCY_DEFINITION,
+            "timed_graphql_response": reference_contract["timed_graphql_response"],
+            "throughput": reference_contract["throughput"],
             "runner_provenance": reference_contract["runner_provenance"],
             "service_provenance": reference_contract["service_provenance"],
             "software_versions": {
@@ -1270,8 +2044,13 @@ def combine(
             "calibration_selection": {
                 "targets": target_records,
                 "scope": "exactly one explicit status per filter/target",
-                "policy": "per-shard policy is recorded; held-out final evidence is confirmation-only",
-                "minimum_calibration_lcb_margin": MIN_CALIBRATION_LCB_MARGIN,
+                "policy": CALIBRATION_SELECTION_POLICY,
+                "qualification_metric": CALIBRATION_STOP_METRIC,
+                "qualification_operator": ">= target",
+                "lcb_is_report_only": False,
+                "fallback": CALIBRATION_FALLBACK,
+                "fallback_requires_full_hnsw_grid": True,
+                "early_stop_metric": CALIBRATION_STOP_METRIC,
             },
             "target_outcomes": outcomes,
             "schema": {
@@ -1280,6 +2059,20 @@ def combine(
                 "all_shards_restored": True,
             },
             "input_shards": shard_evidence,
+            "coverage": combined_coverage,
+            "release_scope": {
+                "kind": (
+                    "formal_14_filter_3_target_mixed_trace"
+                    if formal else "legacy_14_filter_3_target_matrix"
+                ),
+                "requested_slice_complete": True,
+                "full_release_complete": True,
+                "filter_target_cells": len(expected_targets),
+                "samples_per_target": (
+                    len(FORMAL_FINAL_REQUEST_NOS) * FORMAL_FINAL_REPEATS
+                    if formal else None
+                ),
+            },
             "raw_rows": len(raw_rows),
             "summary_rows": len(summary_rows),
             "outputs": {name: str(path) for name, path in destinations.items()},

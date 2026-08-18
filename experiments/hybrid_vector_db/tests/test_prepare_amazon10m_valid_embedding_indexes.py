@@ -14,7 +14,7 @@ from experiments.hybrid_vector_db.scripts import (
 
 
 SHA256 = "a" * 64
-BUILD_ID = "sqlens-v11-formal-test"
+BUILD_ID = "sqlens-v16-d3-full-materialization-persisted-reuse-duplicate-bridge-test"
 
 
 def args(**overrides: object) -> argparse.Namespace:
@@ -31,6 +31,7 @@ def args(**overrides: object) -> argparse.Namespace:
         "hnsw_ef_construction": prepare.HNSW_EF_CONSTRUCTION,
         "maintenance_work_mem": "64GB",
         "build_seed": 57,
+        "max_parallel_maintenance_workers": 0,
         "proof_output": Path("proof.json"),
         "dry_run": False,
     }
@@ -48,7 +49,7 @@ def table_state(relfilenode: int = 200) -> prepare.RelationState:
 
 
 def source_state(
-    options: tuple[str, ...] = ("m=16", "ef_construction=64"),
+    options: tuple[str, ...] = ("m=32", "ef_construction=200"),
     *,
     comment: str | None = None,
     oid: int = 300,
@@ -104,7 +105,7 @@ def clone_state(
         indexed_column="embedding",
         opclass="vector_l2_ops",
         predicate="(embedding_valid)",
-        reloptions=("ef_construction=64", "m=16"),
+        reloptions=("ef_construction=200", "m=32"),
         comment=prepare.provenance_comment(contract) if comment is None else comment,
         definition="CREATE INDEX clone USING hnsw ... WHERE embedding_valid",
     )
@@ -186,9 +187,13 @@ class NamingAndDryRunTests(unittest.TestCase):
             prepare.DEFAULT_SOURCE_INDEX, prepare.DEFAULT_TABLE
         )
         self.assertIn("USING hnsw (embedding vector_l2_ops)", sql)
-        self.assertTrue(sql.startswith('CREATE INDEX "amazon10m_embedding_valid_hnsw_source_idx" '))
+        self.assertTrue(
+            sql.startswith(
+                'CREATE INDEX "amazon10m_hnsw_m32ef200_dupbridge_r29_source_idx" '
+            )
+        )
         self.assertNotIn('CREATE INDEX "public".', sql)
-        self.assertIn("WITH (m = 16, ef_construction = 64)", sql)
+        self.assertIn("WITH (m = 32, ef_construction = 200)", sql)
         self.assertTrue(sql.endswith("WHERE embedding_valid"))
         self.assertNotIn("CONCURRENTLY", sql)
 
@@ -204,12 +209,45 @@ class NamingAndDryRunTests(unittest.TestCase):
         self.assertIn("WITH (m = 32, ef_construction = 200)", sql)
         self.assertEqual(contract["m"], 32)
         self.assertEqual(contract["ef_construction"], 200)
+        self.assertEqual(
+            contract["duplicate_bridge_policy"],
+            "preserve_last_positive_edge_v1",
+        )
+        self.assertEqual(contract["sqlens_build_id"], BUILD_ID)
+        self.assertEqual(contract["vector_so_sha256"], SHA256)
+
+    def test_build_seed_defaults_to_upstream_behavior_and_accepts_deterministic_ab(self) -> None:
+        parser = prepare.build_parser()
+        base = [
+            "--expected-sqlens-build-id",
+            BUILD_ID,
+            "--expected-vector-so-sha256",
+            SHA256,
+        ]
+        self.assertEqual(parser.parse_args(base).build_seed, -1)
+        self.assertEqual(
+            parser.parse_args(base).maintenance_work_mem,
+            prepare.DEFAULT_MAINTENANCE_WORK_MEM,
+        )
+        self.assertEqual(
+            parser.parse_args(base).max_parallel_maintenance_workers,
+            prepare.DEFAULT_PARALLEL_MAINTENANCE_WORKERS,
+        )
+        self.assertEqual(parser.parse_args([*base, "--build-seed", "57"]).build_seed, 57)
+        with self.assertRaises(SystemExit):
+            parser.parse_args([*base, "--build-seed", "-2"])
 
     def test_validate_args_rejects_invalid_hnsw_parameters(self) -> None:
         with self.assertRaisesRegex(prepare.PreparationError, "at least 2"):
             prepare.validate_args(args(hnsw_m=32, hnsw_ef_construction=63))
         with self.assertRaisesRegex(prepare.PreparationError, "hnsw_m must"):
             prepare.validate_args(args(hnsw_m=101, hnsw_ef_construction=202))
+        with self.assertRaisesRegex(prepare.PreparationError, "requires"):
+            prepare.validate_args(
+                args(build_seed=57, max_parallel_maintenance_workers=1)
+            )
+        with self.assertRaisesRegex(prepare.PreparationError, "duplicate-bridge"):
+            prepare.validate_args(args(expected_sqlens_build_id="sqlens-v16-old"))
 
     def test_comment_sql_quotes_identifier_and_literal_without_bind_parameter(self) -> None:
         statement = prepare.hnsw_comment_sql(
@@ -477,12 +515,13 @@ class IndexPreparationTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertEqual(observed, source)
         self.assertEqual(contract["build_page_order"], "insertion")
-        self.assertFalse(contract["require_full_memory_build"])
+        self.assertTrue(contract["require_full_memory_build"])
+        self.assertEqual(contract["max_parallel_maintenance_workers"], 0)
         self.assertIn(
             "SELECT set_config('hnsw.build_page_order', 'insertion', true)", sql
         )
         self.assertIn(
-            "SELECT set_config('hnsw.require_full_memory_build', 'off', true)", sql
+            "SELECT set_config('hnsw.require_full_memory_build', 'on', true)", sql
         )
         self.assertIn("SELECT set_config('hnsw.clone_source', '', true)", sql)
         self.assertTrue(any(statement.startswith("CREATE INDEX") for statement in sql))
@@ -703,7 +742,10 @@ class ProvenanceAndProofTests(unittest.TestCase):
             payload = prepare.run(parsed, connect=connector)
 
         proof_gate.assert_called_once_with(
-            cursor, prepare.DEFAULT_SOURCE_INDEX, prepare.DEFAULT_CLONE_INDEX
+            cursor,
+            prepare.DEFAULT_SOURCE_INDEX,
+            prepare.DEFAULT_CLONE_INDEX,
+            expected_heap_tids=prepare.EXPECTED_ROWS,
         )
         self.assertIn(
             (
@@ -757,7 +799,12 @@ class ProvenanceAndProofTests(unittest.TestCase):
             mock.patch.object(
                 prepare,
                 "verify_embedding_valid_column",
-                return_value={"row_counts": {"total_rows": prepare.EXPECTED_ROWS}},
+                return_value={
+                    "row_counts": {
+                        "total_rows": prepare.EXPECTED_ROWS,
+                        "valid_rows": prepare.EXPECTED_ROWS,
+                    }
+                },
             ),
             mock.patch.object(prepare, "relation_state", return_value=table_state()),
             mock.patch.object(

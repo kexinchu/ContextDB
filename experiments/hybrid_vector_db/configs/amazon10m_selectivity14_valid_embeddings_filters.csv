@@ -1,15 +1,15 @@
-target_rate,filter_name,predicate,atoms,count,actual_pct,source
-50.0%,popular_ge1000,item_rating_number >= 1000,sql:item_rating_number >= 1000,5019997,50.19997,observed_embedding_valid
-45.0%,popular_ge1340,item_rating_number >= 1340,sql:item_rating_number >= 1340,4489429,44.89429,observed_embedding_valid
-40.0%,popular_ge1780,item_rating_number >= 1780,sql:item_rating_number >= 1780,3990500,39.90500,observed_embedding_valid
-35.0%,popular_ge2428,item_rating_number >= 2428,sql:item_rating_number >= 2428,3491010,34.91010,observed_embedding_valid
-30.0%,popular_ge3284,item_rating_number >= 3284,sql:item_rating_number >= 3284,2992481,29.92481,observed_embedding_valid
-25.0%,popular_ge4559,item_rating_number >= 4559,sql:item_rating_number >= 4559,2493459,24.93459,observed_embedding_valid
-20.0%,price_10_to_20,has_price AND price > 10 AND price <= 20,sql:has_price AND price > 10 AND price <= 20,2184326,21.84326,observed_embedding_valid
-15.0%,popular_ge10066,item_rating_number >= 10066,sql:item_rating_number >= 10066,1496628,14.96628,observed_embedding_valid
-10.0%,rating5_price_le10,has_price AND price <= 10 AND rating = 5,sql:has_price AND price <= 10||sql:rating = 5,955625,9.55625,observed_embedding_valid
-5.0%,long_review_ge500,review_text_len >= 500,sql:review_text_len >= 500,588018,5.88018,observed_embedding_valid
-2.0%,grocery_rating5,main_category = 'Grocery' AND rating = 5,sql:main_category = 'Grocery'||sql:rating = 5,233510,2.33510,observed_embedding_valid
-1.0%,grocery_helpful,main_category = 'Grocery' AND helpful_vote >= 1,sql:main_category = 'Grocery'||sql:helpful_vote >= 1,101387,1.01387,observed_embedding_valid
-0.5%,helpful_ge20,helpful_vote >= 20,sql:helpful_vote >= 20,60683,0.60683,observed_embedding_valid
-0.2%,grocery_long500,main_category = 'Grocery' AND review_text_len >= 500,sql:main_category = 'Grocery'||sql:review_text_len >= 500,21317,0.21317,observed_embedding_valid
+target_rate,filter_name,predicate,atoms,count,candidate_rows,actual_pct,source
+50.0%,popular_ge1000,item_rating_number >= 1000,sql:item_rating_number >= 1000,5019997,9979556,50.30281,observed_embedding_valid_index_universe
+45.0%,popular_ge1340,item_rating_number >= 1340,sql:item_rating_number >= 1340,4489429,9979556,44.98626,observed_embedding_valid_index_universe
+40.0%,popular_ge1780,item_rating_number >= 1780,sql:item_rating_number >= 1780,3990500,9979556,39.98675,observed_embedding_valid_index_universe
+35.0%,popular_ge2428,item_rating_number >= 2428,sql:item_rating_number >= 2428,3491010,9979556,34.98162,observed_embedding_valid_index_universe
+30.0%,popular_ge3284,item_rating_number >= 3284,sql:item_rating_number >= 3284,2992481,9979556,29.98611,observed_embedding_valid_index_universe
+25.0%,popular_ge4559,item_rating_number >= 4559,sql:item_rating_number >= 4559,2493459,9979556,24.98567,observed_embedding_valid_index_universe
+20.0%,price_10_to_20,has_price AND price > 10 AND price <= 20,sql:has_price AND price > 10 AND price <= 20,2184326,9979556,21.88801,observed_embedding_valid_index_universe
+15.0%,popular_ge10066,item_rating_number >= 10066,sql:item_rating_number >= 10066,1496628,9979556,14.99694,observed_embedding_valid_index_universe
+10.0%,rating5_price_le10,has_price AND price <= 10 AND rating = 5,sql:has_price AND price <= 10||sql:rating = 5,955625,9979556,9.57583,observed_embedding_valid_index_universe
+5.0%,long_review_ge500,review_text_len >= 500,sql:review_text_len >= 500,588018,9979556,5.89223,observed_embedding_valid_index_universe
+2.0%,grocery_rating5,main_category = 'Grocery' AND rating = 5,sql:main_category = 'Grocery'||sql:rating = 5,233510,9979556,2.33988,observed_embedding_valid_index_universe
+1.0%,grocery_helpful,main_category = 'Grocery' AND helpful_vote >= 1,sql:main_category = 'Grocery'||sql:helpful_vote >= 1,101387,9979556,1.01595,observed_embedding_valid_index_universe
+0.5%,helpful_ge20,helpful_vote >= 20,sql:helpful_vote >= 20,60683,9979556,0.60807,observed_embedding_valid_index_universe
+0.2%,grocery_long500,main_category = 'Grocery' AND review_text_len >= 500,sql:main_category = 'Grocery'||sql:review_text_len >= 500,21317,9979556,0.21361,observed_embedding_valid_index_universe

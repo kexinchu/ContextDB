@@ -1,0 +1,31 @@
+{
+  "original": {
+    "labelor_top70": 2000,
+    "labelor_top55": 2200,
+    "labelor_top40": 2000,
+    "labelor_top30": 2100,
+    "labelor_top20": 2000,
+    "labelor_top14": 2700,
+    "labelor_top9": 2200,
+    "labelor_top6": 2500,
+    "labelor_top3": 3600,
+    "label_175": 7000,
+    "label_79": 12500,
+    "label_2039": 95000,
+    "label_1432": 20000,
+    "label_281": 55000
+  },
+  "design1_bloom_bfs_layout_d3": {
+    "labelor_top70": 2000,
+    "labelor_top55": 2200,
+    "labelor_top40": 2000,
+    "labelor_top30": 2100,
+    "labelor_top20": 2000,
+    "labelor_top14": 2700,
+    "labelor_top9": 2200,
+    "labelor_top6": 2500,
+    "labelor_top3": 3600,
+    "label_1432": 20000,
+    "label_281": 55000
+  }
+}

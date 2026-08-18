@@ -1,0 +1,99 @@
+{
+  "amazon": {
+    "popular_ge1000": {
+      "guidance": false,
+      "stock": {"ef_search": 85, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 80, "iterative_scan": "off"}
+    },
+    "popular_ge1340": {
+      "guidance": false,
+      "stock": {"ef_search": 125, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 110, "iterative_scan": "off"}
+    },
+    "popular_ge1780": {
+      "guidance": false,
+      "stock": {"ef_search": 135, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 100, "iterative_scan": "off"}
+    },
+    "popular_ge2428": {
+      "guidance": false,
+      "stock": {"ef_search": 205, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 180, "iterative_scan": "off"}
+    },
+    "popular_ge3284": {
+      "guidance": false,
+      "stock": {"ef_search": 205, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 185, "iterative_scan": "off"}
+    },
+    "popular_ge4559": {
+      "guidance": false,
+      "stock": {"ef_search": 190, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 170, "iterative_scan": "off"}
+    },
+    "price_10_to_20": {
+      "guidance": false,
+      "stock": {"ef_search": 195, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 175, "iterative_scan": "off"}
+    },
+    "popular_ge10066": {
+      "guidance": false,
+      "stock": {"ef_search": 260, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 260, "iterative_scan": "off"}
+    },
+    "rating5_price_le10": {
+      "guidance": false,
+      "stock": {"ef_search": 1000, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 1050, "iterative_scan": "off"}
+    },
+    "long_review_ge500": {
+      "stock": {"ef_search": 2200, "iterative_scan": "strict_order", "max_scan_tuples": 3500000},
+      "sqlens": {
+        "ef_search": 80,
+        "max_scan_tuples": 100000,
+        "traversal_guided_target": 25,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.99
+      }
+    },
+    "grocery_rating5": {
+      "stock": {"ef_search": 180, "iterative_scan": "strict_order", "max_scan_tuples": 350000},
+      "sqlens": {
+        "ef_search": 80,
+        "max_scan_tuples": 40000,
+        "traversal_guided_target": 26,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.975
+      }
+    },
+    "grocery_helpful": {
+      "stock": {"ef_search": 2000, "iterative_scan": "strict_order", "max_scan_tuples": 5000000},
+      "sqlens": {
+        "ef_search": 80,
+        "max_scan_tuples": 100000,
+        "traversal_guided_target": 30,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.99
+      }
+    },
+    "helpful_ge20": {
+      "stock": {"ef_search": 10000, "iterative_scan": "strict_order", "max_scan_tuples": 5000000},
+      "sqlens": {
+        "ef_search": 80,
+        "max_scan_tuples": 200000,
+        "traversal_guided_target": 35,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.99
+      }
+    },
+    "grocery_long500": {
+      "stock": {"ef_search": 10000, "iterative_scan": "strict_order", "max_scan_tuples": 5000000},
+      "sqlens": {
+        "ef_search": 50,
+        "max_scan_tuples": 250000,
+        "traversal_guided_target": 25,
+        "traversal_guided_early_stop": true,
+        "traversal_guided_early_stop_distance_ratio": 0.99
+      }
+    }
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "amazon": {
+    "popular_ge1000": {
+      "guidance": false,
+      "stock": {"ef_search": 85, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 90, "iterative_scan": "off"}
+    },
+    "popular_ge1340": {
+      "guidance": false,
+      "stock": {"ef_search": 125, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 130, "iterative_scan": "off"}
+    },
+    "popular_ge1780": {
+      "guidance": false,
+      "stock": {"ef_search": 135, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 140, "iterative_scan": "off"}
+    },
+    "popular_ge2428": {
+      "guidance": false,
+      "stock": {"ef_search": 205, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 205, "iterative_scan": "off"}
+    },
+    "popular_ge3284": {
+      "guidance": false,
+      "stock": {"ef_search": 205, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 210, "iterative_scan": "off"}
+    },
+    "popular_ge4559": {
+      "guidance": false,
+      "stock": {"ef_search": 190, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 195, "iterative_scan": "off"}
+    },
+    "price_10_to_20": {
+      "guidance": false,
+      "stock": {"ef_search": 195, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 200, "iterative_scan": "off"}
+    },
+    "popular_ge10066": {
+      "guidance": false,
+      "stock": {"ef_search": 260, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 270, "iterative_scan": "off"}
+    },
+    "rating5_price_le10": {
+      "guidance": false,
+      "stock": {"ef_search": 1000, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 1125, "iterative_scan": "off"}
+    },
+    "long_review_ge500": {
+      "stock": {"ef_search": 2200, "iterative_scan": "strict_order", "max_scan_tuples": 3500000},
+      "sqlens": {"ef_search": 120, "max_scan_tuples": 250000, "traversal_guided_target": 27, "traversal_guided_early_stop": false}
+    },
+    "grocery_rating5": {
+      "stock": {"ef_search": 180, "iterative_scan": "strict_order", "max_scan_tuples": 350000},
+      "sqlens": {"ef_search": 80, "max_scan_tuples": 40000, "traversal_guided_target": 27, "traversal_guided_early_stop": false}
+    },
+    "grocery_helpful": {
+      "stock": {"ef_search": 2000, "iterative_scan": "strict_order", "max_scan_tuples": 5000000},
+      "sqlens": {"ef_search": 350, "max_scan_tuples": 3000000, "traversal_guided_target": 80, "traversal_guided_early_stop": false}
+    },
+    "helpful_ge20": {
+      "stock": {"ef_search": 10000, "iterative_scan": "strict_order", "max_scan_tuples": 5000000},
+      "sqlens": {"ef_search": 350, "max_scan_tuples": 4000000, "traversal_guided_target": 140, "traversal_guided_early_stop": false}
+    },
+    "grocery_long500": {
+      "stock": {"ef_search": 10000, "iterative_scan": "strict_order", "max_scan_tuples": 5000000},
+      "sqlens": {"ef_search": 100, "max_scan_tuples": 500000, "traversal_guided_target": 30, "traversal_guided_early_stop": false}
+    }
+  }
+}

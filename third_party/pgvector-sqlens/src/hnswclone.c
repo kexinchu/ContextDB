@@ -97,6 +97,28 @@ typedef struct HnswBfsLocality
 	HnswBfsLocalitySample samples[HNSW_BFS_LOCALITY_SAMPLE_LIMIT];
 } HnswBfsLocality;
 
+typedef struct HnswEdgeSpanStats
+{
+	int64		directedEdges;
+	int64		samePageEdges;
+	int64		withinOnePageEdges;
+	int64		withinFourPageEdges;
+	int64		withinSixteenPageEdges;
+	uint64		totalAbsBlockDelta;
+	uint64		maxAbsBlockDelta;
+	uint64		p50AbsBlockDelta;
+	uint64		p95AbsBlockDelta;
+	uint64		p99AbsBlockDelta;
+} HnswEdgeSpanStats;
+
+typedef struct HnswEdgeSpan
+{
+	int64		graphNodes;
+	BlockNumber indexBlocks;
+	HnswEdgeSpanStats allLayers;
+	HnswEdgeSpanStats levelZero;
+} HnswEdgeSpan;
+
 typedef struct HnswDiskGraph
 {
 	Relation	index;
@@ -137,6 +159,7 @@ typedef struct HnswGraphFingerprint
 	uint8		logicalDigest[PG_SHA256_DIGEST_LENGTH];
 	uint8		physicalDigest[PG_SHA256_DIGEST_LENGTH];
 	HnswBfsLocality bfsLocality;
+	HnswEdgeSpan edgeSpan;
 	int64		tombstones;
 } HnswGraphFingerprint;
 
@@ -1007,6 +1030,136 @@ HnswBuildBfsLocality(HnswDiskGraph *disk, HnswBfsLocality *result)
 	pfree(queue);
 }
 
+static void
+HnswRecordEdgeSpan(HnswEdgeSpanStats *stats, uint64 *histogram,
+				   uint64 blockDelta)
+{
+	stats->directedEdges++;
+	if (blockDelta == 0)
+		stats->samePageEdges++;
+	if (blockDelta <= 1)
+		stats->withinOnePageEdges++;
+	if (blockDelta <= 4)
+		stats->withinFourPageEdges++;
+	if (blockDelta <= 16)
+		stats->withinSixteenPageEdges++;
+	stats->totalAbsBlockDelta += blockDelta;
+	stats->maxAbsBlockDelta = Max(stats->maxAbsBlockDelta, blockDelta);
+	histogram[blockDelta]++;
+}
+
+static uint64
+HnswEdgeSpanPercentile(const uint64 *histogram, BlockNumber bins,
+					   int64 directedEdges, int percentile)
+{
+	uint64		target;
+	uint64		seen = 0;
+
+	if (directedEdges <= 0)
+		return 0;
+	target = ((uint64) directedEdges * (uint64) percentile + 99) / 100;
+	for (BlockNumber delta = 0; delta < bins; delta++)
+	{
+		seen += histogram[delta];
+		if (seen >= target)
+			return delta;
+	}
+	return bins > 0 ? bins - 1 : 0;
+}
+
+static void
+HnswFinalizeEdgeSpanStats(HnswEdgeSpanStats *stats,
+					  const uint64 *histogram, BlockNumber bins)
+{
+	stats->p50AbsBlockDelta = HnswEdgeSpanPercentile(
+		histogram, bins, stats->directedEdges, 50);
+	stats->p95AbsBlockDelta = HnswEdgeSpanPercentile(
+		histogram, bins, stats->directedEdges, 95);
+	stats->p99AbsBlockDelta = HnswEdgeSpanPercentile(
+		histogram, bins, stats->directedEdges, 99);
+}
+
+/*
+ * Measure the physical span of every directed graph edge.  The source block
+ * is the owner's neighbor-tuple page because that is the ReadBuffer directly
+ * preceding a destination element load during search; the target block is the
+ * destination element page.  Statistics cover the complete graph, including
+ * disconnected fallback elements, and report level zero separately because it
+ * dominates best-first search.
+ */
+static void
+HnswBuildEdgeSpan(HnswDiskGraph *disk, HnswEdgeSpan *result)
+{
+	HnswElementPtr iter;
+	Size		histogramBytes;
+	uint64    *allHistogram;
+	uint64    *levelZeroHistogram;
+	char	   *base = NULL;
+
+	MemSet(result, 0, sizeof(*result));
+	result->graphNodes = disk->nodes;
+	result->indexBlocks = disk->blocks;
+	if (disk->blocks == 0 || disk->nodes == 0)
+		return;
+	if ((uint64) disk->blocks > MaxAllocSize / sizeof(uint64))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("HNSW index has too many blocks for edge-span proof")));
+	histogramBytes = (Size) disk->blocks * sizeof(uint64);
+	if (histogramBytes > MaxAllocSize / 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("HNSW edge-span histogram is too large")));
+	HnswDiskGraphReserveMemory(disk, histogramBytes * 2);
+	allHistogram = palloc0(histogramBytes);
+	levelZeroHistogram = palloc0(histogramBytes);
+	HnswDiskGraphCheckMemory(disk);
+
+	iter = disk->graph->head;
+	while (!HnswPtrIsNull(base, iter))
+	{
+		HnswElement element = HnswPtrAccess(base, iter);
+		BlockNumber sourceBlock = element->neighborPage;
+
+		for (int lc = element->level; lc >= 0; lc--)
+		{
+			HnswNeighborArray *neighbors = HnswGetNeighbors(base, element, lc);
+
+			for (int i = 0; i < neighbors->length; i++)
+			{
+				HnswElement neighbor = HnswPtrAccess(
+					base, neighbors->items[i].element);
+				uint64		blockDelta;
+
+				if (neighbor == NULL || !BlockNumberIsValid(sourceBlock) ||
+					!BlockNumberIsValid(neighbor->blkno))
+					HnswCloneCorruption(disk->index,
+								"an edge-span endpoint is invalid");
+				blockDelta = neighbor->blkno >= sourceBlock ?
+					(uint64) (neighbor->blkno - sourceBlock) :
+					(uint64) (sourceBlock - neighbor->blkno);
+				if (blockDelta >= disk->blocks)
+					HnswCloneCorruption(disk->index,
+								"an edge span exceeds the index block count");
+				HnswRecordEdgeSpan(&result->allLayers, allHistogram,
+								   blockDelta);
+				if (lc == 0)
+					HnswRecordEdgeSpan(&result->levelZero,
+									   levelZeroHistogram, blockDelta);
+			}
+		}
+		iter = element->next;
+	}
+
+	HnswFinalizeEdgeSpanStats(&result->allLayers, allHistogram,
+						   disk->blocks);
+	HnswFinalizeEdgeSpanStats(&result->levelZero, levelZeroHistogram,
+						   disk->blocks);
+	pfree(levelZeroHistogram);
+	pfree(allHistogram);
+	HnswDiskGraphCheckMemory(disk);
+}
+
 static bool
 HnswCloneIndexDefinitionsEqual(Relation source, Relation destination)
 {
@@ -1539,6 +1692,7 @@ HnswFingerprintRelation(Relation index, HnswGraphFingerprint *result)
 	HnswBuildLogicalDigest(&disk, result);
 	HnswBuildTupleCoverageDigest(&disk, result);
 	HnswBuildBfsLocality(&disk, &result->bfsLocality);
+	HnswBuildEdgeSpan(&disk, &result->edgeSpan);
 	HnswDiskGraphCheckMemory(&disk);
 
 	MemoryContextSwitchTo(oldContext);
@@ -1612,6 +1766,61 @@ HnswAppendBfsLocalityJson(StringInfo json, const char *field,
 	appendStringInfoString(json, "]}");
 }
 
+static void
+HnswAppendEdgeSpanStatsJson(StringInfo json, const char *field,
+						const HnswEdgeSpanStats *stats)
+{
+	double		denominator = stats->directedEdges > 0 ?
+		(double) stats->directedEdges : 1.0;
+	double		mean = stats->directedEdges > 0 ?
+		(double) stats->totalAbsBlockDelta / denominator : 0.0;
+
+	appendStringInfo(json,
+					 "\"%s\":{"
+					 "\"directed_edges\":" INT64_FORMAT ","
+					 "\"same_page_edges\":" INT64_FORMAT ","
+					 "\"within_1_page_edges\":" INT64_FORMAT ","
+					 "\"within_4_pages_edges\":" INT64_FORMAT ","
+					 "\"within_16_pages_edges\":" INT64_FORMAT ","
+					 "\"same_page_ratio\":%.17g,"
+					 "\"within_1_page_ratio\":%.17g,"
+					 "\"within_4_pages_ratio\":%.17g,"
+					 "\"within_16_pages_ratio\":%.17g,"
+					 "\"mean_abs_block_delta\":%.17g,"
+					 "\"p50_abs_block_delta\":" UINT64_FORMAT ","
+					 "\"p95_abs_block_delta\":" UINT64_FORMAT ","
+					 "\"p99_abs_block_delta\":" UINT64_FORMAT ","
+					 "\"max_abs_block_delta\":" UINT64_FORMAT "}",
+					 field, stats->directedEdges, stats->samePageEdges,
+					 stats->withinOnePageEdges, stats->withinFourPageEdges,
+					 stats->withinSixteenPageEdges,
+					 (double) stats->samePageEdges / denominator,
+					 (double) stats->withinOnePageEdges / denominator,
+					 (double) stats->withinFourPageEdges / denominator,
+					 (double) stats->withinSixteenPageEdges / denominator,
+					 mean, stats->p50AbsBlockDelta, stats->p95AbsBlockDelta,
+					 stats->p99AbsBlockDelta, stats->maxAbsBlockDelta);
+}
+
+static void
+HnswAppendEdgeSpanJson(StringInfo json, const char *field,
+					   const HnswEdgeSpan *span)
+{
+	appendStringInfo(json,
+					 "\"%s\":{\"format\":\"sqlens-hnsw-edge-span-v1\","
+					 "\"graph_nodes\":" INT64_FORMAT ","
+					 "\"index_blocks\":%u,"
+					 "\"source_page_scope\":\"owner_neighbor_tuple_page\","
+					 "\"target_page_scope\":\"destination_element_page\","
+					 "\"edge_scope\":\"complete_directed_adjacency_with_level_duplicates\","
+					 "\"full_statistics\":true,",
+					 field, span->graphNodes, (uint32) span->indexBlocks);
+	HnswAppendEdgeSpanStatsJson(json, "all_layers", &span->allLayers);
+	appendStringInfoChar(json, ',');
+	HnswAppendEdgeSpanStatsJson(json, "level_zero", &span->levelZero);
+	appendStringInfoChar(json, '}');
+}
+
 static Jsonb *
 HnswFingerprintToJsonb(const HnswGraphFingerprint *fingerprint)
 {
@@ -1630,7 +1839,7 @@ HnswFingerprintToJsonb(const HnswGraphFingerprint *fingerprint)
 		HnswDigestToHex(fingerprint->entryIdentity, entry);
 	initStringInfo(&json);
 	appendStringInfo(&json,
-						 "{\"format\":\"sqlens-hnsw-graph-v2\","
+						 "{\"format\":\"sqlens-hnsw-graph-v3\","
 						 "\"definition_digest\":\"sha256:%s\","
 						 "\"tuple_coverage_digest\":\"sha256:%s\","
 						 "\"logical_digest\":\"sha256:%s\","
@@ -1650,6 +1859,8 @@ HnswFingerprintToJsonb(const HnswGraphFingerprint *fingerprint)
 						 fingerprint->version, fingerprint->dimensions,
 						 fingerprint->m, fingerprint->efConstruction);
 	HnswAppendBfsLocalityJson(&json, "bfs_locality", &fingerprint->bfsLocality);
+	appendStringInfoChar(&json, ',');
+	HnswAppendEdgeSpanJson(&json, "edge_span", &fingerprint->edgeSpan);
 	appendStringInfoChar(&json, '}');
 	return DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
 										 CStringGetDatum(json.data)));
@@ -1756,11 +1967,17 @@ vector_hnsw_graph_compare(PG_FUNCTION_ARGS)
 
 	initStringInfo(&json);
 	appendStringInfo(&json,
-						 "{\"format\":\"sqlens-hnsw-compare-v2\","
+						 "{\"format\":\"sqlens-hnsw-compare-v3\","
 						 "\"same_heap\":%s,\"logical_equal\":%s,"
 						 "\"physical_equal\":%s,\"entry_equal\":%s,"
 						 "\"definition_equal\":%s,"
 						 "\"tuple_coverage_equal\":%s,"
+						 "\"left_nodes\":" INT64_FORMAT ","
+						 "\"right_nodes\":" INT64_FORMAT ","
+						 "\"left_heap_tids\":" INT64_FORMAT ","
+						 "\"right_heap_tids\":" INT64_FORMAT ","
+						 "\"left_tombstones\":" INT64_FORMAT ","
+						 "\"right_tombstones\":" INT64_FORMAT ","
 						 "\"left_definition_digest\":\"sha256:%s\","
 						 "\"right_definition_digest\":\"sha256:%s\","
 						 "\"left_tuple_coverage_digest\":\"sha256:%s\","
@@ -1775,6 +1992,9 @@ vector_hnsw_graph_compare(PG_FUNCTION_ARGS)
 						 entryEqual ? "true" : "false",
 						 definitionEqual ? "true" : "false",
 						 coverageEqual ? "true" : "false",
+						 leftFingerprint.nodes, rightFingerprint.nodes,
+						 leftFingerprint.heapTids, rightFingerprint.heapTids,
+						 leftFingerprint.tombstones, rightFingerprint.tombstones,
 						 leftDefinition, rightDefinition,
 						 leftCoverage, rightCoverage,
 						 leftLogical, rightLogical, leftPhysical, rightPhysical);
@@ -1783,6 +2003,12 @@ vector_hnsw_graph_compare(PG_FUNCTION_ARGS)
 	appendStringInfoChar(&json, ',');
 	HnswAppendBfsLocalityJson(&json, "right_bfs_locality",
 						  &rightFingerprint.bfsLocality);
+	appendStringInfoChar(&json, ',');
+	HnswAppendEdgeSpanJson(&json, "left_edge_span",
+						 &leftFingerprint.edgeSpan);
+	appendStringInfoChar(&json, ',');
+	HnswAppendEdgeSpanJson(&json, "right_edge_span",
+						 &rightFingerprint.edgeSpan);
 	appendStringInfoChar(&json, '}');
 
 	relation_close(right, NoLock);

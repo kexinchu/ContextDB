@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "release_contract": "experiments/hybrid_vector_db/configs/p0_release_contract_r41.json",
+  "search_grid": {
+    "ef_search": [
+      20,
+      40,
+      60,
+      80,
+      100,
+      150,
+      200,
+      250,
+      500,
+      750,
+      1000,
+      1500,
+      2000,
+      3000,
+      4000,
+      5000,
+      7000,
+      8500,
+      10000
+    ],
+    "extension_ef_search": [
+      20000,
+      50000,
+      100000
+    ],
+    "iterative_scan": [
+      "off",
+      "strict_order"
+    ],
+    "max_scan_tuples": 5000000,
+    "scan_mem_multiplier": 32
+  },
+  "protocol": {
+    "modes": [
+      "original",
+      "design1_bloom_bfs_layout_d3"
+    ],
+    "execution_order": "interleaved",
+    "latency_repeats": 3,
+    "throughput_repeats": 6,
+    "measurement_requests": 10000,
+    "calibration_requests": 2800,
+    "calibration_protocol": "formal_per_predicate_cartesian_v1",
+    "calibration_observations_per_predicate": 200,
+    "qualification_scope": "global_min_predicate_lcb",
+    "guidance_filter_strategy": "traversal_guided",
+    "guidance_max_atoms": 160,
+    "d3_measurement_policy": "workload_driven_adaptive",
+    "d2_page_access": "off",
+    "d2_index_page_access": "off",
+    "schedule_seed": 20260801
+  },
+  "datasets": {
+    "yfcc": {
+      "label": "YFCC-10M",
+      "table": "public.yfcc10m_pgvector",
+      "query_table": "public.yfcc10m_queries",
+      "query_id_column": "qid",
+      "query_vector_column": "embedding",
+      "source_index": "public.yfcc10m_pgvector_embedding_hnsw",
+      "bfs_index": "public.yfcc10m_pgvector_embedding_hnsw_bfs_r31",
+      "candidate_validity_predicate": "TRUE",
+      "truth_self_excluded": false,
+      "filters_csv": "results/hybrid_vector_db/yfcc10m_figure5_v3_filters_uniform_0p2_14pct.csv",
+      "query_cohort_csv": "results/hybrid_vector_db/figure5_r35_yfcc_query_cohort_q10200.csv",
+      "truth_csv": "results/hybrid_vector_db/figure5_r41_yfcc_v3filters_workloads/figure5_r41_yfcc_v3_exact_truth_q12800.csv",
+      "calibration_workload_csv": "results/hybrid_vector_db/figure5_r41_yfcc_v3filters_workloads/figure5_r41_yfcc_v3_calibration.csv",
+      "measurement_workload_csv": "results/hybrid_vector_db/figure5_r41_yfcc_v3filters_workloads/figure5_r41_yfcc_v3_measurement.csv",
+      "workload_manifest_json": "results/hybrid_vector_db/figure5_r41_yfcc_v3filters_workloads/figure5_r41_yfcc_v3_manifest.json",
+      "d2_graph_proof_json": "results/hybrid_vector_db/yfcc10m_r31_table6_shared_d2_warm_q100r5_20260723.csv.d2_graph_proof.json"
+    }
+  }
+}

@@ -1,529 +1,551 @@
-# SQLens SIGMOD 实验计划
-
-本文档用于指导 SQLens 的论文级实验执行。目标不是把所有已有结果都塞进
-Evaluation，而是围绕 SIGMOD 系统论文的核心问题组织证据：SQLens 是否在
-保留 PostgreSQL/\pgvector SQL 执行边界的前提下，稳定降低 filtered vector
-search 的端到端代价。
-
-## 论文主张
-
-SQLens 是一个面向 PostgreSQL + \pgvector 的 SQL-native filtered vector
-search 优化方案。它不绕开 PostgreSQL 的 SQL、MVCC、权限与最终验证语义，
-而是在 \pgvector HNSW 扫描路径中引入 SQL 派生的可见性指导、局部性友好的
-执行路径，以及可复用的谓词状态，从而减少无效候选、随机页访问和重复谓词
-计算带来的 DBMS 执行开销。
-
-Evaluation 需要支撑以下四个主张：
-
-1. 在固定 recall 或可比较 recall 下，SQLens 相比 stock PostgreSQL +
-   \pgvector 显著降低端到端 FVS 延迟，并改善 throughput。
-2. SQLens 的 D1/D2/D3 组件分别贡献收益：D1 减少 SQL-invalid candidate，
-   D2 改善物理访问局部性，D3 复用热点谓词状态。
-3. SQLens 的收益不仅出现在单个数据集上，而是在至少两个 10M 级真实工作负载
-   上成立；如果 LAION-25M 结果成熟，可作为更大规模补充。
-4. SQLens 的额外开销可控，包括 guidance metadata、cache footprint、构建
-   时间、正确性验证、更新/失效处理和并发下的尾延迟。
-
-## Motivation 与 Evaluation 的边界
-
-### Motivation 中应该放什么
-
-Motivation 只负责证明问题真实存在，以及为什么问题来自 PostgreSQL +
-\pgvector 的 SQL-native 执行路径。它可以包含以下证据：
-
-- \pgvector HNSW 返回 TID 后，SQL/MVCC/权限/策略验证仍然在 PostgreSQL
-  executor 中发生。
-- 在选择性过滤条件下，stock \pgvector 会向 PostgreSQL 返回大量 SQL-invalid
-  candidates，造成无效验证。
-- HNSW 的距离顺序与 heap/index page 物理布局不一致，导致 page locality 差。
-- 真实工作负载中，SQL filter/predicate fragment 的重复概率明显高于 query
-  vector 精确重复概率，因此可复用状态应围绕 predicate/visibility 而非最终
-  top-k answer。
-
-这些 observation 已经在 Motivation 的图中出现。因此 Evaluation 中不再重复
-candidate waste、page locality、filter reuse 这三类“问题存在性”图。
-
-### Evaluation 中应该放什么
-
-Evaluation 只负责证明 SQLens 是否解决问题。它应包含：
-
-- 端到端 fixed-recall 或 matched-recall 性能对比。
-- Recall-latency 和 throughput-recall frontier。
-- D1/D2/D3 组件消融。
-- D3 cache/reuse 的收益、正确性与开销。
-- 更新、失效、并发、内存和存储 overhead。
-- 与 vector-native payload-filter 系统的边界对比。
-
-Evaluation 中可以在文字或表格里引用 motivation 指标解释结果，但不再单独放
-candidate waste/locality/reuse 的机制图。机制证据的主位置是 Motivation。
-
-### 本轮明确不做的 Evaluation 内容
-
-- 不单独做 `Complex SQL / Routing` 小节。
-- 不把 routing 作为核心实验主张。若实现中有保守 route calibration，可放在
-  Implementation 或 appendix 中作为工程细节，不作为主线结果。
-- 不在 Evaluation 里重复 Motivation 已经展示过的 observation 图。
-- 不使用人工构造的高重复 replay 来证明 D3，除非明确标为 stress/control。
-
-## Evaluation 章节建议结构
-
-推荐把 Evaluation 收敛为以下结构：
-
-1. `Experimental Setup`
-   - 硬件、PostgreSQL、\pgvector commit、SQLens commit、索引大小、表大小。
-   - 数据集、向量维度、行数、谓词来源、query 来源、ground truth 计算方式。
-   - 所有方法使用相同 query vectors、filter predicates、`k=10`。
-
-2. `End-to-End Performance`
-   - 主图：stock \pgvector vs SQLens-D1 vs SQLens-D1+D2 vs SQLens-D1+D2+D3。
-   - 主数据集：Amazon Reviews 10M。
-   - 辅助数据集：YFCC-10M；LAION-25M 若结果成熟，可放入同一图的分面或独立图。
-   - 报告 mean、p50、p95、std、recall@10。
-
-3. `Recall-Latency-Throughput Frontier`
-   - 必须包含 recall-latency 与 throughput-recall 两张 frontier 图。
-   - frontier 不按 selectivity 分组，而是使用尽可能完整的真实 workload。
-   - 每个数据集至少 10,000 个 request，覆盖 recall 0.7 到接近 1.0 的至少
-     10 个配置点。
-   - Amazon 与 YFCC 是最低要求；LAION-25M 若补齐 10K workload，可作为第三组。
-
-4. `Component Ablation`
-   - 只比较 stock、D1、D1+D2、D1+D2+D3。
-   - 用表格汇总每个组件带来的 latency/recall/p95/overhead 变化。
-   - 可以报告 returned TIDs、valid results、guidance skips、cache hits 等
-     诊断列，但不要再画 candidate waste/page locality 机制图。
-
-5. `Overheads and Robustness`
-   - metadata size、cache size、build time、activation time。
-   - update/invalidation cost。
-   - 1/4/8/16 clients 的 throughput 与 p95/p99。
-   - cold-cache sensitivity 可放 appendix，主文保留 warm-cache。
-
-<!-- 6. `External Payload-Filter Boundary`
-   - 只用于说明边界：Milvus/Weaviate/Qdrant/FAISS/HNSWlib 能很好地处理
-     payload-compatible filter，但不能自然替代 PostgreSQL 中 join、ACL、
-     MVCC、temporal policy 等 SQL-defined visibility。
-   - 不要把这一节写成“DBMS 全面击败 vector-native system”。重点是语义边界
-     与系统适用范围。 -->
-
-## 图表组织
-
-主文建议保留以下图表：
-
-| 位置 | 形式 | 内容 | 目的 |
-|---|---|---|---|
-| Table 1 | 表格 | 数据集、规模、维度、谓词、query 来源 | 实验可复现性 |
-| Fig. E1 | 折线/分面图 | End-to-end latency vs selectivity 或 predicate group | 主性能结果 |
-| Fig. E2 | 两行图 | Recall-latency frontier 与 throughput-recall frontier | ANN 标准视角 |
-| Table E1 | 表格 | D1/D2/D3 ablation，含 recall/p95/overhead | 组件贡献 |
-| Table E2 | 表格 | Filter repeat、query repeat、cache hit、cache-control latency | D3 复用证据 |
-| Table E3 | 表格 | metadata/cache/build/update/concurrency overhead | 可部署性 |
-| Table E4 | 表格 | PostgreSQL vs vector-native payload-filter boundary | 适用边界 |
-
-不建议保留在主文 Evaluation 中的图：
-
-- Candidate waste 机制图：放 Motivation。
-- Page locality 机制图：放 Motivation。
-- Filter reuse 折线图：改为 Motivation 表格或 Evaluation 的 cache 表。
-- Complex SQL/routing 图：不作为主线实验。
-
-## 数据集计划
-
-主文至少需要两个 10M 级真实工作负载；第三个成熟后再加入。
-
-| 数据集 | 目标规模 | 本地状态 | 谓词角色 | 论文角色 |
-|---|---:|---|---|---|
-| Amazon Reviews 2023 Grocery | 10M | 已加载 PostgreSQL + \pgvector | category、price、rating、helpfulness、review length | 主 SQL-native 数据集 |
-| YFCC | 10M | 已加载 base/query，HNSW 与 guidance metadata 已构建 | public tag filters 与 filtered-ANNS workload | 跨论文可比的第二主数据集 |
-| LAION | 25M | 已加载 25M image rows，已有 caption/width 派生谓词与 q20 结果 | caption label、width range、hybrid label/range | 大规模 image-text 扩展数据集 |
-
-## Baselines
-
-| Baseline | 是否主文必需 | 使用场景 | 注意事项 |
-|---|---|---|---|
-| Official upstream PostgreSQL + \pgvector v0.8.2 HNSW | 必需 | 主 stock baseline | 使用官方 commit/binary SHA；调优 `ef_search`、iterative scan、scan budget |
-| SQLens binary, all SQLens GUCs disabled | 必需 | instrumentation overhead control | 与 upstream 在同一表、同一索引、同一 SQL 上 A/B；不能代替 official upstream |
-| SQL-first exact | 必需 | exact system baseline | `WHERE predicate` 后 exact vector ranking；其 latency 独立测量，不能把离线 GT 生成时间当 baseline |
-| FAISS HNSW allow-list | 必需 | standalone FVS baseline | PostgreSQL 流式构造 bitmap allow-list；报告 allow-list build 与 search，主比较同时给 cached-allow-list search |
-| Weaviate v1.38 filtered vector search | 必需 | production FVS baseline | 同时调 ACORN、sweeping 与 flat-search cutoff；记录 image digest 与 schema 恢复证据 |
-| SQLens-D1 | 必需 | predicate guidance | 与 stock 使用相同 SQL final validation |
-| SQLens-D1+D2 | 必需 | locality/layout | 不把重排/构建时间混入单查询 latency |
-| SQLens-D1+D2+D3 | 必需 | cache/reusable state | 正确性必须由 PostgreSQL final recheck 保证 |
-
-不再把 D4/routing 作为主文 baseline。若保留实现，可作为保守工程策略或
-appendix 结果。
-
-### Matched-recall baseline contract
-
-- 对 official pgvector、SQLens-disabled、SQLens、FAISS 与 Weaviate 分别调参，
-  在 Recall@10 为 `0.90`、`0.95`、`0.99` 的相同目标下比较 latency/QPS；
-  不允许只固定 stock 的 `ef_search=1000`。
-- 调参使用互不重叠的 q200 split：q0--19 screening、q20--99 verification、
-  q100--199 held-out final。配置选择使用 verification recall 的 95% LCB，
-  最终结论只使用 held-out final。
-- 如果某方法在完整参数网格上达不到目标，必须保留最大预算配置的证据并标成
-  `unattainable_on_grid`，不能把低 recall 点直接与达到目标的方法比较。
-- 每个 binary/system 都记录源码 tag/commit、`vector.so` 或 container image
-  digest、索引 relfilenode/参数、数据与 GT SHA。切换 binary 后必须重启并由
-  server-side digest gate 验证，实验结束恢复原 binary。
-- 预过滤系统的 filter materialization 与 ANN search 分开计时，同时报告完整
-  end-to-end；cached allow-list 只能作为额外分解，不能替代完整成本。
-
-### SQL-native scope contract
-
-Amazon 主线除单表 predicates 外，必须包含同一批 q200 query 与 14 个 filters
-上的三类真实 PostgreSQL workload：`acl_only`、
-`grant_temporal_selectivity`、`fact_temporal_selectivity`。三者都在一次 SQL
-statement 中执行 vector ORDER BY、review fact/product dimension/principal grant
-joins 和 PostgreSQL RLS；后两者分别增加 grant validity 与 source review
-timestamp validity。所有结果使用独立生成的 exact SQL-valid top-10；不能先在
-Python 中算出 allow-list 再把它称为一次 SQL-native hybrid query。
-
-### Design claim gates
-
-- D1 分成 `safe_guided`（只减少 candidate admission/final validation）与
-  `traversal_guided`（在 neighbor distance computation 前使用经 planner proof
-  绑定的安全 guidance）。只有后者实际降低 expanded nodes 或 distance
-  computations 时，论文才使用 “filter-aware traversal” 表述。
-- D2 必须是同一确定性 HNSW graph 的物理 index-page 重排。验证 top-k、距离、
-  visited counters 与 recall 相同后，单独报告 index page reads/runs、buffer
-  hit/miss、prefetch 命中以及 build/storage overhead。
-- D3 必须从空 cache 开始，使用 q10k 在线请求 trace 展示 admission、materialize、
-  reuse、eviction、phase shift、稳定 break-even 和 p95/p99；15 个预构建 fragment
-  只能作为 eager control，不能作为 online adaptation 证据。
-
-## 统一报告标准
-
-每个主文结果必须满足：
-
-- 使用相同 query vectors 与 filter predicates。
-- 使用 exact SQL-valid top-k 作为 ground truth。
-- 主目标 recall@10 建议为 0.9；0.95 作为 sensitivity。
-- 如果固定 0.9 难以达到，必须明确写为 matched-recall 或 attainable-recall，
-  并报告每个点的 recall。
-- 报告 mean latency、p50、p95、std、recall、throughput。
-- 主文使用 warm-cache；cold-cache 放 appendix。
-- 保留 PostgreSQL final SQL/MVCC/policy validation。
-- 记录 PostgreSQL 版本、\pgvector commit、SQLens commit、HNSW 参数、索引
-  大小、表大小、硬件、内存、存储、命令行。
-- 所有 paper-facing 图表应来自可追踪 CSV/JSON，不能手工改数。
-
-## 优先级队列
-
-### P0：正式补齐 10K frontier
-
-目标：
-
-- 在 Amazon 与 YFCC 上生成标准 ANN 视角的 recall-latency 和
-  throughput-recall frontier。
-- 每个数据集至少 10,000 个 request，至少 10 个配置点，覆盖 recall 0.7 到
-  接近 1.0。
-
-YFCC 当前状态：
-
-- 已有 10,000 个真实 public-query request 文件：
-  `results/hybrid_vector_db/yfcc10m_full_workload_requests_10000_20260714.csv`
-- 已完成 q100 calibration，并确认 PostgreSQL SQL-first exact 应作为
-  self-ground-truth，因为官方 YFCC GT 与 PostgreSQL exact 存在少量 tie/order
-  差异。
-- 正式 10K 分片运行未完整完成，需要继续 resume。
-
-YFCC 10K resume 命令模板：
-
-```bash
-python3 experiments/hybrid_vector_db/scripts/yfcc_full_workload_recall_sweep.py \
-  --out-prefix v2_full_q10000_10cfg_w0_20260715 \
-  --requests 10000 \
-  --methods stock bloom exact \
-  --ef-search-values 1,2,4,8,16,32,128,512,2000,5000 \
-  --max-scan-tuples-values 200000 \
-  --selected-queries-in results/hybrid_vector_db/yfcc10m_full_workload_requests_10000_20260714.csv \
-  --num-workers 8 \
-  --worker-id 0 \
-  --warmup-requests 10 \
-  --progress-requests 250 \
-  --statement-timeout-ms 180000 \
-  --resume \
-  --skip-function-ddl
-```
-
-将 `worker-id` 与 `out-prefix` 改为 `0..7`。每个 worker 完整行数应为
-`1250 * (10 stock + 10 bloom + 1 exact) = 26250`。
-
-完成后合并：
-
-```bash
-python3 experiments/hybrid_vector_db/scripts/merge_full_workload_shards.py \
-  --inputs results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w0_20260715.csv \
-           results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w1_20260715.csv \
-           results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w2_20260715.csv \
-           results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w3_20260715.csv \
-           results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w4_20260715.csv \
-           results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w5_20260715.csv \
-           results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w6_20260715.csv \
-           results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w7_20260715.csv \
-  --out results/hybrid_vector_db/yfcc_v2_full_q10000_10cfg_merged_20260715.csv \
-  --summary-out results/hybrid_vector_db/yfcc_v2_full_q10000_10cfg_merged_20260715_summary.csv
-```
-
-用 PostgreSQL exact endpoint 重算 recall：
-
-```bash
-python3 experiments/hybrid_vector_db/scripts/recompute_full_workload_recall_from_exact.py \
-  --raw results/hybrid_vector_db/yfcc_v2_full_q10000_10cfg_merged_20260715.csv \
-  --out results/hybrid_vector_db/yfcc_v2_full_q10000_10cfg_sqltruth_20260715.csv \
-  --summary-out results/hybrid_vector_db/yfcc_v2_full_q10000_10cfg_sqltruth_summary_20260715.csv
-```
-
-注意：
-
-- 8 个 worker 并发运行时，latency 是 8-client closed-loop workload 下的
-  per-query latency。
-- throughput 图应使用并发总吞吐，例如近似为
-  `8 * 1000 / latency_mean_ms`，并在图注中说明。
-- 如果需要单客户端 latency frontier，应单独顺序运行 10K，不能混用并发结果。
-
-### P0：Amazon 主性能与 ablation 整理
-
-目标：
-
-- 保留 Amazon 10M 作为第一条完整 SQLens 证据线。
-- 重新组织为端到端主图 + ablation 表，而不是散放机制图。
-
-已可用结果：
-
-- `results/hybrid_vector_db/sigmod_d123_selectivity_q100r10_warmall_main_20260710_002705.csv`
-- `results/hybrid_vector_db/sigmod_d123_selectivity_q100r10_warmall_main_20260710_002705_table.csv`
-- `results/hybrid_vector_db/sigmod_target_recall_calibration_calib_20260710_123543.csv`
-
-待确认：
-
-- 当前 Amazon 结果是 \pgvector 配置下的 attainable recall，而非严格固定
-  recall。若主文需要 fixed recall@10=0.9，应重新调高或移除 `ef_search`
-  ceiling 后校准。
-- 主文表格中每个方法必须并列报告 recall，避免只展示 latency。
-
-| Sel. | Filter | Stock | D1 | D1+D2 | D1+D2+D3  | Speedup | Recall |
-|---:|---|---:|---:|---:|---:|---:|---:|
-| 50% | popular_ge1000 | 16.73 | 16.48 | 12.58 | 10.58 | 1.58x | 0.844 |
-| 45% | popular_ge1340 | 17.50 | 16.74 | 12.86 | 10.98 | 1.59x | 0.844 |
-| 40% | popular_ge1780 | 18.41 | 17.87 | 13.33 | 11.91 | 1.54x | 0.846 |
-| 35% | popular_ge2428 | 19.74 | 18.98 | 13.99 | 11.48 | 1.72x | 0.846 |
-| 30% | popular_ge3284 | 20.12 | 19.69 | 14.71 | 12.39 | 1.62x | 0.847 |
-| 25% | popular_ge4559 | 22.83 | 19.25 | 14.97 | 12.84 | 1.78x | 0.847 |
-| 20% | price_10_to_20 | 22.71 | 19.79 | 15.03 | 13.76 | 1.65x | 0.821 |
-| 15% | popular_ge10066 | 22.03 | 21.05 | 15.69 | 12.76 | 1.73x | 0.840 |
-| 10% | rating5_price_le10 | 31.42 | 24.54 | 19.06 | 18.61 | 1.69x | 0.852 |
-| 5% | long_review_ge500 | 33.12 | 27.22 | 21.22 | 19.95 | 1.66x | 0.839 |
-| 2% | grocery_rating5 | 32.58 | 28.23 | 23.81 | 19.11 | 1.70x | 0.861 |
-| 1% | grocery_helpful | 40.41 | 36.59 | 33.09 | 29.96 | 1.34x | 0.843 |
-| 0.5% | helpful_ge20 | 155.73 | 123.27 | 77.55 | 76.52 | 2.03x | 0.849 |
-| 0.2% | grocery_long500 | 225.54 | 156.96 | 122.96 | 112.81 | 1.99x | 0.819 |
-
-- YFCC
-| Sel. | Actual | Filter | Stock | D1 | D1+D2 | D1+D2+D3 | Speedup | Recall |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 50% | 53.0273% | tagor_23_29 | 72.31 | 71.11 | 38.65 | 28.34 | 2.55x | 0.990 |
-| 45% | 44.7679% | tagor_23_89 | 63.55 | 61.20 | 29.70 | 18.34 | 3.47x | 0.991 |
-| 40% | 39.9688% | tagor_23_3 | 62.32 | 58.81 | 29.27 | 17.75 | 3.51x | 0.990 |
-| 35% | 34.9893% | tagor_23_90 | 72.94 | 67.46 | 34.70 | 22.66 | 3.22x | 0.987 |
-| 30% | 30.1632% | tagor_29_8 | 61.84 | 58.15 | 29.56 | 17.63 | 3.51x | 0.988 |
-| 25% | 25.0068% | tagor_89_18 | 61.64 | 57.81 | 29.47 | 17.66 | 3.49x | 0.996 |
-| 20% | 20.0005% | tagor_8_28 | 61.48 | 57.38 | 28.98 | 17.67 | 3.48x | 0.986 |
-| 15% | 15.0022% | tagor_20_12 | 60.89 | 57.48 | 29.68 | 17.69 | 3.44x | 0.987 |
-| 10% | 10.0022% | tagor_3_515 | 62.39 | 58.43 | 30.02 | 17.98 | 3.47x | 0.984 |
-| 5% | 4.9908% | tagor_24 | 96.07 | 86.48 | 46.58 | 30.69 | 3.78x | 0.979 |
-| 2% | 2.0001% | tagor_36_414 | 104.94 | 105.60 | 81.63 | 47.11 | 2.23x | 0.972 |
-| 1% | 1.0001% | tagor_430_3076 | 140.31 | 107.97 | 83.29 | 59.91 | 2.34x | 0.959 |
-| 0.5% | 0.5000% | tagor_902 | 182.69 | 134.59 | 80.88 | 59.10 | 3.09x | 0.957 |
-| 0.2% | 0.2002% | tagor_990 | 191.03 | 146.25 | 113.29 | 84.05 | 2.27x | 0.960 |
-
-- LAION-25M
-| Sel. | Actual | Filter | Stock | D1+D2+D3 | Speedup | Recall |
-| ---- | ------ | ------ | ----: | ----: | ----: | ----: |
-| 50% | 49.767% | labelor_top70 | 66.43 | 46.50 | 1.43x | 0.932 |
-| 45% | 45.458% | labelor_top55 | 66.46 | 46.51 | 1.43x | 0.929 |
-| 40% | 39.991% | labelor_top40 | 66.45 | 46.49 | 1.43x | 0.927 |
-| 35% | 36.019% | labelor_top30 | 66.44 | 46.49 | 1.43x | 0.925 |
-| 30% | 29.783% | labelor_top20 | 76.75 | 57.64 | 1.33x | 0.941 |
-| 25% | 24.642% | labelor_top14 | 76.72 | 55.31 | 1.39x | 0.943 |
-| 20% | 19.590% | labelor_top9 | 76.77 | 55.72 | 1.38x | 0.934 |
-| 15% | 15.423% | labelor_top6 | 82.52 | 64.98 | 1.27x | 0.914 |
-| 10% | 9.025% | labelor_top3 | 82.89 | 65.80 | 1.26x | 0.878 |
-| 5% | 3.964% | label_175 | 139.16 | 96.07 | 1.45x | 0.842 |
-| 2% | 2.127% | label_79 | 170.20 | 113.85 | 1.49x | 0.808 |
-| 1% | 1.000% | label_2039 | 203.26 | 132.76 | 1.53x | 0.616 |
-| 0.5% | 0.501% | label_1432 | 300.48 | 164.26 | 1.82x | 0.780 |
-| 0.2% | 0.200% | label_281 | 393.97 | 230.23 | 1.71x | 0.770 |
-
-### P0：D3 cache/reuse 结果整理
-
-目标：
-
-- 用表格说明真实 workload 中 filter repeat 高于 query repeat。
-- 用 cache-control 实验证明 reusable predicate state 能在保持 ordered result
-  IDs 一致的情况下减少 executor 压力。
-
-当前可用 q400 cache-control 结果：
-
-- Artifact:
-  `results/hybrid_vector_db/sigmod_c4_guidance_memory_filteroff_q400_20260713_summary.json`
-- `native`: mean end-to-end 38.51ms，p95 72.78ms，visited tuples 7589.0，
-  returned tuples 228.3。
-- `all_memory`: mean end-to-end 36.48ms，p95 64.97ms，visited tuples 7589.0，
-  returned tuples 11.7，guidance skip rate 94.87%，400/400 ordered-id match。
-- `managed_cache`: mean end-to-end 36.75ms，p95 67.30ms，visited tuples
-  7589.0，returned tuples 11.7，guidance skip rate 94.87%，400/400 ordered-id
-  match。
-- Prebuilt fragments: 15 fragments，8.21MiB SSD payload，14.8s prebuild，
-  1MiB managed cache budget。
-
-写作原则：
-
-- ACORN1 traversal 是诊断实验，不应与纯 cache reuse 混在一起。
-- D3 主张应强调“复用 predicate/visibility state”，不是缓存最终结果。
-
-### P0/P1：Adaptive admission 待深入
-
-当前 raw D1/D2/D3 ablation 暴露一个需要单独处理的问题：在高
-selectivity 或 candidate waste 很低的 filter 上，无条件启用 D1/D2/D3
-不一定单调变好。典型现象是：
-
-- D1 的 membership/guidance check 成本可能超过 stock pgvector 本身的
-  SQL validation 成本。
-- D2 的物理布局收益依赖 workload 的 index/heap locality；并不是所有
-  label/tag filter 都能从 BFS 或 page-aware route 获益。
-- D3 的收益来自可复用 predicate/visibility state；如果 D1/D2 baseline
-  已经被 warmup、fragment cache 或 active guidance 污染，D3 的边际收益会被
-  提前算进 baseline。
-
-后续需要把 adaptive admission 作为独立机制分析，而不是现在强行把 raw
-D1/D2/D3 表改成单调结论。候选 route：
-
-- D1 admission：只在预测 invalid candidate waste 或 validation fanout 足够高
-  时启用 predicate guidance，否则保留 stock route。
-- D2 admission：只在预测 index/heap locality 可改善时切到 physical layout /
-  page-aware route。
-- D3 admission：只在 filter repeat、fragment cache hit、composed exact state
-  或预算下调能覆盖 activation 开销时启用 reusable state。
-
-需要补的实验：
-
-- 在 Amazon/YFCC/LAION 上记录每个 query 的 selectivity、returned tuples、
-  guidance checks/skips、visited tuples、idx/heap blocks、activation/cache hit。
-- 用这些 profile 学一个保守 admission rule，并与 oracle best-of-route 做
-  gap 分析。
-- 最终主表可以报告 `Stock`、`Raw SQLens`、`SQLens + adaptive admission`，
-  但在 admission 验证完成前，不把它作为已完成贡献。
-
-### P1：LAION-25M 是否进入主文
-
-目标：
-
-- 如果 LAION-25M 能补齐 10K frontier 与 SQL-exact/approx recall，则作为
-  第三个数据集进入主文。
-- 如果只能保留 q20/q640 小规模结果，则放 appendix 或作为 scalability
-  feasibility，不作为核心 4/5 分证据。
-
-当前结果：
-
-- `results/hybrid_vector_db/laion25m_selected_filters_q200_20260714.csv`
-- `results/hybrid_vector_db/laion25m_truth_all_q20_20260714.csv`
-- `results/hybrid_vector_db/laion25m_pgvector_all_q20_r3_20260714_with_recall.csv`
-- `results/hybrid_vector_db/laion25m_pgvector_all_q20_r3_20260714_summary_with_recall_e2e.csv`
-- `results/hybrid_vector_db/laion25m_pgvector_range_q20_r5_20260714_summary_e2e.csv`
-- `results/hybrid_vector_db/laion25m_pgvector_range_q20_r1_ef10000_mts5000000_summary_e2e.csv`
-
-### P1：Overhead 与 Robustness
-
-必须补齐的主文/appendix 结果：
-
-- guidance metadata size、index size、table size。
-- fragment build time、cache activation time。
-- update 后 invalidation/rebuild 成本。
-- 1/4/8/16 client 并发下 mean/p95/p99/throughput。
-- cache budget sensitivity，例如 1MiB、8MiB、64MiB。
-- correctness mismatch 必须为 0；lossy summaries 可以有 false positives，
-  但不能产生 false negatives。
-
-### P2：External payload-filter boundary
-
-目标：
-
-- 给审稿人一个清晰边界：vector-native payload filter 很强，但它不是
-  PostgreSQL SQL execution 的替代品。
-
-当前可用结果：
-
-- MS MARCO 1M Qdrant/PostgreSQL control：
-  - `research/late_bound_visibility/results/msmarco_security_killtest_1m_q100_20260713.csv`
-  - `research/late_bound_visibility/results/msmarco_security_killtest_1m_q100_20260713_summary.csv`
-  - `research/late_bound_visibility/results/msmarco_security_killtest_1m_q100_20260713_faiss.csv`
-- Enron 50K visibility control：
-  - `research/late_bound_visibility/results/enron_visibility_benchmark_q100_20260713.csv`
-  - `research/late_bound_visibility/results/enron_visibility_benchmark_q100_20260713_summary.csv`
-
-写作原则：
-
-- 不声称 SQLens/DBMS 在 payload-only 场景全面快于 vector-native system。
-- 强调 SQL-defined visibility、join、ACL、MVCC、temporal constraints 的语义
-  边界。
-
-## 当前需要保留的结果文件
-
-Amazon 10M：
-
-- `results/hybrid_vector_db/sigmod_d123_selectivity_q100r10_warmall_main_20260710_002705.csv`
-- `results/hybrid_vector_db/sigmod_d123_selectivity_q100r10_warmall_main_20260710_002705_table.csv`
-- `results/hybrid_vector_db/sigmod_candidate_waste_q100r10_main_20260710_002705.csv`
-- `results/hybrid_vector_db/sigmod_target_recall_calibration_calib_20260710_123543.csv`
-- `results/hybrid_vector_db/sigmod_c4_guidance_memory_filteroff_q400_20260713_summary.json`
-
-YFCC-10M：
-
-- `results/hybrid_vector_db/yfcc10m_pgvector_manifest_20260713.csv`
-- `results/hybrid_vector_db/yfcc10m_full_workload_requests_10000_20260714.csv`
-- `results/hybrid_vector_db/q100_v2_calib_q100_20260715.csv`
-- `results/hybrid_vector_db/q100_v2_calib_q100_20260715_sqltruth_summary.csv`
-- `results/hybrid_vector_db/q100_v2_selected_configs_sqltruth_20260715.csv`
-- `results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w0_20260715.csv`
-- `results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w1_20260715.csv`
-- `results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w2_20260715.csv`
-- `results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w3_20260715.csv`
-- `results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w4_20260715.csv`
-- `results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w5_20260715.csv`
-- `results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w6_20260715.csv`
-- `results/hybrid_vector_db/q10000_v2_full_q10000_10cfg_w7_20260715.csv`
-
-LAION-25M：
-
-- `results/hybrid_vector_db/laion25m_selected_filters_q200_20260714.csv`
-- `results/hybrid_vector_db/laion25m_truth_all_q20_20260714.csv`
-- `results/hybrid_vector_db/laion25m_pgvector_all_q20_r3_20260714_with_recall.csv`
-- `results/hybrid_vector_db/laion25m_pgvector_all_q20_r3_20260714_summary_with_recall_e2e.csv`
-
-Motivation 机制证据：
-
-- `research/results/page_locality_multidataset_q100_c1000_20260713.csv`
-- `research/results/page_locality_multidataset_q100_c1000_20260713_summary.csv`
-- `research/results/page_locality_reordered_multidataset_q100_c1000_20260713.csv`
-- `research/results/page_locality_reordered_multidataset_q100_c1000_20260713_summary.csv`
-
-脚本：
-
-- `experiments/hybrid_vector_db/scripts/yfcc_full_workload_recall_sweep.py`
-- `experiments/hybrid_vector_db/scripts/merge_full_workload_shards.py`
-- `experiments/hybrid_vector_db/scripts/recompute_full_workload_recall_from_exact.py`
-- `experiments/hybrid_vector_db/scripts/select_full_workload_configs.py`
-- `paper/scripts/plot_evaluation.py`
-
-## 对另一个实验 agent 的执行提醒
-
-1. 先完成 YFCC 10K formal run，不要把 partial shard 结果画进论文。
-2. 画 frontier 前，必须用 PostgreSQL exact endpoint 重新计算 recall。
-3. Evaluation 不再新增 candidate waste/page locality 机制图；这些图留在
-   Motivation。
-4. 不再推进 Complex SQL/Routing 主线实验。
-5. 每张主文图都必须同时报告或能追踪到 recall，否则不能作为性能 claim。
-6. 如果发现 SQLens 与 stock recall 不匹配，优先画 frontier 或 matched-recall
-   点，不要只比较 latency。
+# SQLens SIGMOD/VLDB Experiment Plan
+
+Last updated: 2026-08-02
+
+This document is the authoritative experiment plan for the SQLens paper. It is
+organized around paper claims, not around the chronological order in which
+experiments happened. Historical debugging notes remain recoverable from Git
+and result manifests; they do not define the current protocol.
+
+## 1. Paper Claim
+
+SQLens optimizes SQL-native filtered vector search inside PostgreSQL and
+pgvector without moving SQL, MVCC, access-control, or final validation semantics
+into an external vector engine.
+
+The evaluation must support four claims:
+
+1. At matched Recall@10, full SQLens reduces end-to-end latency and improves
+   throughput relative to stock PostgreSQL + pgvector.
+2. SQLens remains effective when visibility is defined by joins, RLS/ACL, and
+   temporal predicates rather than only by row-local payload columns.
+3. D1, D2, and D3 address complementary costs: invalid candidate validation,
+   physical page locality, and repeated predicate-state construction.
+4. SQLens preserves SQL-visible results under updates and concurrency with
+   acceptable build, storage, memory, and invalidation overhead.
+
+The headline system is full SQLens (`D1+D2+D3`). D1 alone must not be presented
+as the complete system.
+
+## 2. Motivation and Evaluation Boundary
+
+Motivation establishes that the problems exist:
+
+- stock pgvector returns many SQL-invalid TIDs for selective predicates;
+- graph traversal and physical index-page placement have poor locality;
+- predicate/visibility fragments repeat more often than exact query vectors.
+
+Evaluation measures whether SQLens solves those problems:
+
+- end-to-end latency and measured throughput at matched recall;
+- reduction in returned TIDs, heap fetches, SQL validation, and page I/O;
+- adaptation, materialization, reuse, and break-even behavior;
+- correctness and overhead under SQL-native queries, updates, and concurrency.
+
+Stock-only problem-existence figures belong in Motivation. Treatment-effect
+counters that explain a SQLens speedup remain in Evaluation.
+
+## 3. Evaluation Research Questions
+
+### RQ1: End-to-End Performance and Frontiers
+
+At the same Recall@10, how much does full SQLens improve end-to-end latency over
+stock PostgreSQL + pgvector, and does it improve the quality-cost frontier
+rather than merely selecting a lower-recall operating point?
+
+- Datasets: Amazon-10M, YFCC-10M, LAION-25M.
+- Workload: 14 meaningful predicates per dataset, approximately 50% to 0.2%
+  selectivity.
+- Targets: Recall@10 = 0.90, 0.95, and 0.99.
+- Headline comparison: stock pgvector versus full SQLens.
+- Metrics: achieved recall, mean, p50, p95, p99 latency, paired 95% confidence
+  intervals, win count, and geometric-mean speedup.
+- Use at least ten distinct configurations per arm and dataset.
+- Latency uses one 10,000-request mixed trace per dataset/configuration, not
+  10,000 requests per predicate.
+- Throughput uses clients = 1, 4, 8, 16, 32, and 64.
+- QPS is `completed requests / barrier wall time`; it is never derived from
+  inverse mean latency.
+- Report CPU, PostgreSQL backend CPU, error rate, and block-device/relation I/O
+  alongside p95 and p99.
+
+### RQ2: SQL-Native Visibility
+
+Does SQLens retain its advantage when the filter is defined by relational and
+transactional semantics?
+
+Amazon-10M contains three required workload families:
+
+| Workload | SQL semantics |
+|---|---|
+| `acl_only` | product-dimension join, principal grant join, and PostgreSQL RLS |
+| `grant_temporal_selectivity` | ACL/RLS plus grant validity interval |
+| `fact_temporal_selectivity` | fact/product join plus source-row validity interval |
+
+Each request must be one normal PostgreSQL hybrid SQL statement. Python-generated
+allow-lists cannot be reported as SQL-native execution. Results use independent,
+exact SQL-valid top-10 ground truth.
+
+### RQ3: Component Analysis and Ablation
+
+What is the cumulative contribution of VisGuide, Locality, and FragReuse, and
+which measured mechanism explains each increment?
+
+- Main-paper scope: Amazon-10M only.
+- Arms: Stock, VisGuide, VisGuide+Locality, and SQLens.
+- The existing Amazon-10M ablation is retained; it is not a P0 rerun.
+- Before publication, regenerate the paper table from authoritative source CSVs
+  and resolve any cross-table numeric mismatch. This is an artifact audit and
+  table-generation task, not a new experiment.
+- Per-predicate rows remain in the paper or appendix according to space.
+- VisGuide: visited nodes, distance computations, returned TIDs, heap fetches, SQL
+  qualifier calls, and guidance skips.
+- Locality: same-logical-graph proof, page span/runs, ReadBuffer hits/misses and service
+  time, warm latency, cold-I/O sensitivity, rewrite time, and storage overhead.
+- FragReuse: empty-cache start, probes, online materializations, reuses, evictions,
+  phase shift, cumulative break-even, p95/p99, and fresh-backend persistent
+  reload.
+
+YFCC and LAION ablation results are supporting/appendix evidence and are not a
+submission blocker.
+
+### RQ4: Correctness, Concurrency, and Deployability
+
+Can SQLens preserve PostgreSQL-visible results and remain useful under load?
+
+- Read Committed and Repeatable Read.
+- Commit/rollback, insert, delete, predicate-crossing update, vector update,
+  truncate, and TID reuse.
+- Requested update rates = 0, 10, 100, and 1000 TPS.
+- Read clients = 1, 4, 8, 16, 32, and 64.
+- Report ordered-ID/distance mismatches, delivered update TPS, delivery ratio,
+  read QPS, p95/p99, invalidations, rebuild/reactivation latency, stale bypass,
+  metadata size, cache size, index size, and build/rewrite time.
+
+## 4. Main-Paper Figure and Table Layout
+
+| Position | Form | Content |
+|---|---|---|
+| Table 1 | Setup table | datasets, rows, dimensions, predicates, queries, table/index size, GT |
+| Figure 5 | 2 x 3 panels | recall-latency and measured throughput-recall for three datasets |
+| Table 2 | Matched-recall summary | dataset x target, stock/full SQLens latency, p95/p99, recall, QPS, speedup |
+| Figure 6 | 1 x 3 SQL-native panels | ACL/RLS, grant-time, and fact-time end-to-end latency versus actual combined selectivity |
+| Table 3 | Component analysis and ablation | Stock, VisGuide, VisGuide+Locality, SQLens, recall and speedup |
+| Table 4 | Robustness/overhead | updates, concurrency, correctness, memory, storage, build cost |
+
+Appendix material:
+
+- all 14 per-predicate matched-recall rows;
+- complete baseline parameter grids and unattainable cells;
+- complete SQL-native per-cell latency, recall, counters, plans, and six
+  boolean-complex workload variants;
+- YFCC/LAION ablation;
+- D2 cold-I/O and ReadBuffer detail;
+- cache-budget and predicate-complexity sensitivity;
+- full update/concurrency matrix.
+
+Do not allocate a main-paper figure to calibration scores, fixed-`ef_search`
+comparisons, historical q400 results, or derived QPS.
+
+## 5. Unified Measurement Contract
+
+### 5.1 Release identity
+
+The current frozen release is r41. r36 artifacts remain immutable historical
+evidence and must not be relabeled as r41:
+
+- build ID:
+  `sqlens-v16-distance-aware-route-budget-ef500k-20260801-r41`
+- `vector.so` SHA256:
+  `8f53226d35cae28d4e1b6926b13b01fa01fd1f6720c5f57c96c7886905f5eaf0`
+- release contract:
+  `experiments/hybrid_vector_db/configs/p0_release_contract_r41.json`
+
+Paper artifacts must verify the server-side build ID, installed `vector.so`
+digest, table/index OID and relfilenode, selected HNSW index, filter/query/GT
+hashes, query split, and EXPLAIN plan.
+
+### 5.2 Recall and configuration selection
+
+- `k=10`, exact tie-aware SQL-valid top-10 ground truth.
+- Stock, full SQLens, and every approximate baseline tune independently.
+- Calibration and final measurement queries are disjoint.
+- The main protocol uses one global configuration per
+  `(dataset, target, method)`. It does not retune per predicate.
+- Formal calibration is the complete Cartesian product of the 200 calibration
+  queries and 14 predicates: 2,800 requests and exactly 200 observations per
+  predicate. The historical q200 mixed trace is audit-only.
+- A configuration qualifies only if both its aggregate Recall@10 LCB95 and
+  every predicate's Recall@10 LCB95 meet the target. Among qualifying
+  configurations, select the lowest measured calibration cost.
+- Predicate-conditioned tuning, if reported, is a separate appendix result.
+  It must give Stock and every baseline the same per-predicate tuning budget
+  and include selector overhead.
+- A method that cannot reach a target after exhausting its required grid is
+  marked `unattainable_on_grid`; it is not compared as though it met the target.
+- Final paper latency comes only from held-out end-to-end requests. Calibration
+  scores are never plotted as final latency.
+
+### 5.3 Final trace
+
+- Use a frozen 10,000-request mixed trace per dataset.
+- Queries q0--q199 are reserved for screening/calibration/confirmation;
+  q200--q10199 are measurement queries.
+- Methods use seeded paired/interleaved scheduling.
+- D3 begins each repeat with an empty namespace. Probe, materialization, reuse,
+  and activation costs are included.
+- Warm-cache is the main result. Cold-I/O is a labeled mechanism stress test.
+
+### 5.4 Expedited per-predicate evidence
+
+The August 2 expedited campaign requested by the author is a distinct result
+class. It uses one held-out 5,000-unique-query mixed trace, one paired/interleaved
+repeat, and independently tuned per-predicate settings for both arms. It is
+useful for filling and debugging target-matched rows quickly, but it is not the
+global-configuration q10K/r3 protocol above and is therefore not automatically
+`paper_eligible` for the headline table. Promotion requires either completing
+the formal protocol or explicitly revising the paper contract and rerunning all
+datasets consistently.
+
+The r41 LAION-25M Recall@10 approximately 0.90 artifact is:
+
+`results/hybrid_vector_db/table6_r41_laion_target090_per_filter_q5k/`
+`laion_target090_per_filter_paired_q5k.csv`
+
+It contains 5,000 unique queries per arm, all 14 predicates, 10,000 rows, zero
+errors, exact runtime identity and CPU-affinity evidence, and a complete online
+D3 lifecycle. Stock/SQLens mean recall is 0.9084/0.9092; workload-weighted mean
+latency is 335.02/290.65 ms; per-predicate latency geomean is 113.56/108.75 ms
+(1.044x); and SQLens wins 11/14 predicates. Per-predicate recall ranges from
+0.8957 to 0.9228, with at most 0.0089 difference between the two arms on a
+predicate. This is valid expedited evidence, not a strict every-predicate
+0.900 result.
+
+The raw rows preserve every effective setting, but this run predates the plan
+schema that separately records configured per-filter overrides versus global
+adaptive routing. Its current evidence-inventory classification is therefore
+`diagnostic` until a SHA-bound provenance supplement or a rerun with the new
+`search_configuration` plan block proves the tuning scope. This does not change
+the measured values; it prevents them from being promoted under an ambiguous
+configuration contract.
+
+### 5.4 Statistical reporting
+
+- Latency: mean, p50, p95, p99, standard deviation, and paired 95% CI.
+- Recall: aggregate mean Recall@10, per-predicate mean and LCB95, minimum
+  predicate recall, and target delta. Every predicate must pass in every final
+  repeat for a fixed-target cell to enter the paper.
+- Throughput: measured completed QPS and 95% CI.
+- Each plot point binds to raw request rows and a complete manifest.
+
+## 6. Baselines
+
+| Baseline | Paper role | Required treatment |
+|---|---|---|
+| Official upstream pgvector 0.8.2 | primary DB baseline | auto planner and forced HNSW reported separately |
+| SQLens binary, all features disabled | instrumentation overhead control | same table, SQL, index, and query trace |
+| Indexed SQL-first exact | exact DB baseline | one PostgreSQL statement; offline GT time is not substituted |
+| FAISS HNSW allow-list | standalone FVS baseline | report materialization, transfer, search, and cached-list control |
+| Weaviate 1.38 | production payload-filter baseline | independently tune ACORN, sweeping, cutoff, and ef |
+| Full SQLens | proposed system | D1+D2+D3 with online D3 costs included |
+
+FAISS and Weaviate are compared only on predicates they can faithfully express.
+Join/RLS/temporal semantics are a scope boundary, not a claim that PostgreSQL
+universally outperforms vector-native systems.
+
+## 7. Existing Evidence Inventory
+
+### 7.1 Ready for the paper
+
+- D2 Amazon-10M same-graph warm/cold locality:
+  `amazon10m_r30_d2_cache_isolated_warm_q100r5_retry3_20260722.csv.manifest.json`
+  and
+  `amazon10m_r33_d2_cache_isolated_cold14_q1r5_distinct_20260727.csv.manifest.json`.
+- D3 Amazon-10M q10K online adaptation:
+  `amazon10m_d3_adaptation_lifecycle_r29_formal_q10k_clean_manifest.json`.
+- Amazon-10M component ablation is retained for Table 3, subject to
+  authoritative-source and table-generation audit.
+
+D2/D3 use older release identities. Before final submission, audit whether the
+relevant implementation paths changed. Rerun only the affected mechanism if
+behavioral equivalence cannot be established.
+
+### 7.2 Complete foundations, not final performance results
+
+- Three datasets and their 14-filter workload definitions.
+- Row-local exact SQL-valid GT and frozen q10K traces.
+- Amazon SQL-native q200 GT for 3 workloads x 14 filters:
+  `amazon10m_sql_native_exact_truth_valid_embeddings/amazon10m_sql_native_exact_truth_manifest.json`.
+- r36 Figure 5 calibration: 146 base cells + 36 stock-cap cells + 33 SQLens
+  target-extension cells. These are configuration-selection evidence and are
+  explicitly not paper latency.
+- The old Weaviate Amazon-10M run has 41 of 42 target cells final-confirmed,
+  but its filter and GT hashes predate the current corpus import. It is useful
+  only as protocol/debugging evidence; all current-protocol cells must rerun.
+- Existing SQL-first/FAISS combined artifacts are protocol-reuse candidates,
+  not yet current-P0 paper evidence.
+- r41 expedited per-predicate q5K results exist for Amazon, YFCC, and LAION.
+  They are useful target-matching and implementation evidence. The LAION 0.90
+  run is a single complete paired artifact; the Amazon/YFCC campaigns are
+  per-filter shards plus repair cells and require a deterministic merge audit.
+  None should be mixed with r36 global q10K rows.
+- The current machine-readable r41 inventory is
+  `results/hybrid_vector_db/r41_matched_recall_evidence_inventory.{csv,json}`.
+  Of the eleven enumerated artifacts, four single-pass throughput artifacts are
+  `expedited` and seven latency artifacts are `diagnostic`; none yet passes the
+  complete formal publication gate.
+
+### 7.3 Missing paper evidence
+
+1. Current-release three-dataset matched-recall q10K final results.
+2. Official upstream pgvector and SQLens-disabled A/B.
+3. Current-protocol SQL-first, FAISS, and fully closed Weaviate baselines.
+4. Amazon SQL-native q10K GT and formal execution measurements.
+5. Formal measured service curves.
+6. Current-release update correctness and read/write concurrency.
+
+The old universal-frontier-dominance, full-system `1.95x`, formal-throughput,
+and current-release transactional-update claims remain withheld until the
+corresponding evidence passes the release gate.
+
+## 8. Authoritative P0 Execution Order
+
+The P0 queue follows the paper dependency graph. A later stage cannot begin
+until the previous stage publishes an audited manifest.
+
+### P0-1: Three-dataset current-release matched recall
+
+1. Build the balanced q2800 calibration traces from the existing q200 query
+   cohort and exact all-predicate truth, then rerun the r36 candidate grid.
+2. Generate the fixed-target selector for Recall@10 = 0.90/0.95/0.99.
+3. Run q10K/r3 paired/interleaved latency for the selected fixed-target pairs
+   and preserve fully exhausted unattainable targets as explicit results.
+4. Generate the Table 2 matched-target summary.
+5. Separately generate the distinct-pair frontier selector with at least ten
+   configurations per arm and dataset. Reuse any fixed-target raw cells whose
+   configuration-pair hashes are identical, then run only the missing q10K/r3
+   pairs for the latency half of Figure 5.
+
+Current status (2026-08-02):
+
+- r41 is the active binary. Any remaining r36 references in paper-facing runner
+  defaults are release-migration defects; historical manifests retain their
+  original r36 identity.
+- A complete r41 LAION per-predicate q5K Recall approximately 0.90 run is
+  available and classified under Section 5.4. A corresponding Recall
+  approximately 0.95 artifact also exists, but contains targeted repair shards
+  and must retain its merge provenance.
+- r41 YFCC global q10K and measured c16 artifacts exist for several targets;
+  their publication status must be recomputed against the current release and
+  configuration-selection contract instead of copied from the r36 table.
+- An r41 Amazon global-grid calibration is currently running. Do not launch a
+  second database benchmark against the same PostgreSQL/storage instance while
+  it is active.
+- The bullets below describe the earlier r36/r37 campaign and remain as
+  historical rationale for the stricter gates.
+
+- The r37 formal workload artifacts now exist for Amazon-10M, YFCC-10M, and
+  LAION-25M. Each calibration trace is the complete 200-query x 14-predicate
+  Cartesian product (2,800 requests, exactly 200 observations per predicate),
+  followed by the frozen disjoint q10K measurement trace.
+- Amazon reuses its already complete exact all-predicate truth. YFCC and LAION
+  calibration truth was recomputed by an exact float32 full-base scan over 10M
+  and 25M rows, respectively. Their q10K measurement truth is reused only for
+  exact `(query_no, query_id, filter_name)` matches. The 200 CPU/GPU overlap
+  rows pass a fail-closed audit that permits only float32 rounding and tied
+  IDs at the exact kth-distance boundary.
+- The formal workload manifests and the 12,800-row assigned-truth artifacts are
+  valid. Contract tests for workload construction, exact-truth generation and
+  merge, selector, and final latency gates pass (100 tests).
+- Base, Stock-cap, and SQLens-target q200 calibration completed with zero
+  request errors and exact r36 runtime identity, but this trace has only about
+  14 observations per predicate and is now classified as audit-only.
+- A parallel q200 high-budget screening run is in progress only to reduce the
+  expensive formal grid. Screening latency is invalid under resource
+  interference and will never be selected or plotted; only its recall signal
+  is used to choose formal q2800 cells. Formal calibration and all held-out
+  latency measurements remain cache-isolated and sequential.
+- The legacy aggregate-only fixed-target selector is
+  `figure5_r36_formal/figure5_r36_fixed_target_configs.{csv,json,manifest.json}`.
+  It binds 274 calibration artifacts and publishes eight selected pairs:
+  Recall@10 0.90/0.95/0.99 on Amazon and YFCC, and 0.90/0.95 on LAION.
+- The completed Amazon 0.90 q10K/r3 diagnostic is not paper evidence. Although
+  aggregate recall passes 0.90, `long_review_ge500` falls from Stock 0.9342 to
+  SQLens 0.4613 while contributing a 4.94x apparent speedup. This is precisely
+  the quality-cost substitution that the formal per-predicate gate prevents.
+- Under the legacy grid, LAION 0.99 is
+  `unattainable_on_calibration_grid`: Stock exhausted
+  ef 20K/50K/100K, while SQLens exhausted the registered high-recall beam/target
+  extension through ef 10K and target 1K. The formal q2800 calibration must
+  re-establish this result.
+- The aggregate-only q10K run was stopped before Amazon 0.95 completed. P0-1
+  resumes only after the balanced calibration, formal selector, and
+  per-predicate final gate are published and tested.
+
+### P0-2: Official upstream and disabled control
+
+1. Rebuild one dedicated Amazon source-order HNSW index under the unmodified
+   official pgvector 0.8.2 binary and archive binary/source/index provenance.
+2. Upgrade the existing A/B runner from q100/r5 to the frozen q10K/r3 trace,
+   pass DSN/planner/workload arguments through the binary controller, and bind
+   the exact r36 build ID rather than an obsolete prefix.
+3. Run official upstream and SQLens-disabled on that same table, index, SQL,
+   trace, GT, and independently selected matched-recall targets.
+4. Report auto-planner and forced-HNSW variants. The disabled arm must prove
+   `final_path=stock` and zero D1/D2/D3 activity for every measured query.
+5. Restore and verify the r36 binary before continuing.
+
+The existing official/disabled artifacts are not reusable: they are q200,
+partial, built from older SQLens binaries, or use a patched/non-pinned official
+binary. No current artifact has a publishable official-vs-disabled manifest.
+
+Implementation status (2026-07-30): the q10K/r3 A/B controller, disabled-path
+proof, and official-index preparation/provenance tool pass local tests and
+dry-run. The dedicated official-built index and the real binary-switch A/B
+artifact have not yet been executed.
+
+### P0-3: SQL-first, FAISS, and Weaviate
+
+1. Re-audit existing SQL-first/FAISS artifacts against the current query,
+   predicate, GT, and target contract.
+2. Add independent method selection to the shared Amazon runner and rerun the
+   SQL-first and FAISS cells against the current M32 index, filters, and GT.
+3. Report planner-chosen and forced-indexed SQL-first separately. For FAISS,
+   report SQL materialization, row transfer, bitmap construction, ANN search,
+   full end-to-end, and cached-allow-list control as distinct metrics.
+4. Rerun the complete Weaviate matrix because the old 41/42 result binds the
+   previous filter/GT hashes. Bind the current import and truth manifests and
+   return only row ID and distance in the timed GraphQL response.
+5. Add `paper_eligible` gates and produce a payload-compatible strong-baseline
+   summary. Do not treat latency reciprocals as measured concurrent QPS.
+
+Implementation status (2026-07-30): SQL-first/FAISS and Weaviate now expose
+current q200 calibration plus q10K/r3 formal protocols, per-request checkpoints,
+current input hashes, and fail-closed publication gates. No current-protocol
+PostgreSQL/FAISS or Weaviate final artifact has been executed.
+
+### P0-4: SQL-native workloads
+
+1. Restrict the main experiment to `acl_only`,
+   `grant_temporal_selectivity`, and `fact_temporal_selectivity`, using four
+   representative predicates spanning roughly 38% to 0.055% combined
+   selectivity. Keep the six boolean-complex variants for the appendix.
+2. Upgrade the GT producer from the hard-coded q100+q100 protocol and generate
+   exact SQL-valid GT for the frozen q10,200 cohort.
+3. Upgrade the runner to q80/r2 calibration plus a balanced q10K/r3 mixed
+   measurement trace. Fix the continuous end-to-end timer, use Recall LCB95
+   for selection, and reset D3 once per trace repeat rather than once per cell.
+4. Run stock, forced-indexed SQL-first exact, and full SQLens for the three
+   workload families under the r36 release identity.
+5. Require complete trace/output hashes, RLS positive/negative probes, relation
+   epoch stability, plan proofs, and zero errors before publication.
+6. Report recall, mean/p95/p99, returned TIDs, heap/index activity, and plans;
+   then generate Figure 6.
+
+Implementation status (2026-07-30): the GT producer and three-arm SQL-native
+runner pass local tests and q10K/r3 dry-run. The q10,200 SQL-native GT and the
+real formal benchmark remain unexecuted.
+
+### P0-5: Formal service curves
+
+1. Remove all latency-reciprocal throughput numbers from paper-facing
+   artifacts. QPS is measured only as completed queries divided by the
+   barrier-delimited wall-clock interval.
+2. For the throughput-recall half of Figure 5, run the 32 distinct matched
+   pairs at one preregistered concurrency (16 clients), q10K/r3. This retains
+   at least ten frontier points per dataset without multiplying every point by
+   the full client grid.
+3. Separately run the fixed Recall@10 0.90 pair for each dataset at
+   clients 1/4/8/16/32/64, q10K/r6, to report closed-loop concurrency scaling.
+   Describe this as one outstanding request per client, not open-loop SLO
+   capacity.
+4. Pass the container's real backend `/proc` root through the wrapper, use
+   disjoint client/backend CPU partitions, and hold a global experiment lock
+   while collecting host/device telemetry.
+5. Record measured QPS with CI, per-request p95/p99 with CI, recall LCB95,
+   errors/timeouts, backend and host CPU, device I/O, and relation/index
+   reads/hits. Preserve those fields in a service-summary artifact rather than
+   dropping them in the plotting aggregate.
+6. Generate the throughput half of Figure 5 and an appendix
+   QPS/p95/p99-versus-clients figure.
+
+This split executes about 4.08M real hybrid queries instead of the redundant
+23.04M-query Cartesian product of every frontier pair and every client count.
+The current q400 concurrency artifacts and `1000 / mean_latency` summaries are
+not reusable as formal service evidence.
+
+Implementation status (2026-07-30): both preregistered service slices, Docker
+backend-proc telemetry, and the service-summary gate pass local tests/dry-run.
+No formal measured service cell exists yet.
+
+### P0-6: Updates and concurrency
+
+1. Add exact r36 source/binary gates, per-cell atomic checkpoints/resume,
+   full-SQLens mode, current matched-recall input bindings, and formal
+   `paper_eligible` gates to the two new update runners.
+2. Run the 128-row adversarial commit/rollback/update/delete/TRUNCATE harness
+   under RC and RR, including non-owner RLS/ACL cases.
+3. Run the current-release 250K-row/1K-query correctness stress with real
+   predicate/vector/insert/delete changes, four readers, two writers, and 2K
+   committed updates.
+4. Run Stock and full SQLens at Recall@10 0.90 for requested update rates
+   0/10/100/1000 TPS across 1/4/8/16/32/64 readers, q10K/r6. Disable
+   per-query profiling in the timed service run and collect a separate sampled
+   profile trace.
+5. Record overload cells and continue the matrix. Require delivered/requested
+   update TPS >= 0.90 only for cells claimed as sustainable.
+6. Gate recall/correctness, read p95/p99, update lag p95/p99, zero errors,
+   successful commits, relation epoch transitions, invalidations, rebuilds,
+   and reactivations.
+7. Add a 50%/5%/0.5% selectivity sensitivity at 16 readers and
+   0/100/1000 TPS, then generate Table 4 and the appendix service matrix.
+
+The existing r22/r26 correctness and q400 read-only concurrency results remain
+historical diagnostics. They are not current-release read/write evidence.
+
+Implementation status (2026-07-30): the current-release correctness and
+read/write runners support the formal matrix, atomic per-cell resume, sampled
+profiling, real mutations, and lifecycle gates in local tests/dry-run. They
+remain unexecuted and therefore provide no paper result yet.
+
+## 9. Execution Efficiency
+
+- Do not run independent database benchmark cells concurrently against the same
+  PostgreSQL instance and storage path. They would interfere through buffer
+  cache, backend CPU, and block-device I/O.
+- Use one paired/interleaved invocation per dataset/configuration to avoid
+  repeated restarts and prewarm.
+- Parallelize pure CPU exact-GT shards, artifact validation, statistics, and
+  plotting on separate CPU/NUMA partitions when they do not read the experiment
+  database or shared block device.
+- Throughput experiments deliberately use multiple clients; different
+  throughput cells remain sequential.
+- Run an auditor after every stage and resume only missing cells.
+
+## 10. Artifact Release Gate
+
+Every paper-facing artifact must satisfy:
+
+1. `status=complete`, `artifact_valid=true`, `paper_eligible=true`.
+2. Requested slice and full paper-required coverage are both explicit.
+3. Runtime binary, source, index, relation, query, filter, workload, and GT
+   identities match the frozen contract.
+4. Raw row count, query coverage, repeat coverage, plan coverage, and hashes
+   close exactly.
+5. Errors, timeouts, silent fallbacks, plan drift, and missing cells are zero.
+6. Unattainable cells include complete required-grid exhaustion proof.
+7. Paper tables and figures are generated automatically from audited summaries.
+
+## 11. Immediate Next Action
+
+1. Let the active r41 Amazon calibration finish without a competing database
+   workload, then audit its requested cells and recall gates.
+2. Produce one r41 evidence inventory for all three datasets and targets,
+   separating global q10K artifacts, expedited per-predicate q5K artifacts,
+   calibration-only cells, and measured-QPS artifacts.
+3. Migrate paper-facing runner defaults from r36 to the immutable r41 contract
+   without rewriting historical manifests, and rerun affected unit tests.
+4. Complete only the missing r41 matched-recall cells after the inventory;
+   do not rerun cells that already satisfy the selected protocol.
+5. Continue P0-2 through P0-6 only after P0-1 has one internally consistent
+   protocol and fail-closed summary.

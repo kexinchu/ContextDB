@@ -1,0 +1,26 @@
+{
+  "original": {
+    "ef_search": 2000,
+    "max_scan_tuples": 5000000,
+    "scan_mem_multiplier": 32,
+    "iterative_scan": "strict_order",
+    "guided_collect_target": 2000,
+    "traversal_guided_target": 10,
+    "traversal_guided_prioritization": false,
+    "traversal_guided_burst": 1,
+    "traversal_guided_early_stop": false,
+    "traversal_guided_early_stop_distance_ratio": 0
+  },
+  "design1_bloom_bfs_layout_d3": {
+    "ef_search": 500,
+    "max_scan_tuples": 5000000,
+    "scan_mem_multiplier": 32,
+    "iterative_scan": "off",
+    "guided_collect_target": 500,
+    "traversal_guided_target": 20,
+    "traversal_guided_prioritization": true,
+    "traversal_guided_burst": 1,
+    "traversal_guided_early_stop": true,
+    "traversal_guided_early_stop_distance_ratio": 0.995
+  }
+}

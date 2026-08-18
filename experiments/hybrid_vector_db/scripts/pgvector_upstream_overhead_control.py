@@ -1,8 +1,9 @@
 """Formal stock-pgvector overhead control with held-out matched-recall tuning.
 
-The caller switches ``vector.so`` before invoking this runner.  The runner
+Each invocation binds one explicit DSN and one inspected Docker container.  It
 never copies libraries, restarts services, creates indexes, or uses a SQLens
-query marker.  Both implementations execute the same stock filtered HNSW SQL.
+query marker.  The ``official`` and ``sqlens_disabled`` arms are therefore
+separate server artifacts rather than a process that swaps ``vector.so``.
 """
 
 from __future__ import annotations
@@ -26,18 +27,36 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_filters.csv"
-DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal.csv"
+DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_valid_embeddings_filters.csv"
+DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_unique_embeddings_formal.csv"
+DEFAULT_CALIBRATION_WORKLOAD = (
+    ROOT / "results/hybrid_vector_db/figure5_r35_amazon_calibration.csv"
+)
+DEFAULT_MEASUREMENT_WORKLOAD = (
+    ROOT / "results/hybrid_vector_db/figure5_r35_amazon_measurement.csv"
+)
 DEFAULT_OUT_DIR = ROOT / "results/hybrid_vector_db"
 DEFAULT_TABLE = "public.amazon_grocery_reviews_10m_pgvector"
-DEFAULT_INDEX = "public.amazon10m_embedding_valid_hnsw_source_idx"
+DEFAULT_INDEX = "public.amazon10m_hnsw_m32ef200_dupbridge_r29_source_idx"
 DEFAULT_CANDIDATE_VALIDITY_PREDICATE = "embedding_valid"
+FORMAL_FILTERS_SHA256 = "ae07c4d94450958f2071bf54f5db48d26c55328538087629cb1375c09bd4bcec"
+FORMAL_TRUTH_COHORT_SHA256 = "9c457ca6bc178c66e112f1f72bd94f23178e110311c2d3aa8418a5c3eced887f"
+FORMAL_Q10200_TRUTH_SHA256 = "62e7f280f953828b680b2ae069de221bd6d593e42b241cd3d699ea870a1bfb5b"
+FORMAL_CALIBRATION_WORKLOAD_SHA256 = (
+    "54ca60d63c7c68391005e663bf20bf4b0e5b8d749973cf259a55e984a74b79e2"
+)
+FORMAL_MEASUREMENT_WORKLOAD_SHA256 = (
+    "983622346f87d5c084be24e5784da8cc9063e44302732e9b05f37cc360e719a8"
+)
+FORMAL_CALIBRATION_REQUESTS = 200
+FORMAL_MEASUREMENT_REQUESTS = 10_000
 UPSTREAM_MAX_EF_SEARCH = 1000
 EVALUATION_EF_PATCH_SHA256 = {
     10_000: "d63b8d75015cffb90d9bd7f04d0c8f572502f0b84f77f59f581d224db7601bcf",
     100_000: "2393fff3ac210d9fd19478ed7552db559359d19cdae693de51e42c71d04cf225",
 }
-DEFAULT_EF_VALUES = (250, 500, 750, UPSTREAM_MAX_EF_SEARCH)
+LOW_EF_VALUES = (20, 40, 60, 80, 100, 150, 200)
+DEFAULT_EF_VALUES = (*LOW_EF_VALUES, 250, 500, 750, UPSTREAM_MAX_EF_SEARCH)
 DEFAULT_BUDGET_RUNGS = (
     (1, 100_000, 1.0),
     (2, 1_000_000, 8.0),
@@ -45,11 +64,33 @@ DEFAULT_BUDGET_RUNGS = (
 )
 OFF_REPRESENTATIVE_MAX_SCAN = 100_000
 OFF_REPRESENTATIVE_SCAN_MEM = 1.0
-OFFICIAL_UPSTREAM_VECTOR_SO_SHA256 = "812292e3e7553c3dbe6a4187b528430a7f9c25693f4876b8d22f88829592a778"
-DEFAULT_SQLENS_BUILD_PREFIX = "sqlens-v11-"
-DEFAULT_SQLENS_PROFILE_SEMANTICS = 7.0
+OFFICIAL_UPSTREAM_VECTOR_SO_SHA256 = "a97f730478cd3628820fb072273f8185c94ffa76a9ee802a006db7028e7b8d87"
+DEFAULT_SQLENS_BUILD_PREFIX = (
+    "sqlens-v16-d3-full-materialization-persisted-reuse-"
+)
+DEFAULT_SQLENS_BUILD_ID = (
+    "sqlens-v16-d3-sticky-rejection-mixed-predicate-reuse-d2-edge-trace-"
+    "readbuffer-profile-orderchangefix-ef500k-20260729-r36"
+)
+DEFAULT_SQLENS_PROFILE_SEMANTICS = 9.0
 FORMAL_TARGET_RECALLS = (0.90, 0.95, 0.99)
 FORMAL_FAMILIES = ("off", "strict_order")
+FORMAL_FAMILY_CHOICES = (*FORMAL_FAMILIES, "all")
+PLANNER_MODES = ("auto", "forced_hnsw")
+FORMAL_FINAL_BLOCKS = 5
+FROZEN_WORKLOAD_FINAL_BLOCKS = 3
+FORMAL_PROTOCOL_VERSION = (
+    "official-upstream-matched-recall-v6-frozen-q200r2-q10kr3"
+)
+LEGACY_FORMAL_PROTOCOL_VERSION = (
+    "official-upstream-matched-recall-v5-independent-dsn-container-lcb95-q80r2-q100r5"
+)
+CALIBRATION_SELECTION_POLICY = "lcb_then_max_recall"
+CALIBRATION_SELECTION_RULE = (
+    "among every complete configuration in the frozen r2 calibration grid whose "
+    "query-cluster bootstrap Recall@10 LCB95 reaches the target, select the "
+    "lowest mean latency; no mean-recall fallback is publishable"
+)
 STOCK_HNSW_GUCS = frozenset(
     {
         "hnsw.ef_search",
@@ -59,6 +100,9 @@ STOCK_HNSW_GUCS = frozenset(
     }
 )
 SQLENS_PROFILE_FIELDS = (
+    "traversal_result_target",
+    "traversal_guided_result_count",
+    "traversal_max_scan_reached",
     "graph_elements_visited",
     "raw_index_tids_returned",
     "hnsw_am_callback_ms",
@@ -74,6 +118,7 @@ SQLENS_PROFILE_FIELDS = (
     "heap_tid_distinct_pages_exact",
     "heap_tid_sequence_scope",
     "heap_blks_are_exact_heap_io",
+    "priority_reorders",
 )
 SQLENS_OFF_GUCS = (
     "hnsw.filter_strategy",
@@ -113,11 +158,13 @@ STAGE_QUERY_NOS = {
 RAW_FIELDS = (
     "run_uuid",
     "implementation",
+    "planner_mode",
     "execution_stage",
     "final_block",
     "phase",
     "query_split",
     "filter_name",
+    "request_no",
     "query_no",
     "query_id",
     "repeat",
@@ -136,11 +183,20 @@ RAW_FIELDS = (
     "result_ids",
     "recall_at_10",
     "truth_self_excluded",
+    "disabled_path_verified",
+    "disabled_final_path",
+    "disabled_profile_sha256",
     "valid",
     "error",
 )
 # Compatibility alias for callers/tests that consumed the first revision.
 CSV_FIELDS = RAW_FIELDS
+RAW_COMPAT_OPTIONAL_FIELDS = {
+    "request_no",
+    "disabled_path_verified",
+    "disabled_final_path",
+    "disabled_profile_sha256",
+}
 
 
 class ProvenanceGateError(RuntimeError):
@@ -183,6 +239,14 @@ class TruthEntry:
     tie_tolerance: float
     exact_ids: tuple[int, ...]
     self_excluded: bool
+
+
+@dataclass(frozen=True)
+class WorkloadRequest:
+    request_no: int
+    query_no: int
+    query_id: int
+    filter_name: str
 
 
 def utc_now() -> str:
@@ -232,6 +296,13 @@ def validate_sha256(value: str) -> str:
     return normalized
 
 
+def dsn_fingerprint(conninfo: str) -> str:
+    """Persist a target binding without placing database credentials on disk."""
+    if not isinstance(conninfo, str) or not conninfo.strip():
+        raise ProvenanceGateError("formal runs require an explicit non-empty --dsn")
+    return hashlib.sha256(conninfo.encode("utf-8")).hexdigest()
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -249,6 +320,7 @@ def validate_formal_design(
     filters: Sequence[Mapping[str, Any]],
     targets: Sequence[float],
     formal_family: str,
+    planner_mode: str = "forced_hnsw",
 ) -> dict[str, Any]:
     names = [str(row["filter_name"]) for row in filters]
     if len(names) != 14 or len(set(names)) != 14:
@@ -256,16 +328,31 @@ def validate_formal_design(
     normalized = tuple(float(target) for target in targets)
     if normalized != FORMAL_TARGET_RECALLS:
         raise ValueError("formal design requires target recalls exactly 0.90,0.95,0.99")
-    if formal_family not in FORMAL_FAMILIES:
+    if formal_family not in FORMAL_FAMILY_CHOICES:
         raise ValueError(
-            "relaxed_order is exploratory-only; formal_family must be off or strict_order"
+            "relaxed_order is exploratory-only; formal_family must be off, "
+            "strict_order, or all"
         )
+    if planner_mode not in PLANNER_MODES:
+        raise ValueError(f"planner_mode must be one of {PLANNER_MODES}")
     return {
         "formal_family": formal_family,
+        "planner_mode": planner_mode,
+        "planner_contract": (
+            "PostgreSQL planner defaults; EXPLAIN route is observed but not forced"
+            if planner_mode == "auto"
+            else "enable_seqscan=off; EXPLAIN must prove the declared HNSW index"
+        ),
         "filters": names,
         "target_recalls": list(FORMAL_TARGET_RECALLS),
         "target_metric": "query_level_mean_recall_at_10",
-        "uncertainty": "query_bootstrap_95pct_ci_reported_not_used_as_target",
+        "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+        "calibration_selection_rule": CALIBRATION_SELECTION_RULE,
+        "uncertainty": (
+            "query-cluster bootstrap Recall@10 LCB95 is a hard calibration "
+            "admission gate; a target without an LCB95-qualified configuration "
+            "on the complete grid is not publishable"
+        ),
         "cell_keys": [
             f"{name}|{format(target, 'g')}" for name in names for target in normalized
         ],
@@ -338,6 +425,34 @@ def source_tree_provenance(path: Path, expected_commit: str) -> dict[str, Any]:
         "source_tree": str(path.resolve()),
         "source_commit": actual_commit,
         **dirty,
+    }
+
+
+def source_tag_provenance(
+    path: Path, expected_tag: str, expected_commit: str
+) -> dict[str, Any]:
+    """Bind the declared source tag to the exact source commit used to build."""
+    if not expected_tag:
+        raise ProvenanceGateError("formal provenance requires a nonempty source tag")
+    result = subprocess.run(
+        ["git", "rev-list", "-n", "1", f"{expected_tag}^{{commit}}"],
+        cwd=str(path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    resolved = result.stdout.strip()
+    if result.returncode != 0 or not resolved:
+        raise ProvenanceGateError(f"vector source tag is not resolvable: {expected_tag!r}")
+    if resolved != expected_commit:
+        raise ProvenanceGateError(
+            f"vector source tag/commit mismatch: {expected_tag!r} resolves to "
+            f"{resolved}, expected {expected_commit}"
+        )
+    return {
+        "source_tag": expected_tag,
+        "source_tag_commit": resolved,
+        "tag_resolution_method": "git rev-list -n 1 <tag>^{commit}",
     }
 
 
@@ -493,6 +608,128 @@ def load_filters(path: Path, selected: set[str] | None = None) -> list[dict[str,
     return rows
 
 
+def frozen_workload_enabled(args: argparse.Namespace) -> bool:
+    calibration = getattr(args, "calibration_workload_csv", None)
+    measurement = getattr(args, "measurement_workload_csv", None)
+    if bool(calibration) != bool(measurement):
+        raise ProvenanceGateError(
+            "--calibration-workload-csv and --measurement-workload-csv must be supplied together"
+        )
+    return bool(calibration)
+
+
+def protocol_version(args: argparse.Namespace) -> str:
+    return (
+        FORMAL_PROTOCOL_VERSION
+        if frozen_workload_enabled(args)
+        else LEGACY_FORMAL_PROTOCOL_VERSION
+    )
+
+
+def protocol_final_blocks(args: argparse.Namespace) -> int:
+    return (
+        FROZEN_WORKLOAD_FINAL_BLOCKS
+        if frozen_workload_enabled(args)
+        else FORMAL_FINAL_BLOCKS
+    )
+
+
+def load_frozen_workload(
+    path: Path,
+    *,
+    expected_requests: int,
+    expected_split: str,
+    filter_names: set[str],
+) -> list[WorkloadRequest]:
+    rows = read_csv(path)
+    required = {"request_no", "query_no", "query_id", "filter_name"}
+    if not rows or not required.issubset(rows[0]):
+        missing = required - set(rows[0]) if rows else required
+        raise ValueError(f"frozen workload is missing {sorted(missing)}")
+    requests: list[WorkloadRequest] = []
+    seen: set[int] = set()
+    for row in rows:
+        request_no = int(row["request_no"])
+        if request_no in seen:
+            raise ValueError(f"frozen workload repeats request_no={request_no}")
+        seen.add(request_no)
+        filter_name = str(row["filter_name"])
+        if filter_name not in filter_names:
+            raise ValueError(
+                f"frozen workload request_no={request_no} has unknown filter {filter_name!r}"
+            )
+        if row.get("split") and str(row["split"]) != expected_split:
+            raise ValueError(
+                f"frozen workload request_no={request_no} has split={row['split']!r}; "
+                f"expected {expected_split!r}"
+            )
+        requests.append(
+            WorkloadRequest(
+                request_no=request_no,
+                query_no=int(row["query_no"]),
+                query_id=int(row["query_id"]),
+                filter_name=filter_name,
+            )
+        )
+    requests.sort(key=lambda item: item.request_no)
+    if len(requests) != expected_requests:
+        raise ValueError(
+            f"{expected_split} workload has {len(requests)} requests; "
+            f"expected {expected_requests}"
+        )
+    if [item.request_no for item in requests] != list(range(expected_requests)):
+        raise ValueError(
+            f"{expected_split} workload request_no coverage must be contiguous "
+            f"0..{expected_requests - 1}"
+        )
+    if {item.filter_name for item in requests} != filter_names:
+        raise ValueError(f"{expected_split} workload does not cover every formal filter")
+    identities = {(item.query_no, item.query_id) for item in requests}
+    if len(identities) != len(requests):
+        raise ValueError(f"{expected_split} workload repeats a query identity")
+    return requests
+
+
+def validate_frozen_workload_contract(
+    calibration: Sequence[WorkloadRequest],
+    measurement: Sequence[WorkloadRequest],
+) -> dict[str, Any]:
+    calibration_query_nos = {item.query_no for item in calibration}
+    measurement_query_nos = {item.query_no for item in measurement}
+    if calibration_query_nos != set(range(0, FORMAL_CALIBRATION_REQUESTS)):
+        raise ProvenanceGateError(
+            "formal calibration workload must bind query_no 0..199 exactly"
+        )
+    if measurement_query_nos != set(
+        range(
+            FORMAL_CALIBRATION_REQUESTS,
+            FORMAL_CALIBRATION_REQUESTS + FORMAL_MEASUREMENT_REQUESTS,
+        )
+    ):
+        raise ProvenanceGateError(
+            "formal measurement workload must bind query_no 200..10199 exactly"
+        )
+    if calibration_query_nos & measurement_query_nos:
+        raise ProvenanceGateError("calibration and measurement query cohorts overlap")
+    return {
+        "protocol": "frozen_mixed_trace_q200r2_q10kr3",
+        "calibration_requests": len(calibration),
+        "measurement_requests": len(measurement),
+        "calibration_request_nos": {
+            "first": calibration[0].request_no,
+            "last": calibration[-1].request_no,
+        },
+        "measurement_request_nos": {
+            "first": measurement[0].request_no,
+            "last": measurement[-1].request_no,
+        },
+        "calibration_query_nos": {"first": 0, "last": 199},
+        "measurement_query_nos": {"first": 200, "last": 10199},
+        "disjoint_query_cohorts": True,
+        "pairing_key": ["request_no", "repeat"],
+    }
+
+
 def parse_ids(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in value.split(",") if part.strip())
 
@@ -559,6 +796,69 @@ def load_truth(
     expected = len(filter_names) * len(wanted)
     if len(result) != expected:
         raise ValueError(f"exact truth is incomplete: rows={len(result)}, expected={expected}")
+    return result
+
+
+def load_truth_for_workloads(
+    path: Path,
+    requests: Sequence[WorkloadRequest],
+    k: int,
+    candidate_validity_predicate: str = "",
+) -> dict[tuple[str, int], TruthEntry]:
+    wanted = {(item.filter_name, item.query_no): item for item in requests}
+    rows = read_csv(path)
+    required = {
+        "filter_name",
+        "query_no",
+        "query_id",
+        "exact_filtered_topk_ids",
+        "kth_distance_sq",
+        "tie_tolerance",
+        "self_excluded",
+    }
+    if not rows or not required.issubset(rows[0]):
+        missing = required - set(rows[0]) if rows else required
+        raise ValueError(f"tie-aware exact truth is missing {sorted(missing)}")
+    if candidate_validity_predicate:
+        if "candidate_validity_predicate" not in rows[0]:
+            raise ValueError(
+                "tie-aware exact truth is missing candidate_validity_predicate"
+            )
+    result: dict[tuple[str, int], TruthEntry] = {}
+    for row in rows:
+        key = (str(row["filter_name"]), int(row["query_no"]))
+        request = wanted.get(key)
+        if request is None:
+            continue
+        if key in result:
+            raise ValueError(f"duplicate exact truth key {key}")
+        if candidate_validity_predicate and (
+            row.get("candidate_validity_predicate", "").strip()
+            != candidate_validity_predicate.strip()
+        ):
+            raise ValueError(
+                "tie-aware exact truth candidate-validity contract does not match the run"
+            )
+        if str(row["self_excluded"]).lower() != "true":
+            raise ValueError("exact truth must explicitly be self-excluded")
+        if int(row["query_id"]) != request.query_id:
+            raise ValueError(f"truth/workload query_id mismatch for {key}")
+        exact_ids = parse_ids(row["exact_filtered_topk_ids"])
+        if len(exact_ids) < k:
+            raise ValueError(f"truth row {key} has fewer than k={k} IDs")
+        result[key] = TruthEntry(
+            query_id=request.query_id,
+            kth_distance_sq=float(row["kth_distance_sq"]),
+            tie_tolerance=float(row["tie_tolerance"]),
+            exact_ids=exact_ids[:k],
+            self_excluded=True,
+        )
+    if set(result) != set(wanted):
+        missing = sorted(set(wanted) - set(result))
+        raise ValueError(
+            f"exact truth is incomplete for frozen workloads: "
+            f"rows={len(result)}, expected={len(wanted)}, missing={missing[:3]}"
+        )
     return result
 
 
@@ -641,6 +941,49 @@ def load_config_ladder(
     if path.suffix.lower() == ".csv":
         return [config_from_mapping(row, max_ef_search) for row in read_csv(path)]
     raise ValueError("--config-ladder must be a .json or .csv file")
+
+
+def validate_formal_ladder(
+    configs: Sequence[Config], max_ef_search: int
+) -> dict[str, Any]:
+    """Require the preregistered low-ef sweep and a complete family/rung grid."""
+    effective, proof = effective_config_grid(configs)
+    values = {config.ef_search for config in effective}
+    missing_low = [value for value in LOW_EF_VALUES if value not in values]
+    if missing_low:
+        raise ProvenanceGateError(
+            "formal ef grid is missing required low-ef values: "
+            + ",".join(str(value) for value in missing_low)
+        )
+    if max(values) != max_ef_search:
+        raise ProvenanceGateError(
+            "formal ef grid does not reach the declared max_ef_search ceiling"
+        )
+    expected_strict_rungs = {rank for rank, _tuples, _memory in DEFAULT_BUDGET_RUNGS}
+    for ef_search in sorted(values):
+        families = {config.family for config in effective if config.ef_search == ef_search}
+        if not set(FORMAL_FAMILIES).issubset(families):
+            raise ProvenanceGateError(
+                f"formal ef={ef_search} lacks official family coverage: {sorted(families)}"
+            )
+        strict_rungs = {
+            config.budget_rank
+            for config in effective
+            if config.ef_search == ef_search and config.family == "strict_order"
+        }
+        if strict_rungs != expected_strict_rungs:
+            raise ProvenanceGateError(
+                f"formal ef={ef_search} strict_order rungs are incomplete: "
+                f"expected={sorted(expected_strict_rungs)} got={sorted(strict_rungs)}"
+            )
+    return {
+        "required_low_ef_values": list(LOW_EF_VALUES),
+        "observed_ef_values": sorted(values),
+        "max_ef_search": max_ef_search,
+        "effective_config_count": len(effective),
+        "config_grid_sha256": sha256_json([asdict(config) for config in effective]),
+        "dedup_proof_sha256": sha256_json(proof),
+    }
 
 
 def effective_config_grid(configs: Sequence[Config]) -> tuple[list[Config], dict[str, Any]]:
@@ -748,11 +1091,12 @@ def default_query_count_bounds(
     targets: int = 3,
     screen_repeats: int = 1,
     verification_repeats: int = 2,
-    final_repeats: int = 6,
+    final_repeats: int = 5,
     families: int = 3,
 ) -> dict[str, int]:
-    # Global max recall is necessarily one of the family max-recall configs.
-    max_promoted_per_filter = min(effective_config_count, targets + families + families)
+    # Formal selection is LCB95-gated on the complete r2 grid. The r1 screen
+    # is retained only as a diagnostic artifact and cannot prune it.
+    max_promoted_per_filter = effective_config_count
     screen = effective_config_count * filters * len(SCREEN_QUERY_NOS) * screen_repeats
     verification = max_promoted_per_filter * filters * len(VERIFICATION_QUERY_NOS) * verification_repeats
     final = targets * filters * len(FINAL_QUERY_NOS) * final_repeats
@@ -806,6 +1150,30 @@ def configure_stock(cur: Any, config: Config) -> None:
     cur.execute(f"SET hnsw.iterative_scan = {config.iterative_scan}")
     cur.execute(f"SET hnsw.max_scan_tuples = {int(config.max_scan_tuples)}")
     cur.execute(f"SET hnsw.scan_mem_multiplier = {float(config.scan_mem_multiplier)}")
+
+
+def configure_planner_session(
+    cur: Any, planner_mode: str, statement_timeout_ms: int
+) -> dict[str, str | int]:
+    if planner_mode not in PLANNER_MODES:
+        raise ValueError(f"unknown planner mode: {planner_mode}")
+    if planner_mode == "auto":
+        for setting in ("enable_seqscan", "max_parallel_workers_per_gather", "jit"):
+            cur.execute(f"RESET {setting}")
+    else:
+        cur.execute("SET max_parallel_workers_per_gather = 0")
+        cur.execute("SET jit = off")
+        cur.execute("SET enable_seqscan = off")
+    cur.execute(f"SET statement_timeout = {int(statement_timeout_ms)}")
+    observed: dict[str, str | int] = {
+        "planner_mode": planner_mode,
+        "statement_timeout_ms": int(statement_timeout_ms),
+    }
+    for setting in ("enable_seqscan", "max_parallel_workers_per_gather", "jit"):
+        cur.execute(f"SHOW {setting}")
+        row = cur.fetchone()
+        observed[setting] = str(row[0]) if row else ""
+    return observed
 
 
 def disable_sqlens_gucs(cur: Any) -> list[str]:
@@ -899,6 +1267,7 @@ def require_sqlens_profile(
     cur: Any,
     required_prefix: str = DEFAULT_SQLENS_BUILD_PREFIX,
     minimum_semantics: float = DEFAULT_SQLENS_PROFILE_SEMANTICS,
+    expected_build_id: str = "",
 ) -> tuple[str, dict[str, Any]]:
     try:
         cur.execute("SELECT vector_sqlens_build_id()")
@@ -908,7 +1277,13 @@ def require_sqlens_profile(
         raise ProvenanceGateError(
             "SQLens v11 provenance gate failed: vector_sqlens_build_id() is unavailable"
         ) from exc
-    if not build_id.startswith(required_prefix):
+    if expected_build_id and build_id != expected_build_id:
+        raise ProvenanceGateError(
+            "SQLens exact-build provenance gate failed: "
+            f"vector_sqlens_build_id() returned {build_id!r}; "
+            f"expected exact build ID {expected_build_id!r}"
+        )
+    if not expected_build_id and not build_id.startswith(required_prefix):
         raise ProvenanceGateError(
             "SQLens v11 provenance gate failed: "
             f"vector_sqlens_build_id() returned {build_id!r}; expected prefix {required_prefix!r}"
@@ -938,6 +1313,7 @@ def gate_implementation(
     implementation: str,
     required_sqlens_prefix: str = DEFAULT_SQLENS_BUILD_PREFIX,
     minimum_profile_semantics: float = DEFAULT_SQLENS_PROFILE_SEMANTICS,
+    expected_sqlens_build_id: str = "",
 ) -> dict[str, Any]:
     cur.execute(
         "SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'vector'), '')"
@@ -958,7 +1334,10 @@ def gate_implementation(
         }
     if implementation == "sqlens_disabled":
         build_id, profile = require_sqlens_profile(
-            cur, required_sqlens_prefix, minimum_profile_semantics
+            cur,
+            required_sqlens_prefix,
+            minimum_profile_semantics,
+            expected_sqlens_build_id,
         )
         return {
             "implementation": "sqlens_disabled",
@@ -966,6 +1345,11 @@ def gate_implementation(
             "loaded_vector_sqlens_build_id": build_id,
             "profile_gate": {
                 "required_build_prefix": required_sqlens_prefix,
+                "expected_build_id": expected_sqlens_build_id,
+                "exact_build_id_match": (
+                    bool(expected_sqlens_build_id)
+                    and build_id == expected_sqlens_build_id
+                ),
                 "minimum_profile_semantics_version": minimum_profile_semantics,
                 "profile_semantics_version": profile["profile_semantics_version"],
                 "required_fields": {field: profile[field] for field in SQLENS_PROFILE_FIELDS},
@@ -973,6 +1357,81 @@ def gate_implementation(
             "sqlens_gucs": "explicit off/reset at connection setup and every atomic phase/filter block",
         }
     raise ProvenanceGateError(f"unsupported implementation {implementation!r}")
+
+
+def _profile_false(value: Any) -> bool:
+    return value is False or str(value).strip().lower() in {"false", "0", "off", ""}
+
+
+def assert_sqlens_disabled_query_profile(cur: Any) -> dict[str, Any]:
+    """Prove that one SQLens-binary query used the stock path only.
+
+    Profile reads happen after the timed query and are intentionally excluded
+    from latency. The gate fails closed if either the scan path or the active
+    guidance state exposes D1, D2, or D3 activity.
+    """
+    cur.execute("SELECT vector_hnsw_last_scan_profile()")
+    scan_row = cur.fetchone()
+    scan = _profile_object(scan_row[0] if scan_row else None)
+    cur.execute("SELECT vector_hnsw_guidance_profile()")
+    guidance_row = cur.fetchone()
+    guidance = _profile_object(guidance_row[0] if guidance_row else None)
+    zero_fields = (
+        "guidance_checks",
+        "traversal_guidance_checks",
+        "neighbor_expansion_guidance_checks",
+        "priority_reorders",
+        "page_access_prefetches",
+        "index_page_prefetches",
+    )
+    failures: list[str] = []
+    if scan.get("valid") is not True:
+        failures.append("scan profile is not valid")
+    if scan.get("final_path") != "stock":
+        failures.append(f"final_path={scan.get('final_path')!r}")
+    if scan.get("filter_strategy") != "off":
+        failures.append(f"filter_strategy={scan.get('filter_strategy')!r}")
+    if scan.get("traversal_guidance_scope") != "none":
+        failures.append(
+            f"traversal_guidance_scope={scan.get('traversal_guidance_scope')!r}"
+        )
+    for field in (
+        "approximate_prioritization_attempted",
+        "traversal_order_changed",
+    ):
+        if not _profile_false(scan.get(field)):
+            failures.append(f"{field}={scan.get(field)!r}")
+    for field in zero_fields:
+        try:
+            value = int(scan.get(field, 0))
+        except (TypeError, ValueError):
+            failures.append(f"{field} is not an integer")
+            continue
+        if value != 0:
+            failures.append(f"{field}={value}")
+    for field in ("active", "effective_active", "composed_exact_active"):
+        if not _profile_false(guidance.get(field)):
+            failures.append(f"guidance.{field}={guidance.get(field)!r}")
+    if failures:
+        raise ProvenanceGateError(
+            "SQLens-disabled per-query stock-path gate failed: "
+            + ", ".join(failures)
+        )
+    proof = {
+        "verified": True,
+        "final_path": "stock",
+        "filter_strategy": "off",
+        "traversal_guidance_scope": "none",
+        "zero_fields": {field: int(scan.get(field, 0)) for field in zero_fields},
+        "guidance_inactive": {
+            field: guidance.get(field)
+            for field in ("active", "effective_active", "composed_exact_active")
+        },
+    }
+    proof["profile_sha256"] = sha256_json(
+        {"scan": scan, "guidance": guidance}
+    )
+    return proof
 
 
 def _checked_command(
@@ -1058,12 +1517,18 @@ def server_vector_binary_provenance(
 
 def validate_runtime_args(args: argparse.Namespace) -> None:
     args.max_ef_search = getattr(args, "max_ef_search", UPSTREAM_MAX_EF_SEARCH)
+    args.planner_mode = getattr(args, "planner_mode", "auto")
     args.upstream_evaluation_patch = getattr(
         args, "upstream_evaluation_patch", None
     )
     args.candidate_validity_predicate = getattr(
         args, "candidate_validity_predicate", ""
     )
+    workload_mode = frozen_workload_enabled(args)
+    final_blocks = (
+        FROZEN_WORKLOAD_FINAL_BLOCKS if workload_mode else FORMAL_FINAL_BLOCKS
+    )
+    dsn_fingerprint(getattr(args, "dsn", ""))
     if not args.server_container:
         raise ProvenanceGateError("formal runs require explicit --server-container")
     if not args.vector_source_tag or not args.vector_source_commit:
@@ -1080,8 +1545,29 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ProvenanceGateError("formal runs require --vector-compiler-flags provenance")
     if tuple(getattr(args, "target_recalls", ())) != FORMAL_TARGET_RECALLS:
         raise ProvenanceGateError("formal target recalls must be exactly 0.90,0.95,0.99")
-    if getattr(args, "formal_family", "") not in FORMAL_FAMILIES:
-        raise ProvenanceGateError("formal family must be off or strict_order")
+    if (
+        getattr(args, "screen_repeats", 1) != 1
+        or getattr(args, "verification_repeats", 2) != 2
+    ):
+        raise ProvenanceGateError(
+            "formal calibration is fixed to one diagnostic pass plus r2 selection"
+        )
+    expected_final_repeats = 3 if workload_mode else 5
+    if getattr(args, "final_repeats", 0) != expected_final_repeats:
+        raise ProvenanceGateError(
+            f"formal held-out final requires r{expected_final_repeats}"
+        )
+    allowed_families = (
+        {"all"} if workload_mode else set(FORMAL_FAMILIES)
+    )
+    if getattr(args, "formal_family", "") not in allowed_families:
+        raise ProvenanceGateError(
+            "frozen q10k/r3 formal runs require --formal-family all"
+            if workload_mode
+            else "legacy formal family must be off or strict_order"
+        )
+    if getattr(args, "planner_mode", "") not in PLANNER_MODES:
+        raise ProvenanceGateError(f"planner mode must be one of {PLANNER_MODES}")
     safe_predicate(
         getattr(args, "candidate_validity_predicate", ""),
         "candidate-validity predicate",
@@ -1098,23 +1584,93 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ProvenanceGateError(
             "the evaluation ceiling requires an explicit, hashed config ladder"
         )
-    if getattr(args, "final_repeats", 0) <= 0 or args.final_repeats % 2:
-        raise ProvenanceGateError("formal --final-repeats must be positive and even")
-    if getattr(args, "execution_stage", "") == "final" and getattr(args, "final_block", None) not in {0, 1}:
-        raise ProvenanceGateError("final execution requires --final-block 0 or 1")
-    for label, path in (
+    if (
+        getattr(args, "final_repeats", 0) <= 0
+        or args.final_repeats % final_blocks
+    ):
+        raise ProvenanceGateError(
+            f"formal --final-repeats must be positive and divisible by {final_blocks}"
+        )
+    if (
+        getattr(args, "execution_stage", "") == "final"
+        and getattr(args, "final_block", None) not in range(final_blocks)
+    ):
+        raise ProvenanceGateError(
+            f"final execution requires --final-block 0..{final_blocks - 1}"
+        )
+    required_paths = [
         ("filters CSV", args.filters_csv),
         ("truth CSV", args.truth_csv),
-        ("graph identity JSON", args.graph_identity_json),
-    ):
+    ]
+    if workload_mode:
+        required_paths.extend(
+            [
+                ("calibration workload CSV", args.calibration_workload_csv),
+                ("measurement workload CSV", args.measurement_workload_csv),
+                (
+                    "official index-build manifest",
+                    args.official_index_build_manifest,
+                ),
+            ]
+        )
+    else:
+        required_paths.append(("graph identity JSON", args.graph_identity_json))
+    for label, path in required_paths:
         if path is None or not path.is_file():
             raise ProvenanceGateError(f"formal {label} does not exist: {path}")
+    formal_hashes = {
+        "filters CSV": (sha256_file(args.filters_csv), FORMAL_FILTERS_SHA256),
+        "truth/cohort CSV": (
+            sha256_file(args.truth_csv),
+            (
+                FORMAL_Q10200_TRUTH_SHA256
+                if workload_mode
+                else FORMAL_TRUTH_COHORT_SHA256
+            ),
+        ),
+    }
+    if workload_mode:
+        formal_hashes.update(
+            {
+                "calibration workload CSV": (
+                    sha256_file(args.calibration_workload_csv),
+                    FORMAL_CALIBRATION_WORKLOAD_SHA256,
+                ),
+                "measurement workload CSV": (
+                    sha256_file(args.measurement_workload_csv),
+                    FORMAL_MEASUREMENT_WORKLOAD_SHA256,
+                ),
+            }
+        )
+    mismatches = {
+        label: {"actual": actual, "expected": expected}
+        for label, (actual, expected) in formal_hashes.items()
+        if actual != expected
+    }
+    if mismatches:
+        raise ProvenanceGateError(
+            "formal unique-embedding cohort/filter hash mismatch: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
     if args.vector_source_repo is None or not args.vector_source_repo.is_dir():
         raise ProvenanceGateError(
             f"formal vector source tree does not exist: {args.vector_source_repo}"
         )
-    if not args.source_index or not args.clone_index:
-        raise ProvenanceGateError("formal runs require source and clone index identities")
+    if workload_mode:
+        if args.index != args.source_index:
+            raise ProvenanceGateError(
+                "P0-2 requires both arms to use the same official-built source index"
+            )
+        if getattr(args, "clone_index", None) not in {None, "", args.index}:
+            raise ProvenanceGateError(
+                "P0-2 does not accept a D2 source-vs-BFS clone index"
+            )
+        if not getattr(args, "official_index_source_commit", ""):
+            raise ProvenanceGateError(
+                "P0-2 requires the official index-build source commit"
+            )
+    elif not args.source_index or not args.clone_index:
+        raise ProvenanceGateError("legacy formal runs require source and clone index identities")
     if (
         not math.isfinite(args.promotion_margin)
         or not 0 <= args.promotion_margin < 1
@@ -1128,6 +1684,10 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
             f"--minimum-sqlens-profile-semantics must be >= {DEFAULT_SQLENS_PROFILE_SEMANTICS:g}"
         )
     if args.implementation == "official":
+        if args.vector_source_tag != "v0.8.2":
+            raise ProvenanceGateError(
+                "official formal mode requires --vector-source-tag v0.8.2"
+            )
         if not args.expected_vector_so_sha256:
             raise ProvenanceGateError(
                 "official formal mode requires --expected-vector-so-sha256"
@@ -1151,6 +1711,18 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
             raise ProvenanceGateError(
                 "the evaluation ceiling patch must produce a distinct binary digest"
             )
+    else:
+        if args.expected_vector_so_sha256 == OFFICIAL_UPSTREAM_VECTOR_SO_SHA256:
+            raise ProvenanceGateError(
+                "sqlens_disabled formal mode cannot use the official upstream vector.so digest"
+            )
+        if workload_mode and (
+            getattr(args, "expected_sqlens_build_id", "")
+            != DEFAULT_SQLENS_BUILD_ID
+        ):
+            raise ProvenanceGateError(
+                "P0-2 requires exact equality with the frozen r36 SQLens build ID"
+            )
 
 
 def plan_index_names(plan: Any) -> set[str]:
@@ -1164,6 +1736,32 @@ def plan_index_names(plan: Any) -> set[str]:
         for child in plan:
             names.update(plan_index_names(child))
     return names
+
+
+def plan_node_types(plan: Any) -> set[str]:
+    names: set[str] = set()
+    if isinstance(plan, dict):
+        if plan.get("Node Type"):
+            names.add(str(plan["Node Type"]))
+        for child in plan.values():
+            names.update(plan_node_types(child))
+    elif isinstance(plan, list):
+        for child in plan:
+            names.update(plan_node_types(child))
+    return names
+
+
+def classify_plan_route(plan: Any, expected_index: str) -> str:
+    indexes = plan_index_names(plan)
+    expected = expected_index.split(".")[-1]
+    if any(name.split(".")[-1] == expected for name in indexes):
+        return "hnsw"
+    node_types = plan_node_types(plan)
+    if "Seq Scan" in node_types:
+        return "sequential_exact"
+    if {"Index Scan", "Index Only Scan", "Bitmap Index Scan"} & node_types:
+        return "scalar_index_exact"
+    return "other"
 
 
 def assert_hnsw_explain_gate(plan: Any, expected_index: str) -> set[str]:
@@ -1182,6 +1780,8 @@ def explain_hybrid(
     vector_text: str,
     query_id: int,
     expected_index: str,
+    planner_mode: str = "forced_hnsw",
+    query_no: int | None = None,
 ) -> dict[str, Any]:
     cur.execute(
         "EXPLAIN (FORMAT JSON, COSTS OFF) " + sql,
@@ -1192,11 +1792,19 @@ def explain_hybrid(
     if isinstance(payload, str):
         payload = json.loads(payload)
     plan = payload[0] if isinstance(payload, list) and payload else payload
-    indexes = assert_hnsw_explain_gate(plan, expected_index)
+    indexes = plan_index_names(plan)
+    if planner_mode == "forced_hnsw":
+        assert_hnsw_explain_gate(plan, expected_index)
     return {
         "valid": True,
+        "planner_mode": planner_mode,
+        "representative_query_no": query_no,
+        "representative_query_id": query_id,
+        "route": classify_plan_route(plan, expected_index),
         "expected_index": expected_index,
         "index_names": sorted(indexes),
+        "node_types": sorted(plan_node_types(plan)),
+        "plan": plan,
     }
 
 
@@ -1207,27 +1815,27 @@ def balanced_order(values: Sequence[Any], block_no: int, seed: int) -> list[Any]
     return list(values[rotation:]) + list(values[:rotation])
 
 
-def pair_key(phase: str, filter_name: str, query_no: int, repeat: int) -> str:
-    return f"{phase}|{filter_name}|q{query_no}|r{repeat}"
+def pair_key(phase: str, filter_name: str, request_no: int, repeat: int) -> str:
+    return f"{phase}|{filter_name}|q{request_no}|r{repeat}"
 
 
 def measurement_key(
     implementation: str,
     phase: str,
     filter_name: str,
-    query_no: int,
+    request_no: int,
     repeat: int,
     config_label: str,
 ) -> str:
     return (
-        f"{implementation}|{phase}|{filter_name}|q{query_no}|r{repeat}|{config_label}"
+        f"{implementation}|{phase}|{filter_name}|q{request_no}|r{repeat}|{config_label}"
     )
 
 
 def validate_raw_schema_and_dedup(rows: Sequence[Mapping[str, Any]]) -> None:
     seen: set[str] = set()
     for row in rows:
-        missing = set(RAW_FIELDS) - set(row)
+        missing = set(RAW_FIELDS) - set(row) - RAW_COMPAT_OPTIONAL_FIELDS
         if missing:
             raise CheckpointContractError(
                 f"checkpoint schema is missing fields {sorted(missing)}"
@@ -1244,7 +1852,11 @@ def validate_raw_schema_and_dedup(rows: Sequence[Mapping[str, Any]]) -> None:
                 str(row["implementation"]),
                 phase,
                 str(row["filter_name"]),
-                int(row["query_no"]),
+                int(
+                    row["request_no"]
+                    if str(row.get("request_no", "")).strip()
+                    else row["query_no"]
+                ),
                 int(row["repeat"]),
                 str(row["config_label"]),
             )
@@ -1261,7 +1873,7 @@ def expected_stage_keys(
     phase: str,
     filter_name: str,
     configs: Sequence[Config],
-    query_nos: Sequence[int],
+    request_nos: Sequence[int],
     repeats: int,
     repeat_values: Sequence[int] | None = None,
 ) -> set[str]:
@@ -1269,7 +1881,7 @@ def expected_stage_keys(
     return {
         measurement_key(implementation, phase, filter_name, query_no, repeat, config.label)
         for config in configs
-        for query_no in query_nos
+        for query_no in request_nos
         for repeat in selected_repeats
     }
 
@@ -1283,6 +1895,7 @@ def validate_stage_checkpoint(
     repeats: int,
     repeat_values: Sequence[int] | None = None,
     run_uuid: str | None = None,
+    workload_requests: Sequence[WorkloadRequest] | None = None,
 ) -> set[tuple[str, str]]:
     validate_raw_schema_and_dedup(rows)
     selected_repeats = set(
@@ -1305,6 +1918,21 @@ def validate_stage_checkpoint(
         )
     completed: set[tuple[str, str]] = set()
     for filter_name, configs in configs_by_filter.items():
+        filter_requests = (
+            [
+                request
+                for request in workload_requests
+                if request.filter_name == filter_name
+            ]
+            if workload_requests is not None
+            else []
+        )
+        request_by_no = {
+            request.request_no: request for request in filter_requests
+        }
+        expected_request_nos = (
+            sorted(request_by_no) if workload_requests is not None else list(query_nos)
+        )
         filter_rows = [
             row for row in stage_rows if str(row["filter_name"]) == filter_name
         ]
@@ -1321,7 +1949,17 @@ def validate_stage_checkpoint(
                     str(row["implementation"]) == implementation
                     and (run_uuid is None or str(row.get("run_uuid", "")) == run_uuid)
                     and str(row["query_split"]) == phase
-                    and int(row["query_no"]) in query_nos
+                    and (
+                        (
+                            int(row["request_no"]) in request_by_no
+                            and int(row["query_no"])
+                            == request_by_no[int(row["request_no"])].query_no
+                            and int(row["query_id"])
+                            == request_by_no[int(row["request_no"])].query_id
+                        )
+                        if workload_requests is not None
+                        else int(row["query_no"]) in query_nos
+                    )
                     and int(row["repeat"]) in selected_repeats
                     and str(row["config_family"]) == config.family
                     and int(row["budget_rank"]) == config.budget_rank
@@ -1351,7 +1989,7 @@ def validate_stage_checkpoint(
             phase,
             filter_name,
             configs,
-            query_nos,
+            expected_request_nos,
             repeats,
             sorted(selected_repeats),
         )
@@ -1415,6 +2053,19 @@ def bootstrap_means(values: Sequence[float], samples: int, seed: int) -> list[fl
         ]
 
 
+def calibration_bootstrap_seed(
+    base_seed: int,
+    implementation: str,
+    filter_name: str,
+    config_label: str,
+) -> int:
+    material = (
+        f"{base_seed}|calibration-selection|{implementation}|"
+        f"{filter_name}|{config_label}"
+    )
+    return int(hashlib.sha256(material.encode("utf-8")).hexdigest()[:16], 16)
+
+
 def summarize_rows(
     rows: Sequence[Mapping[str, Any]],
     expected_queries: int,
@@ -1427,7 +2078,11 @@ def summarize_rows(
     by_query_recall: dict[str, list[float]] = {}
     by_query_latency: dict[str, list[float]] = {}
     for row in valid:
-        key = str(row["query_no"])
+        key = str(
+            row["request_no"]
+            if str(row.get("request_no", "")).strip()
+            else row["query_no"]
+        )
         by_query_recall.setdefault(key, []).append(float(row["recall_at_10"]))
         by_query_latency.setdefault(key, []).append(float(row["latency_ms"]))
     query_recalls = [statistics.fmean(values) for values in by_query_recall.values()]
@@ -1458,6 +2113,10 @@ def summarize_rows(
         "latency_p99_ms": percentile(latencies, 0.99),
         "latency_ci_low_ms": percentile(latency_bootstrap, 0.025),
         "latency_ci_high_ms": percentile(latency_bootstrap, 0.975),
+        "recall_bootstrap_unit": "query_cluster_after_repeat_mean",
+        "recall_bootstrap_samples": bootstrap_samples,
+        "recall_bootstrap_seed": bootstrap_seed,
+        "recall_lcb_confidence": 0.95,
     }
 
 
@@ -1471,10 +2130,16 @@ def summarize_stage(
     repeats: int,
     bootstrap_samples: int,
     bootstrap_seed: int,
+    workload_requests: Sequence[WorkloadRequest] | None = None,
 ) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for filter_position, filter_spec in enumerate(filters):
         name = filter_spec["filter_name"]
+        expected_queries = (
+            sum(request.filter_name == name for request in workload_requests)
+            if workload_requests is not None
+            else len(query_nos)
+        )
         for config_position, config in enumerate(configs_by_filter[name]):
             rows = [
                 row
@@ -1483,11 +2148,22 @@ def summarize_stage(
                 and str(row["filter_name"]) == name
                 and str(row["config_label"]) == config.label
             ]
-            seed_material = (
-                f"{bootstrap_seed}|{phase}|{name}|{config.label}|"
-                f"{filter_position}|{config_position}"
-            )
-            seed = int(hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:12], 16)
+            if phase == "verification":
+                seed = calibration_bootstrap_seed(
+                    bootstrap_seed,
+                    implementation,
+                    name,
+                    config.label,
+                )
+            else:
+                seed_material = (
+                    f"{bootstrap_seed}|{phase}|{name}|{config.label}|"
+                    f"{filter_position}|{config_position}"
+                )
+                seed = int(
+                    hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:12],
+                    16,
+                )
             summaries.append(
                 {
                     "implementation": implementation,
@@ -1502,7 +2178,7 @@ def summarize_stage(
                     "scan_mem_multiplier": config.scan_mem_multiplier,
                     **summarize_rows(
                         rows,
-                        len(query_nos),
+                        expected_queries,
                         repeats,
                         bootstrap_samples,
                         seed,
@@ -1663,39 +2339,72 @@ def select_verified_config(
     ]
     if missing or incomplete:
         return None, "incomplete_verification", {
+            "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+            "selection_fallback": "incomplete_verification",
             "qualified_configs": 0,
+            "mean_qualified_configs": 0,
+            "lcb95_qualified_configs": 0,
             "claims_unattainable": False,
             "verified_configs": required_labels,
             "missing_verified_configs": missing,
             "incomplete_promoted_configs": sorted(incomplete),
         }
-    eligible = [
+    for label in required_labels:
+        row = by_label[label]
+        recall = float(row.get("recall_mean", math.nan))
+        recall_lcb95 = float(row.get("recall_lcb95", math.nan))
+        latency = float(row.get("latency_mean_ms", math.nan))
+        if (
+            not math.isfinite(recall)
+            or not 0 <= recall <= 1
+            or not math.isfinite(recall_lcb95)
+            or not 0 <= recall_lcb95 <= 1
+            or not math.isfinite(latency)
+            or latency <= 0
+        ):
+            raise RuntimeError(f"verification config {label} has invalid metrics")
+    complete_rows = [
         dict(row)
         for row in verification_summaries
         if str(row.get("config_label", "")) in required_labels
         and _complete_summary(row)
-        and float(row.get("recall_mean", 0.0)) >= target
     ]
-    if eligible:
-        eligible.sort(
+    mean_eligible = [
+        row for row in complete_rows if float(row.get("recall_mean", 0.0)) >= target
+    ]
+    lcb95_eligible = [
+        row
+        for row in complete_rows
+        if float(row.get("recall_lcb95", row["recall_mean"])) >= target
+    ]
+    if lcb95_eligible:
+        lcb95_eligible.sort(
             key=lambda row: (
                 float(row.get("latency_mean_ms", math.inf)),
                 str(row.get("config_label", "")),
             )
         )
-        return eligible[0], "selected", {
-            "qualified_configs": len(eligible),
+        return lcb95_eligible[0], "selected", {
+            "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+            "selection_fallback": "none",
+            "qualified_configs": len(mean_eligible),
+            "mean_qualified_configs": len(mean_eligible),
+            "lcb95_qualified_configs": len(lcb95_eligible),
             "claims_unattainable": False,
             "verified_configs": required_labels,
             "missing_verified_configs": [],
         }
 
-    return None, "no_verified_config_meets_target", {
+    return None, "unattainable_on_calibration_grid", {
+        "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+        "selection_fallback": "none_lcb95_qualified",
         "qualified_configs": 0,
-        "claims_unattainable": False,
+        "mean_qualified_configs": len(mean_eligible),
+        "lcb95_qualified_configs": 0,
+        "claims_unattainable": True,
         "verified_configs": required_labels,
         "missing_verified_configs": [],
-        "interpretation": "no completely verified config in the declared grid met the target",
+        "interpretation": "no complete configuration in the calibration grid met the Recall@10 LCB95 target",
     }
 
 
@@ -1728,7 +2437,7 @@ def heldout_final_status(
     if metrics is None:
         return (
             "incomparable_no_verified_config"
-            if selection_status == "no_verified_config_meets_target"
+            if selection_status == "unattainable_on_calibration_grid"
             else "not_run_incomplete"
         )
     if not _complete_summary(metrics):
@@ -1764,12 +2473,16 @@ def normalized_args(args: argparse.Namespace) -> dict[str, Any]:
         "execution_stage",
         "final_block",
         "guc_block_audits",
+        "dsn",
+        "calibration_workload_requests",
     }
-    return {
+    normalized = {
         key: str(value) if isinstance(value, Path) else value
         for key, value in sorted(vars(args).items())
         if key not in ignored
     }
+    normalized["dsn_sha256"] = dsn_fingerprint(args.dsn)
+    return normalized
 
 
 def source_hashes(args: argparse.Namespace, filters: Sequence[Mapping[str, str]]) -> dict[str, Any]:
@@ -1803,7 +2516,22 @@ def source_hashes(args: argparse.Namespace, filters: Sequence[Mapping[str, str]]
         result["config_ladder_sha256"] = sha256_json(
             [asdict(config) for config in default_config_ladder()]
         )
-    result["graph_identity_sha256"] = sha256_file(args.graph_identity_json)
+    if frozen_workload_enabled(args):
+        result.update(
+            {
+                "calibration_workload_sha256": sha256_file(
+                    args.calibration_workload_csv
+                ),
+                "measurement_workload_sha256": sha256_file(
+                    args.measurement_workload_csv
+                ),
+                "official_index_build_manifest_sha256": sha256_file(
+                    args.official_index_build_manifest
+                ),
+            }
+        )
+    else:
+        result["graph_identity_sha256"] = sha256_file(args.graph_identity_json)
     return result
 
 
@@ -1901,6 +2629,85 @@ def index_catalog_fingerprint(cur: Any, index: str) -> dict[str, Any]:
         "indisvalid": bool(valid),
         "indisready": bool(ready),
     }
+
+
+def load_official_index_build_identity(
+    path: Path,
+    *,
+    table: str,
+    index: str,
+    official_vector_so_sha256: str = OFFICIAL_UPSTREAM_VECTOR_SO_SHA256,
+    official_source_tag: str = "v0.8.2",
+    official_source_commit: str = "",
+) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("artifact_valid") is not True:
+        raise ProvenanceGateError(
+            "official index-build manifest must be a valid JSON artifact"
+        )
+    builder = payload.get("builder")
+    fingerprint = payload.get("index_fingerprint")
+    if not isinstance(builder, Mapping) or not isinstance(fingerprint, Mapping):
+        raise ProvenanceGateError(
+            "official index-build manifest lacks builder/index_fingerprint"
+        )
+    expected = {
+        "table": table,
+        "index": index,
+        "vector_so_sha256": official_vector_so_sha256,
+        "source_tag": official_source_tag,
+    }
+    observed = {
+        "table": str(payload.get("table", "")),
+        "index": str(payload.get("index", "")),
+        "vector_so_sha256": str(builder.get("vector_so_sha256", "")),
+        "source_tag": str(builder.get("source_tag", "")),
+    }
+    if observed != expected:
+        raise ProvenanceGateError(
+            "official index-build manifest does not match the requested "
+            f"table/index/upstream binary: observed={observed!r}"
+        )
+    if official_source_commit and str(builder.get("source_commit", "")) != official_source_commit:
+        raise ProvenanceGateError(
+            "official index-build manifest source commit does not match"
+        )
+    required_fingerprint = {
+        "index_oid",
+        "index_relfilenode",
+        "indexdef_sha256",
+    }
+    if not required_fingerprint.issubset(fingerprint):
+        raise ProvenanceGateError(
+            "official index-build manifest fingerprint is incomplete"
+        )
+    if not re.fullmatch(
+        r"[0-9a-f]{64}", str(fingerprint.get("indexdef_sha256", ""))
+    ):
+        raise ProvenanceGateError(
+            "official index-build manifest index definition hash is invalid"
+        )
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "artifact_valid": True,
+        "table": table,
+        "index": index,
+        "builder": dict(builder),
+        "index_fingerprint": dict(fingerprint),
+    }
+
+
+def verify_live_official_index_identity(
+    build_identity: Mapping[str, Any],
+    live_fingerprint: Mapping[str, Any],
+) -> None:
+    expected = build_identity.get("index_fingerprint", {})
+    for field in ("index_oid", "index_relfilenode", "indexdef_sha256"):
+        if str(live_fingerprint.get(field)) != str(expected.get(field)):
+            raise ProvenanceGateError(
+                f"live index {field} does not match official build manifest"
+            )
 
 
 def database_fingerprint(
@@ -2024,10 +2831,13 @@ def measurement_row(
     run_uuid: str = "",
     execution_stage: str = "",
     final_block: int | str = "",
+    planner_mode: str = "",
+    request_no: int | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     error = ""
     result_rows: list[Sequence[Any]] = []
+    disabled_proof: dict[str, Any] | None = None
     try:
         cur.execute(sql, (vector_text, query_id, vector_text))
         result_rows = cur.fetchall()
@@ -2039,18 +2849,23 @@ def measurement_row(
     recall = 0.0
     if not error:
         try:
+            if implementation == "sqlens_disabled":
+                disabled_proof = assert_sqlens_disabled_query_profile(cur)
             # Recall is deliberately offline and excluded from the latency timer.
             recall = tie_aware_recall(result_rows, truth, k)
         except Exception as exc:
             error = f"{exc.__class__.__name__}: {exc}"
+    effective_request_no = query_no if request_no is None else request_no
     return {
         "run_uuid": run_uuid,
         "implementation": implementation,
+        "planner_mode": planner_mode,
         "execution_stage": execution_stage,
         "final_block": final_block,
         "phase": phase,
         "query_split": phase,
         "filter_name": filter_name,
+        "request_no": effective_request_no if request_no is not None else "",
         "query_no": query_no,
         "query_id": query_id,
         "repeat": repeat,
@@ -2062,15 +2877,29 @@ def measurement_row(
         "max_scan_tuples": config.max_scan_tuples,
         "scan_mem_multiplier": config.scan_mem_multiplier,
         "schedule_position": schedule_position,
-        "pair_key": pair_key(phase, filter_name, query_no, repeat),
+        "pair_key": pair_key(phase, filter_name, effective_request_no, repeat),
         "measurement_key": measurement_key(
-            implementation, phase, filter_name, query_no, repeat, config.label
+            implementation,
+            phase,
+            filter_name,
+            effective_request_no,
+            repeat,
+            config.label,
         ),
         "latency_ms": latency_ms,
         "returned": len(result_rows),
         "result_ids": ",".join(str(int(row[0])) for row in result_rows),
         "recall_at_10": recall,
         "truth_self_excluded": truth.self_excluded,
+        "disabled_path_verified": (
+            disabled_proof["verified"] if disabled_proof is not None else ""
+        ),
+        "disabled_final_path": (
+            disabled_proof["final_path"] if disabled_proof is not None else ""
+        ),
+        "disabled_profile_sha256": (
+            disabled_proof["profile_sha256"] if disabled_proof is not None else ""
+        ),
         "valid": not error,
         "error": error,
     }
@@ -2090,8 +2919,109 @@ def run_stage_blocks(
     completed: set[tuple[str, str]],
     repeat_values: Sequence[int] | None = None,
     final_block: int | str = "",
+    workload_requests: Sequence[WorkloadRequest] | None = None,
 ) -> None:
     phase_offset = {"screen": 0, "verification": 1_000_003, "final": 2_000_003}[phase]
+    if workload_requests is not None:
+        filters_by_name = {
+            str(filter_spec["filter_name"]): filter_spec
+            for filter_spec in filters
+        }
+        ordered_requests = sorted(
+            workload_requests, key=lambda request: request.request_no
+        )
+        if [request.request_no for request in ordered_requests] != list(
+            range(len(ordered_requests))
+        ):
+            raise ProvenanceGateError(
+                f"{phase} frozen workload request_no order is not contiguous"
+            )
+        pending_filters = {
+            name
+            for name in filters_by_name
+            if (phase, name) not in completed
+        }
+        if not pending_filters:
+            return
+        block_rows: list[dict[str, Any]] = []
+        audited_filters: set[str] = set()
+        selected_repeats = (
+            list(repeat_values)
+            if repeat_values is not None
+            else list(range(repeats))
+        )
+        block_no = 0
+        for repeat in selected_repeats:
+            for request in ordered_requests:
+                name = request.filter_name
+                if name not in pending_filters:
+                    continue
+                if name not in audited_filters:
+                    block_guc_audit = enforce_hnsw_guc_allowlist(cur)
+                    args.guc_block_audits.append(
+                        {
+                            "phase": phase,
+                            "filter_name": name,
+                            "actions": block_guc_audit["actions"],
+                            "after_sha256": sha256_json(
+                                block_guc_audit["after"]
+                            ),
+                        }
+                    )
+                    audited_filters.add(name)
+                configs = list(configs_by_filter[name])
+                config_order = balanced_order(
+                    configs, block_no, args.schedule_seed + phase_offset
+                )
+                filter_spec = filters_by_name[name]
+                sql = build_hybrid_sql(
+                    args.table,
+                    filter_spec["predicate"],
+                    args.k,
+                    args.candidate_validity_predicate,
+                )
+                entry = truth[(name, request.query_no)]
+                if entry.query_id != request.query_id:
+                    raise ProvenanceGateError(
+                        f"workload/truth query identity mismatch for request "
+                        f"{request.request_no}"
+                    )
+                for position, config in enumerate(config_order, start=1):
+                    configure_stock(cur, config)
+                    block_rows.append(
+                        measurement_row(
+                            args.implementation,
+                            phase,
+                            name,
+                            request.query_no,
+                            entry.query_id,
+                            repeat,
+                            config,
+                            position,
+                            vectors[entry.query_id],
+                            entry,
+                            cur,
+                            sql,
+                            args.k,
+                            args.run_uuid,
+                            args.execution_stage,
+                            final_block,
+                            args.planner_mode,
+                            request.request_no,
+                        )
+                    )
+                block_no += 1
+        if audited_filters != pending_filters:
+            raise ProvenanceGateError(
+                f"{phase} frozen workload does not cover pending filters "
+                f"{sorted(pending_filters - audited_filters)}"
+            )
+        raw_rows.extend(block_rows)
+        raw_rows.sort(key=lambda row: str(row["measurement_key"]))
+        write_csv_atomic(args.paths["raw"], raw_rows, RAW_FIELDS)
+        completed.update((phase, name) for name in pending_filters)
+        return
+
     for filter_position, filter_spec in enumerate(filters):
         name = filter_spec["filter_name"]
         configs = list(configs_by_filter[name])
@@ -2121,26 +3051,47 @@ def run_stage_blocks(
             list(repeat_values) if repeat_values is not None else list(range(repeats))
         )
         for repeat in selected_repeats:
-            query_order = list(query_nos)
+            request_order = (
+                [
+                    request
+                    for request in workload_requests
+                    if request.filter_name == name
+                ]
+                if workload_requests is not None
+                else [
+                    WorkloadRequest(
+                        request_no=int(query_no),
+                        query_no=int(query_no),
+                        query_id=truth[(name, int(query_no))].query_id,
+                        filter_name=name,
+                    )
+                    for query_no in query_nos
+                ]
+            )
             random.Random(
                 args.schedule_seed
                 + phase_offset
                 + filter_position * 1009
                 + repeat * 104729
-            ).shuffle(query_order)
-            for query_no in query_order:
+            ).shuffle(request_order)
+            for request in request_order:
                 config_order = balanced_order(
                     configs, block_no, args.schedule_seed + phase_offset
                 )
                 for position, config in enumerate(config_order, start=1):
                     configure_stock(cur, config)
-                    entry = truth[(name, int(query_no))]
+                    entry = truth[(name, request.query_no)]
+                    if entry.query_id != request.query_id:
+                        raise ProvenanceGateError(
+                            f"workload/truth query identity mismatch for request "
+                            f"{request.request_no}"
+                        )
                     block_rows.append(
                         measurement_row(
                             args.implementation,
                             phase,
                             name,
-                            int(query_no),
+                            request.query_no,
                             entry.query_id,
                             repeat,
                             config,
@@ -2153,6 +3104,12 @@ def run_stage_blocks(
                             args.run_uuid,
                             args.execution_stage,
                             final_block,
+                            args.planner_mode,
+                            (
+                                request.request_no
+                                if workload_requests is not None
+                                else None
+                            ),
                         )
                     )
                 block_no += 1
@@ -2160,6 +3117,40 @@ def run_stage_blocks(
         raw_rows.sort(key=lambda row: str(row["measurement_key"]))
         write_csv_atomic(args.paths["raw"], raw_rows, RAW_FIELDS)
         completed.add(block)
+
+
+def validate_resume_manifest_contract(
+    manifest: Mapping[str, Any], raw_path: Path, raw_exists: bool
+) -> None:
+    if manifest.get("formal_protocol_version") not in {
+        FORMAL_PROTOCOL_VERSION,
+        LEGACY_FORMAL_PROTOCOL_VERSION,
+    }:
+        raise CheckpointContractError(
+            "legacy or mean-only checkpoint is not resumable under the current "
+            "LCB95 matched-recall protocol"
+        )
+    calibration = manifest.get("calibration_selection")
+    if not isinstance(calibration, Mapping) or (
+        calibration.get("policy") != CALIBRATION_SELECTION_POLICY
+        or calibration.get("lcb95_required") is not True
+        or calibration.get("mean_only_fallback_allowed") is not False
+    ):
+        raise CheckpointContractError(
+            "checkpoint lacks the required LCB95-only calibration-selection contract"
+        )
+    if raw_exists:
+        recorded = manifest.get("output_hashes", {}).get("raw", {})
+        expected = recorded.get("sha256") if isinstance(recorded, Mapping) else None
+        if not expected:
+            raise CheckpointContractError(
+                "checkpoint raw artifact is not hash-bound by its manifest"
+            )
+        actual = sha256_file(raw_path)
+        if actual != expected:
+            raise CheckpointContractError(
+                "checkpoint raw artifact SHA-256 does not match its manifest"
+            )
 
 
 def load_checkpoint(
@@ -2174,6 +3165,7 @@ def load_checkpoint(
     if raw_exists and not manifest_exists:
         raise CheckpointContractError("raw checkpoint exists without its manifest")
     manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    validate_resume_manifest_contract(manifest, paths["raw"], raw_exists)
     recorded_hash = manifest.get(
         "checkpoint_spec_sha256", manifest.get("base_run_spec_hash")
     )
@@ -2253,9 +3245,36 @@ def warmup_spec(
     filters: Sequence[Mapping[str, str]],
     config: Config,
 ) -> dict[str, Any]:
-    query_nos = list(SCREEN_QUERY_NOS[: args.warmup_queries])
+    workload = list(getattr(args, "calibration_workload_requests", []) or [])
+    if workload:
+        requests_by_filter = {
+            row["filter_name"]: [
+                request
+                for request in workload
+                if request.filter_name == row["filter_name"]
+            ][: args.warmup_queries]
+            for row in filters
+        }
+        query_nos = sorted(
+            {request.query_no for requests in requests_by_filter.values() for request in requests}
+        )
+        request_contract = {
+            name: [
+                {
+                    "request_no": request.request_no,
+                    "query_no": request.query_no,
+                    "query_id": request.query_id,
+                }
+                for request in requests
+            ]
+            for name, requests in requests_by_filter.items()
+        }
+    else:
+        query_nos = list(SCREEN_QUERY_NOS[: args.warmup_queries])
+        request_contract = {}
     spec = {
         "query_nos": query_nos,
+        "requests_by_filter": request_contract,
         "filters": [row["filter_name"] for row in filters],
         "config": asdict(config) | {"label": config.label},
         "sql_sha256_by_filter": {
@@ -2352,7 +3371,15 @@ def deterministic_warmup(
             args.k,
             args.candidate_validity_predicate,
         )
-        for query_no in spec["query_nos"]:
+        warmup_queries = (
+            [
+                int(row["query_no"])
+                for row in spec["requests_by_filter"][filter_spec["filter_name"]]
+            ]
+            if spec["requests_by_filter"]
+            else spec["query_nos"]
+        )
+        for query_no in warmup_queries:
             entry = truth[(filter_spec["filter_name"], int(query_no))]
             cur.execute(sql, (vectors[entry.query_id], entry.query_id, vectors[entry.query_id]))
             rows_fetched += len(cur.fetchall())
@@ -2388,6 +3415,10 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
     base_run_spec = {
         "args": normalized_args(args),
         "source_hashes": hashes,
+        "calibration_selection": {
+            "policy": CALIBRATION_SELECTION_POLICY,
+            "rule": CALIBRATION_SELECTION_RULE,
+        },
         "effective_configs": [asdict(config) | {"label": config.label} for config in configs],
         "config_dedup_proof_sha256": sha256_json(dedup_proof),
         "filters": [
@@ -2431,6 +3462,10 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
         "source_hashes": hashes,
         "git_revision": git_revision(),
         "query_splits": split_contract,
+        "calibration_selection": {
+            "policy": CALIBRATION_SELECTION_POLICY,
+            "rule": CALIBRATION_SELECTION_RULE,
+        },
         "config_ladder": {
             "source": str(args.config_ladder) if args.config_ladder else "deterministic_default",
             "effective_configs": [asdict(config) | {"label": config.label} for config in configs],
@@ -2471,17 +3506,15 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
 
         with psycopg.connect(pg_config_from_env().conninfo, autocommit=True) as conn:
             cur = conn.cursor()
-            cur.execute("SET max_parallel_workers_per_gather = 0")
-            cur.execute("SET jit = off")
-            # This is the sole planner-path shortcut.  EXPLAIN must still prove
-            # use of the same declared HNSW index for every filter.
-            cur.execute("SET enable_seqscan = off")
-            cur.execute(f"SET statement_timeout = {int(args.statement_timeout_ms)}")
+            planner_settings = configure_planner_session(
+                cur, args.planner_mode, args.statement_timeout_ms
+            )
             runtime = gate_implementation(
                 cur,
                 args.implementation,
                 args.required_sqlens_build_prefix,
                 args.minimum_sqlens_profile_semantics,
+                getattr(args, "expected_sqlens_build_id", ""),
             )
             if args.implementation == "sqlens_disabled":
                 disable_sqlens_gucs(cur)
@@ -2509,7 +3542,13 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
                     args.candidate_validity_predicate,
                 )
                 explain_audit[filter_spec["filter_name"]] = explain_hybrid(
-                    cur, sql, vectors[query_ids[0]], query_ids[0], args.index
+                    cur,
+                    sql,
+                    vectors[query_ids[0]],
+                    query_ids[0],
+                    args.index,
+                    args.planner_mode,
+                    query_no=0,
                 )
             manifest.update(
                 {
@@ -2521,7 +3560,11 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
                         "index_relfilenode": fingerprint["index_relfilenode"],
                         "indexdef_sha256": fingerprint["indexdef_sha256"],
                     },
-                    "explain_hnsw_gate": explain_audit,
+                    "planner_settings": planner_settings,
+                    "explain_route_audit": explain_audit,
+                    "explain_hnsw_gate": (
+                        explain_audit if args.planner_mode == "forced_hnsw" else {}
+                    ),
                 }
             )
             atomic_write_json(paths["manifest"], manifest)
@@ -2673,7 +3716,7 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
             }
             selection_rows: list[dict[str, Any]] = []
             selected_by_filter: dict[str, list[Config]] = {}
-            selection_spec: dict[str, dict[str, str]] = {}
+            selection_spec: dict[str, dict[str, dict[str, Any]]] = {}
             config_by_label = {config.label: config for config in configs}
             for filter_spec in filters:
                 name = filter_spec["filter_name"]
@@ -2689,7 +3732,15 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
                         summaries, target, max_budget_labels
                     )
                     label = str(selected["config_label"]) if selected else ""
-                    selection_spec[name][format(target, "g")] = label or status
+                    selection_spec[name][format(target, "g")] = {
+                        "status": status,
+                        "config_label": label,
+                        "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+                        "selection_fallback": proof["selection_fallback"],
+                        "verification_recall_lcb95": (
+                            selected["recall_lcb95"] if selected else ""
+                        ),
+                    }
                     if label and config_by_label[label] not in selected_by_filter[name]:
                         selected_by_filter[name].append(config_by_label[label])
                     selection_rows.append(
@@ -2698,6 +3749,8 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
                             "filter_name": name,
                             "target_recall": target,
                             "selection_status": status,
+                            "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+                            "selection_fallback": proof["selection_fallback"],
                             "selected_config_label": label,
                             "verification_recall_mean": (
                                 selected["recall_mean"] if selected else ""
@@ -2890,12 +3943,51 @@ def _legacy_monolithic_run(args: argparse.Namespace) -> dict[str, Path]:
 def run(args: argparse.Namespace) -> dict[str, Path]:
     """Run one staging arm phase; publication is owned by the controller finalizer."""
     validate_runtime_args(args)
-    split_contract = validate_split_contract()
+    workload_mode = frozen_workload_enabled(args)
     filters = load_filters(args.filters_csv, set(args.filter_names) or None)
-    formal_design = validate_formal_design(filters, args.target_recalls, args.formal_family)
+    filter_names = {row["filter_name"] for row in filters}
+    calibration_requests: list[WorkloadRequest] | None = None
+    measurement_requests: list[WorkloadRequest] | None = None
+    if workload_mode:
+        calibration_requests = load_frozen_workload(
+            args.calibration_workload_csv,
+            expected_requests=FORMAL_CALIBRATION_REQUESTS,
+            expected_split="calibration",
+            filter_names=filter_names,
+        )
+        measurement_requests = load_frozen_workload(
+            args.measurement_workload_csv,
+            expected_requests=FORMAL_MEASUREMENT_REQUESTS,
+            expected_split="measurement",
+            filter_names=filter_names,
+        )
+        workload_contract = validate_frozen_workload_contract(
+            calibration_requests, measurement_requests
+        )
+        args.calibration_workload_requests = calibration_requests
+        split_contract = {
+            "calibration": workload_contract["calibration_query_nos"],
+            "measurement": workload_contract["measurement_query_nos"],
+        }
+    else:
+        workload_contract = None
+        args.calibration_workload_requests = []
+        split_contract = validate_split_contract()
+    formal_design = validate_formal_design(
+        filters, args.target_recalls, args.formal_family, args.planner_mode
+    )
     input_configs = load_config_ladder(args.config_ladder, args.max_ef_search)
     all_configs, dedup_proof = effective_config_grid(input_configs)
-    configs = [config for config in all_configs if config.family == args.formal_family]
+    ladder_proof = validate_formal_ladder(all_configs, args.max_ef_search)
+    configs = [
+        config
+        for config in all_configs
+        if config.family in (
+            FORMAL_FAMILIES
+            if args.formal_family == "all"
+            else (args.formal_family,)
+        )
+    ]
     if not configs:
         raise ValueError(f"config ladder has no configs for formal family {args.formal_family}")
     if max(config.ef_search for config in configs) != args.max_ef_search:
@@ -2903,30 +3995,77 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "formal config ladder does not exercise the declared max_ef_search ceiling"
         )
 
-    filter_names = {row["filter_name"] for row in filters}
-    all_query_nos = SCREEN_QUERY_NOS + VERIFICATION_QUERY_NOS + FINAL_QUERY_NOS
-    truth = load_truth(
-        args.truth_csv,
-        all_query_nos,
-        filter_names,
-        args.k,
-        args.candidate_validity_predicate,
-    )
+    if workload_mode:
+        assert calibration_requests is not None
+        assert measurement_requests is not None
+        all_requests = [*calibration_requests, *measurement_requests]
+        truth = load_truth_for_workloads(
+            args.truth_csv,
+            all_requests,
+            args.k,
+            args.candidate_validity_predicate,
+        )
+        all_query_nos = tuple(request.query_no for request in all_requests)
+    else:
+        all_requests = []
+        all_query_nos = SCREEN_QUERY_NOS + VERIFICATION_QUERY_NOS + FINAL_QUERY_NOS
+        truth = load_truth(
+            args.truth_csv,
+            all_query_nos,
+            filter_names,
+            args.k,
+            args.candidate_validity_predicate,
+        )
     query_ids: dict[int, int] = {}
-    for query_no in all_query_nos:
-        ids = {truth[(name, query_no)].query_id for name in filter_names}
-        if len(ids) != 1:
+    if workload_mode:
+        query_ids = {
+            request.query_no: request.query_id for request in all_requests
+        }
+        if len(query_ids) != len(all_requests):
             raise ProvenanceGateError(
-                f"query_no={query_no} maps to different query IDs across filters"
+                "frozen workloads do not map each query_no to one unique query"
             )
-        query_ids[query_no] = ids.pop()
+    else:
+        for query_no in all_query_nos:
+            ids = {truth[(name, query_no)].query_id for name in filter_names}
+            if len(ids) != 1:
+                raise ProvenanceGateError(
+                    f"query_no={query_no} maps to different query IDs across filters"
+                )
+            query_ids[query_no] = ids.pop()
     paths = output_paths(args.out_dir, args.implementation, args.tag, args.run_uuid)
     args.paths = paths
     args.guc_block_audits = []
+    screen_query_nos = (
+        tuple(request.query_no for request in calibration_requests)
+        if workload_mode and calibration_requests is not None
+        else SCREEN_QUERY_NOS
+    )
+    verification_query_nos = (
+        tuple(request.query_no for request in calibration_requests)
+        if workload_mode and calibration_requests is not None
+        else VERIFICATION_QUERY_NOS
+    )
+    final_query_nos = (
+        tuple(request.query_no for request in measurement_requests)
+        if workload_mode and measurement_requests is not None
+        else FINAL_QUERY_NOS
+    )
     hashes = source_hashes(args, filters)
     dirty = source_tree_provenance(
         args.vector_source_repo, args.vector_source_commit
     )
+    source_tag = source_tag_provenance(
+        args.vector_source_repo, args.vector_source_tag, args.vector_source_commit
+    )
+    if (
+        args.implementation == "official"
+        and args.max_ef_search == UPSTREAM_MAX_EF_SEARCH
+        and dirty["dirty"]
+    ):
+        raise ProvenanceGateError(
+            "the release-limit official upstream source tree must be clean"
+        )
     ceiling_provenance = (
         upstream_parameter_ceiling_provenance(
             args.vector_source_repo,
@@ -2943,33 +4082,74 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     selected_config_records = [
         asdict(config) | {"label": config.label} for config in configs
     ]
+    final_blocks = protocol_final_blocks(args)
     schedule_contract = {
         "schedule_seed": args.schedule_seed,
-        "screen_query_nos": list(SCREEN_QUERY_NOS),
-        "verification_query_nos": list(VERIFICATION_QUERY_NOS),
-        "final_query_nos": list(FINAL_QUERY_NOS),
+        "screen_query_nos": (
+            [request.query_no for request in calibration_requests]
+            if workload_mode and calibration_requests is not None
+            else list(SCREEN_QUERY_NOS)
+        ),
+        "verification_query_nos": (
+            [request.query_no for request in calibration_requests]
+            if workload_mode and calibration_requests is not None
+            else list(VERIFICATION_QUERY_NOS)
+        ),
+        "final_query_nos": (
+            [request.query_no for request in measurement_requests]
+            if workload_mode and measurement_requests is not None
+            else list(FINAL_QUERY_NOS)
+        ),
+        "calibration_request_nos": (
+            [request.request_no for request in calibration_requests]
+            if workload_mode and calibration_requests is not None
+            else []
+        ),
+        "measurement_request_nos": (
+            [request.request_no for request in measurement_requests]
+            if workload_mode and measurement_requests is not None
+            else []
+        ),
         "screen_repeats": args.screen_repeats,
         "verification_repeats": args.verification_repeats,
         "final_repeats": args.final_repeats,
-        "final_blocks": 2,
-        "final_repeat_partition": "contiguous equal halves",
+        "final_blocks": final_blocks,
+        "final_repeat_partition": (
+            "one measurement-trace repeat per AB/BA/seeded round"
+            if workload_mode
+            else "contiguous equal blocks"
+        ),
         "balanced_config_order": "seeded cyclic rotation per query/repeat block",
         "warmup_spec_sha256": warmup_spec(args, filters, configs[0])["warmup_spec_sha256"],
         "prewarm_spec_sha256": relation_prewarm_spec(args)["prewarm_spec_sha256"],
         "prewarm_relations": list(getattr(args, "prewarm_relations", []) or []),
         "prewarm_mode": "read",
+        "pairing_key": (
+            ["request_no", "repeat"]
+            if workload_mode
+            else ["query_no", "repeat"]
+        ),
     }
     base_run_spec = {
         "args": normalized_args(args),
         "source_hashes": hashes,
+        "calibration_selection": {
+            "policy": CALIBRATION_SELECTION_POLICY,
+            "rule": CALIBRATION_SELECTION_RULE,
+            "lcb95_required": True,
+            "mean_only_fallback_allowed": False,
+        },
+        "formal_protocol_version": protocol_version(args),
         "vector_source_tree_provenance": {
             **dirty,
             "source_tag": args.vector_source_tag,
+            "source_tag_provenance": source_tag,
             "build_recipe": args.vector_build_recipe,
             "compiler_flags": args.vector_compiler_flags,
         },
         "formal_design": formal_design,
         "effective_configs": selected_config_records,
+        "formal_ladder_proof": ladder_proof,
         "config_dedup_proof_sha256": sha256_json(dedup_proof),
         "filters": [
             {"filter_name": row["filter_name"], "predicate": row["predicate"]}
@@ -2979,6 +4159,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         "parameter_ceiling_provenance": ceiling_provenance,
         "query_ids": query_ids,
         "query_splits": split_contract,
+        "frozen_workload_contract": workload_contract,
         "schedule_contract": schedule_contract,
     }
     base_run_spec_hash = sha256_json(base_run_spec)
@@ -2987,11 +4168,14 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     binary = server_vector_binary_provenance(
         args.server_container, args.expected_vector_so_sha256
     )
+    binary["dsn_sha256"] = dsn_fingerprint(args.dsn)
+    binary["independent_server_contract"] = True
     binary["source_tag"] = args.vector_source_tag
     binary["source_commit"] = args.vector_source_commit
     source_provenance = {
         "source_tag": args.vector_source_tag,
         "source_commit": args.vector_source_commit,
+        "source_tag_provenance": source_tag,
         "build_recipe": args.vector_build_recipe,
         "compiler_flags": args.vector_compiler_flags,
         "dirty_diff_sha256": dirty["dirty_diff_sha256"],
@@ -3004,24 +4188,13 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     }
 
     try:
-        try:
-            from common_pg import pg_config_from_env
-        except ImportError:
-            from experiments.hybrid_vector_db.scripts.common_pg import pg_config_from_env
         import psycopg
 
-        with psycopg.connect(pg_config_from_env().conninfo, autocommit=True) as conn:
+        with psycopg.connect(args.dsn, autocommit=True) as conn:
             cur = conn.cursor()
-            planner_settings = {
-                "max_parallel_workers_per_gather": "0",
-                "jit": "off",
-                "enable_seqscan": "off",
-                "statement_timeout_ms": int(args.statement_timeout_ms),
-            }
-            cur.execute("SET max_parallel_workers_per_gather = 0")
-            cur.execute("SET jit = off")
-            cur.execute("SET enable_seqscan = off")
-            cur.execute(f"SET statement_timeout = {int(args.statement_timeout_ms)}")
+            planner_settings = configure_planner_session(
+                cur, args.planner_mode, args.statement_timeout_ms
+            )
             runtime = gate_implementation(
                 cur,
                 args.implementation,
@@ -3038,25 +4211,48 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 fingerprint["table_max_id"],
             ) != (10_000_000, 0, 9_999_999):
                 raise RuntimeError(f"Amazon 10M table fingerprint mismatch: {fingerprint}")
-            graph_identity = load_graph_identity(
-                args.graph_identity_json, args.source_index, args.clone_index
-            )
-            source_index_fingerprint = index_catalog_fingerprint(
-                cur, args.source_index
-            )
-            clone_index_fingerprint = index_catalog_fingerprint(cur, args.clone_index)
-            if (
-                source_index_fingerprint["heap_oid"] != fingerprint["table_oid"]
-                or clone_index_fingerprint["heap_oid"] != fingerprint["table_oid"]
-            ):
-                raise ProvenanceGateError(
-                    "source and clone graph indexes must belong to the bound table"
+            if workload_mode:
+                official_index_identity = load_official_index_build_identity(
+                    args.official_index_build_manifest,
+                    table=args.table,
+                    index=args.index,
+                    official_source_commit=args.official_index_source_commit,
                 )
-            fingerprint["source_clone_graph_identity"] = {
-                "proof": graph_identity,
-                "source_index": source_index_fingerprint,
-                "clone_index": clone_index_fingerprint,
-            }
+                live_index_fingerprint = index_catalog_fingerprint(cur, args.index)
+                if live_index_fingerprint["heap_oid"] != fingerprint["table_oid"]:
+                    raise ProvenanceGateError(
+                        "official-built source index does not belong to the bound table"
+                    )
+                verify_live_official_index_identity(
+                    official_index_identity, live_index_fingerprint
+                )
+                fingerprint["official_index_build_identity"] = {
+                    **official_index_identity,
+                    "live_index_fingerprint": live_index_fingerprint,
+                    "same_index_for_both_arms": True,
+                }
+            else:
+                graph_identity = load_graph_identity(
+                    args.graph_identity_json, args.source_index, args.clone_index
+                )
+                source_index_fingerprint = index_catalog_fingerprint(
+                    cur, args.source_index
+                )
+                clone_index_fingerprint = index_catalog_fingerprint(
+                    cur, args.clone_index
+                )
+                if (
+                    source_index_fingerprint["heap_oid"] != fingerprint["table_oid"]
+                    or clone_index_fingerprint["heap_oid"] != fingerprint["table_oid"]
+                ):
+                    raise ProvenanceGateError(
+                        "source and clone graph indexes must belong to the bound table"
+                    )
+                fingerprint["source_clone_graph_identity"] = {
+                    "proof": graph_identity,
+                    "source_index": source_index_fingerprint,
+                    "clone_index": clone_index_fingerprint,
+                }
             settings_audit = {
                 "planner_settings": planner_settings,
                 "hnsw_guc_audit": guc_audit,
@@ -3084,13 +4280,23 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             manifest.pop("fatal_error", None)
             manifest.update(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
+                    "formal_protocol_version": protocol_version(args),
                     "status": "running",
+                    "diagnostic_valid": False,
                     "artifact_valid": False,
+                    "paper_eligible": False,
                     "started_at_utc": manifest.get("started_at_utc", utc_now()),
                     "last_invocation_started_at_utc": utc_now(),
                     "run_uuid": args.run_uuid,
                     "implementation": args.implementation,
+                    "comparison_role": (
+                        "independent_upstream_pgvector"
+                        if args.implementation == "official"
+                        else "sqlens_disabled_stock_control"
+                    ),
+                    "sqlens_profile_dependency": args.implementation == "sqlens_disabled",
+                    "upstream_pgvector": args.implementation == "official",
                     "execution_stage": args.execution_stage,
                     "checkpoint_spec_sha256": checkpoint_hash,
                     "base_run_spec_hash": base_run_spec_hash,
@@ -3103,7 +4309,14 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                     "database_fingerprint": fingerprint,
                     "settings_audit": settings_audit,
                     "formal_design": formal_design,
+                    "calibration_selection": {
+                        "policy": CALIBRATION_SELECTION_POLICY,
+                        "rule": CALIBRATION_SELECTION_RULE,
+                        "lcb95_required": True,
+                        "mean_only_fallback_allowed": False,
+                    },
                     "query_splits": split_contract,
+                    "frozen_workload_contract": workload_contract,
                     "schedule_contract": schedule_contract,
                     "config_ladder": {
                         "source": (
@@ -3118,14 +4331,15 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                             - {args.formal_family}
                         ),
                         "equivalence_dedup_proof": dedup_proof,
+                        "formal_ladder_proof": ladder_proof,
                     },
                     "checkpoint": {
                         "path": str(paths["raw"]),
                         "atomic": True,
                         "constructed_after_database_fingerprint": True,
                         "complete_block": (
-                            "phase/filter exact measurement-key set; final additionally "
-                            "partitions repeats into two complete blocks"
+                            "phase/filter exact measurement-key set; final is "
+                            "partitioned by complete trace repeat"
                         ),
                         "resume_cross_run_pairing": False,
                         "resume": args.resume,
@@ -3155,13 +4369,22 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                     args.candidate_validity_predicate,
                 )
                 explain_audit[filter_spec["filter_name"]] = explain_hybrid(
-                    cur, sql, vectors[query_ids[0]], query_ids[0], args.index
+                    cur,
+                    sql,
+                    vectors[query_ids[0]],
+                    query_ids[0],
+                    args.index,
+                    args.planner_mode,
+                    query_no=0,
                 )
             warmup_audit = deterministic_warmup(
                 cur, args, filters, configs[0], truth, vectors
             )
             post_warmup_gucs = enforce_hnsw_guc_allowlist(cur)
-            manifest["explain_hnsw_gate"] = explain_audit
+            manifest["explain_route_audit"] = explain_audit
+            manifest["explain_hnsw_gate"] = (
+                explain_audit if args.planner_mode == "forced_hnsw" else {}
+            )
             manifest.setdefault("prewarm_invocations", []).append(
                 {
                     "execution_stage": args.execution_stage,
@@ -3185,9 +4408,10 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 args.implementation,
                 "screen",
                 all_configs_by_filter,
-                SCREEN_QUERY_NOS,
+                screen_query_nos,
                 args.screen_repeats,
                 run_uuid=args.run_uuid,
+                workload_requests=calibration_requests,
             )
             if args.execution_stage == "calibration":
                 if any(str(row["phase"]) == "final" for row in raw_rows):
@@ -3200,21 +4424,23 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                     "screen",
                     filters,
                     all_configs_by_filter,
-                    SCREEN_QUERY_NOS,
+                    screen_query_nos,
                     args.screen_repeats,
                     truth,
                     vectors,
                     raw_rows,
                     screen_completed,
+                    workload_requests=calibration_requests,
                 )
                 screen_completed = validate_stage_checkpoint(
                     raw_rows,
                     args.implementation,
                     "screen",
                     all_configs_by_filter,
-                    SCREEN_QUERY_NOS,
+                    screen_query_nos,
                     args.screen_repeats,
                     run_uuid=args.run_uuid,
+                    workload_requests=calibration_requests,
                 )
             if len(screen_completed) != len(filters):
                 raise CheckpointContractError(
@@ -3226,10 +4452,11 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 "screen",
                 filters,
                 all_configs_by_filter,
-                SCREEN_QUERY_NOS,
+                screen_query_nos,
                 args.screen_repeats,
                 args.bootstrap_samples,
                 args.bootstrap_seed,
+                workload_requests=calibration_requests,
             )
             if any(not _complete_summary(row) for row in screen_summaries):
                 raise FormalResultInvalid("screening contains failed measurements")
@@ -3240,27 +4467,45 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             promotion_spec: dict[str, list[str]] = {}
             for filter_spec in filters:
                 name = filter_spec["filter_name"]
-                summaries = [
-                    row for row in screen_summaries if row["filter_name"] == name
-                ]
-                promoted, proof = build_promotion_set(
-                    summaries,
-                    configs,
-                    args.target_recalls,
-                    args.promotion_margin,
-                    family=args.formal_family,
-                )
-                promoted_by_filter[name] = promoted
-                promotion_spec[name] = [config.label for config in promoted]
+                # The r1 screen is diagnostic only. A formal LCB claim must
+                # calibrate r2 on the whole declared grid, otherwise
+                # an unattainable target could be an artifact of promotion.
+                promoted_by_filter[name] = list(configs)
+                promotion_spec[name] = [config.label for config in configs]
                 promotion_rows.extend(
                     {
                         "implementation": args.implementation,
                         "filter_name": name,
                         "formal_family": args.formal_family,
                         "promotion_margin": args.promotion_margin,
-                        **row,
+                        "config_label": config.label,
+                        "config_family": config.family,
+                        "promotion_reasons": "formal_complete_r2_calibration_grid",
+                        "screen_recall_mean": next(
+                            row["recall_mean"]
+                            for row in screen_summaries
+                            if row["filter_name"] == name
+                            and row["config_label"] == config.label
+                        ),
+                        "screen_recall_lcb95": next(
+                            row["recall_lcb95"]
+                            for row in screen_summaries
+                            if row["filter_name"] == name
+                            and row["config_label"] == config.label
+                        ),
+                        "screen_latency_mean_ms": next(
+                            row["latency_mean_ms"]
+                            for row in screen_summaries
+                            if row["filter_name"] == name
+                            and row["config_label"] == config.label
+                        ),
+                        "is_family_maximum_budget": config.label
+                        in {
+                            item.label
+                            for item in family_max_budget_configs(configs).values()
+                        },
                     }
-                    for row in proof
+                    for config in configs
                 )
             promotion_hash = sha256_json(promotion_spec)
             validate_derived_resume_hash(
@@ -3278,9 +4523,10 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 args.implementation,
                 "verification",
                 promoted_by_filter,
-                VERIFICATION_QUERY_NOS,
+                verification_query_nos,
                 args.verification_repeats,
                 run_uuid=args.run_uuid,
+                workload_requests=calibration_requests,
             )
             if args.execution_stage == "calibration":
                 run_stage_blocks(
@@ -3289,21 +4535,23 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                     "verification",
                     filters,
                     promoted_by_filter,
-                    VERIFICATION_QUERY_NOS,
+                    verification_query_nos,
                     args.verification_repeats,
                     truth,
                     vectors,
                     raw_rows,
                     verification_completed,
+                    workload_requests=calibration_requests,
                 )
                 verification_completed = validate_stage_checkpoint(
                     raw_rows,
                     args.implementation,
                     "verification",
                     promoted_by_filter,
-                    VERIFICATION_QUERY_NOS,
+                    verification_query_nos,
                     args.verification_repeats,
                     run_uuid=args.run_uuid,
+                    workload_requests=calibration_requests,
                 )
             if len(verification_completed) != len(filters):
                 raise CheckpointContractError(
@@ -3315,16 +4563,17 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 "verification",
                 filters,
                 promoted_by_filter,
-                VERIFICATION_QUERY_NOS,
+                verification_query_nos,
                 args.verification_repeats,
                 args.bootstrap_samples,
                 args.bootstrap_seed + 100_000,
+                workload_requests=calibration_requests,
             )
             write_csv_atomic(paths["verification"], verification_summaries)
 
             selection_rows: list[dict[str, Any]] = []
             selected_by_filter: dict[str, list[Config]] = {}
-            selection_spec: dict[str, dict[str, dict[str, str]]] = {}
+            selection_spec: dict[str, dict[str, dict[str, Any]]] = {}
             config_by_label = {config.label: config for config in configs}
             incomplete_selections = 0
             for filter_spec in filters:
@@ -3342,15 +4591,24 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                         summaries,
                         target,
                         verified_config_labels=verified_labels,
-                        family=args.formal_family,
+                        family=(
+                            None
+                            if args.formal_family == "all"
+                            else args.formal_family
+                        ),
                     )
                     label = str(selected["config_label"]) if selected else ""
-                    if status == "incomplete_verification":
+                    if status != "selected":
                         incomplete_selections += 1
                     selection_spec[name][format(float(target), "g")] = {
                         "status": status,
                         "config_label": label,
                         "formal_family": args.formal_family,
+                        "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+                        "selection_fallback": proof["selection_fallback"],
+                        "verification_recall_lcb95": (
+                            selected["recall_lcb95"] if selected else ""
+                        ),
                     }
                     if label and config_by_label[label] not in selected_by_filter[name]:
                         selected_by_filter[name].append(config_by_label[label])
@@ -3361,6 +4619,8 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                             "formal_family": args.formal_family,
                             "target_recall": target,
                             "selection_status": status,
+                            "calibration_selection_policy": CALIBRATION_SELECTION_POLICY,
+                            "selection_fallback": proof["selection_fallback"],
                             "selected_config_label": label,
                             "verification_recall_mean": (
                                 selected["recall_mean"] if selected else ""
@@ -3412,21 +4672,39 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 raise CheckpointContractError(
                     "final stage requires a completed calibration manifest"
                 )
-            half = args.final_repeats // 2
-            repeat_values = (
-                list(range(0, half))
-                if args.final_block == 0
-                else list(range(half, args.final_repeats))
+            if incomplete_selections:
+                manifest.update(
+                    {
+                        "status": "calibration_unattainable",
+                        "artifact_valid": False,
+                        "last_invocation_finished_at_utc": utc_now(),
+                        "incomplete_verification_targets": incomplete_selections,
+                        "outputs": {name: str(path) for name, path in paths.items()},
+                    }
+                )
+                manifest["output_hashes"] = _output_hashes(paths)
+                atomic_write_json(paths["manifest"], manifest)
+                raise FormalResultInvalid(
+                    "a Recall@10 target has no LCB95-qualified configuration on "
+                    "the complete r2 calibration grid"
+                )
+            repeats_per_block = args.final_repeats // final_blocks
+            repeat_values = list(
+                range(
+                    int(args.final_block) * repeats_per_block,
+                    (int(args.final_block) + 1) * repeats_per_block,
+                )
             )
             final_completed = validate_stage_checkpoint(
                 raw_rows,
                 args.implementation,
                 "final",
                 selected_by_filter,
-                FINAL_QUERY_NOS,
+                final_query_nos,
                 args.final_repeats,
                 repeat_values=repeat_values,
                 run_uuid=args.run_uuid,
+                workload_requests=measurement_requests,
             )
             run_stage_blocks(
                 cur,
@@ -3434,7 +4712,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 "final",
                 filters,
                 selected_by_filter,
-                FINAL_QUERY_NOS,
+                final_query_nos,
                 args.final_repeats,
                 truth,
                 vectors,
@@ -3442,16 +4720,18 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 final_completed,
                 repeat_values=repeat_values,
                 final_block=args.final_block,
+                workload_requests=measurement_requests,
             )
             final_completed = validate_stage_checkpoint(
                 raw_rows,
                 args.implementation,
                 "final",
                 selected_by_filter,
-                FINAL_QUERY_NOS,
+                final_query_nos,
                 args.final_repeats,
                 repeat_values=repeat_values,
                 run_uuid=args.run_uuid,
+                workload_requests=measurement_requests,
             )
             expected_selected_blocks = {
                 ("final", name)
@@ -3468,7 +4748,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             completed_invocations.add(int(args.final_block))
             manifest["completed_final_blocks"] = sorted(completed_invocations)
 
-            if completed_invocations != {0, 1}:
+            if completed_invocations != set(range(final_blocks)):
                 manifest.update(
                     {
                         "status": "final_in_progress",
@@ -3489,22 +4769,24 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 args.implementation,
                 "final",
                 selected_by_filter,
-                FINAL_QUERY_NOS,
+                final_query_nos,
                 args.final_repeats,
                 run_uuid=args.run_uuid,
+                workload_requests=measurement_requests,
             )
             if full_final_completed != expected_selected_blocks:
-                raise CheckpointContractError("combined AB/BA final blocks are incomplete")
+                raise CheckpointContractError("combined interleaved final blocks are incomplete")
             final_summaries = summarize_stage(
                 raw_rows,
                 args.implementation,
                 "final",
                 filters,
                 selected_by_filter,
-                FINAL_QUERY_NOS,
+                final_query_nos,
                 args.final_repeats,
                 args.bootstrap_samples,
                 args.bootstrap_seed + 200_000,
+                workload_requests=measurement_requests,
             )
             final_by_key = {
                 (row["filter_name"], row["config_label"]): row
@@ -3570,15 +4852,30 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 and not final_misses
                 and incomplete_selections == 0
             )
+            diagnostic_valid = bool(
+                all(str(row.get("error", "")) == "" and bool(row.get("valid")) for row in raw_rows)
+                and len(target_summaries) == 42
+            )
+            paper_eligible = bool(artifact_valid and diagnostic_valid)
             manifest.update(
                 {
-                    "status": "arm_ready" if artifact_valid else "staging_unconfirmed",
+                    "status": "paper_eligible" if paper_eligible else "staging_unconfirmed",
+                    "diagnostic_valid": diagnostic_valid,
                     "artifact_valid": artifact_valid,
+                    "paper_eligible": paper_eligible,
                     "finished_at_utc": utc_now(),
                     "last_invocation_finished_at_utc": utc_now(),
                     "heldout_final_misses": final_misses,
                     "incomplete_verification_targets": incomplete_selections,
                     "target_result_rows": len(target_summaries),
+                    "formal_coverage": {
+                        "expected_target_cells": 42,
+                        "selected_target_cells": len(selection_rows),
+                        "final_target_cells": len(target_summaries),
+                        "all_targets_selected": all_targets_selected,
+                        "final_miss_count": len(final_misses),
+                        "unattainable_count": incomplete_selections,
+                    },
                     "resume_append_only_audit": resume_append_only_audit(
                         checkpoint_rows_before, raw_rows
                     ),
@@ -3593,7 +4890,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             manifest.update(
                 {
                     "status": "invalid",
+                    "diagnostic_valid": False,
                     "artifact_valid": False,
+                    "paper_eligible": False,
                     "last_invocation_finished_at_utc": utc_now(),
                     "fatal_error": f"{exc.__class__.__name__}: {exc}",
                 }
@@ -3616,10 +4915,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--execution-stage", choices=("calibration", "final"), default="calibration"
     )
-    parser.add_argument("--final-block", type=int, choices=(0, 1))
-    parser.add_argument("--formal-family", choices=FORMAL_FAMILIES, default="off")
+    parser.add_argument("--final-block", type=nonnegative_int)
+    parser.add_argument("--formal-family", choices=FORMAL_FAMILY_CHOICES, default="off")
+    parser.add_argument(
+        "--planner-mode",
+        choices=PLANNER_MODES,
+        default="auto",
+        help=(
+            "auto preserves PostgreSQL planner defaults and records the chosen route; "
+            "forced_hnsw disables sequential scans and requires the declared HNSW index"
+        ),
+    )
     parser.add_argument("--filters-csv", type=Path, default=DEFAULT_FILTERS)
     parser.add_argument("--truth-csv", type=Path, default=DEFAULT_TRUTH)
+    parser.add_argument("--calibration-workload-csv", type=Path)
+    parser.add_argument("--measurement-workload-csv", type=Path)
     parser.add_argument("--config-ladder", type=Path)
     parser.add_argument(
         "--max-ef-search",
@@ -3642,6 +4952,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-index", type=validate_identifier, default=DEFAULT_INDEX)
     parser.add_argument("--clone-index", type=validate_identifier)
     parser.add_argument("--graph-identity-json", type=Path)
+    parser.add_argument("--official-index-build-manifest", type=Path)
+    parser.add_argument("--official-index-source-commit", default="")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--tag", default="20260718")
     parser.add_argument("--filter-names", nargs="*", default=[])
@@ -3650,7 +4962,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--promotion-margin", type=float, default=0.02)
     parser.add_argument("--screen-repeats", type=positive_int, default=1)
     parser.add_argument("--verification-repeats", type=positive_int, default=2)
-    parser.add_argument("--final-repeats", type=positive_int, default=6)
+    parser.add_argument("--final-repeats", type=positive_int, default=5)
     parser.add_argument("--warmup-queries", type=positive_int, default=5)
     parser.add_argument(
         "--prewarm-relation",
@@ -3664,6 +4976,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-seed", type=int, default=20260718)
     parser.add_argument("--schedule-seed", type=int, default=20260718)
     parser.add_argument("--statement-timeout-ms", type=nonnegative_int, default=300_000)
+    parser.add_argument(
+        "--dsn",
+        default="",
+        help="explicit DSN for this arm; only its SHA-256 fingerprint is persisted",
+    )
     parser.add_argument("--server-container", type=validate_container_name)
     parser.add_argument("--expected-vector-so-sha256", type=validate_sha256)
     parser.add_argument("--vector-source-tag", default="")
@@ -3674,6 +4991,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-epoch", default="")
     parser.add_argument(
         "--required-sqlens-build-prefix", default=DEFAULT_SQLENS_BUILD_PREFIX
+    )
+    parser.add_argument(
+        "--expected-sqlens-build-id",
+        default="",
+        help="exact SQLens build ID; mandatory for frozen P0-2 formal runs",
     )
     parser.add_argument(
         "--minimum-sqlens-profile-semantics",
@@ -3692,7 +5014,13 @@ def build_parser() -> argparse.ArgumentParser:
 def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
     default_configs, proof = effective_config_grid(default_config_ladder())
     formal_configs = [
-        config for config in default_configs if config.family == args.formal_family
+        config
+        for config in default_configs
+        if config.family in (
+            FORMAL_FAMILIES
+            if args.formal_family == "all"
+            else (args.formal_family,)
+        )
     ]
     counts = default_query_count_bounds(
         len(formal_configs),
@@ -3710,11 +5038,14 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
         "run_uuid": dry_uuid,
         "staging_dir": str(args.out_dir / "staging" / dry_uuid),
         "formal_family": args.formal_family,
+        "planner_mode": args.planner_mode,
+        "planner_defaults_preserved": args.planner_mode == "auto",
         "formal_target_recalls": list(FORMAL_TARGET_RECALLS),
         "formal_filter_count": 14,
         "formal_cell_count": 42,
         "calibration_final_separated": True,
-        "final_blocks": 2,
+        "final_blocks": protocol_final_blocks(args),
+        "frozen_workload_protocol": frozen_workload_enabled(args),
         "warmup_queries_per_filter_per_invocation": args.warmup_queries,
         "relation_prewarm": relation_prewarm_spec(args),
         "resume": args.resume,
@@ -3733,15 +5064,25 @@ def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
         "default_query_count_bounds_per_implementation": counts,
         "promotion_margin": args.promotion_margin,
         "official_pinned_vector_so_sha256": OFFICIAL_UPSTREAM_VECTOR_SO_SHA256,
+        "dsn_sha256": dsn_fingerprint(args.dsn) if args.dsn else None,
         "formal_cli_complete": bool(
             args.server_container
+            and args.dsn
             and args.run_uuid
             and args.data_epoch
             and args.vector_build_recipe
             and args.vector_compiler_flags
             and args.vector_source_repo
-            and args.graph_identity_json
-            and args.clone_index
+            and (
+                (
+                    args.calibration_workload_csv
+                    and args.measurement_workload_csv
+                    and args.official_index_build_manifest
+                    and args.formal_family == "all"
+                )
+                if frozen_workload_enabled(args)
+                else (args.graph_identity_json and args.clone_index)
+            )
             and (
                 args.implementation != "official"
                 or (

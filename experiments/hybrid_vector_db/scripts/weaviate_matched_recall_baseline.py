@@ -14,6 +14,7 @@ import json
 import math
 import os
 import random
+import shlex
 import statistics
 import struct
 import subprocess
@@ -32,7 +33,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[3]
 CLASS_NAME = "AmazonGroceryReview"
 EXPECTED_ROWS = 10_000_000
-DEFAULT_EF_VALUES = (100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000)
+DEFAULT_EF_VALUES = (
+    20, 40, 60, 80, 100, 150, 200, 250, 500, 1000, 2000, 5000, 10000,
+    20000, 50000, 100000,
+)
 DEFAULT_TARGETS = (0.90, 0.95, 0.99)
 CALIBRATION_QUERY_NOS = tuple(range(20, 100))
 FINAL_QUERY_NOS = tuple(range(100, 200))
@@ -40,12 +44,14 @@ CALIBRATION_REPEATS = 2
 FINAL_REPEATS = 5
 BOOTSTRAP_SAMPLES = 10_000
 K = 10
+FORMAL_HNSW_M = 32
+FORMAL_HNSW_EF_CONSTRUCTION = 128
 NA = "N/A"
 TARGET_SELECTION_RULE = "query-level mean recall@10 >= target; bootstrap CI/LCB reporting only"
 ACORN_REPORTED_STRATEGY = "acorn_configured_auto_fallback"
 ACORN_RATIO_ENV = "HNSW_ACORN_FILTER_RATIO"
 DEFAULT_FILTERS = ROOT / "experiments/hybrid_vector_db/configs/amazon10m_selectivity14_valid_embeddings_filters.csv"
-DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_valid_embeddings_formal.csv"
+DEFAULT_TRUTH = ROOT / "results/hybrid_vector_db/amazon_selectivity14_exact_truth_q200_unique_embeddings_formal.csv"
 DEFAULT_FBIN = ROOT / "data/amazon_reviews_2023/processed/grocery_reviews_10m_tfidf_svd128.fbin"
 DEFAULT_OUT = ROOT / "results/hybrid_vector_db/weaviate_matched_recall_baseline.csv"
 
@@ -88,6 +94,7 @@ class QueryResult:
     error: str
     returned_count: int = 0
     request_limit: int = K + 1
+    filter_membership_valid: bool = True
 
 
 EXPECTED_FILTERS = {
@@ -448,12 +455,53 @@ def json_to_graphql(value: Any, key: str | None = None) -> str:
 
 def graphql_query(class_name: str, vector: Sequence[float], where: dict[str, Any], limit: int) -> str:
     vector_text = json_to_graphql(np.asarray(vector, dtype=np.float32).tolist())
+    scalar_fields = " ".join(PROPERTY_TYPES)
     return (
         "{ Get { "
         f"{class_name}(nearVector:{{vector:{vector_text}}} "
         f"where:{json_to_graphql(where)} limit:{int(limit)}) "
-        "{ row_id _additional { distance id } } } }"
+        f"{{ {scalar_fields} _additional {{ distance id }} }} }} }}"
     )
+
+
+def where_matches_object(where: dict[str, Any], obj: dict[str, Any]) -> bool:
+    operator = str(where.get("operator", ""))
+    if operator in {"And", "Or"}:
+        operands = where.get("operands")
+        if not isinstance(operands, list):
+            return False
+        values = [where_matches_object(item, obj) for item in operands]
+        return all(values) if operator == "And" else any(values)
+    if operator == "Not":
+        operands = where.get("operands")
+        return bool(
+            isinstance(operands, list)
+            and len(operands) == 1
+            and not where_matches_object(operands[0], obj)
+        )
+    path = where.get("path")
+    if not isinstance(path, list) or len(path) != 1:
+        return False
+    actual = obj.get(str(path[0]))
+    expected_keys = ("valueInt", "valueNumber", "valueBoolean", "valueText")
+    expected_values = [where[key] for key in expected_keys if key in where]
+    if len(expected_values) != 1 or actual is None:
+        return False
+    expected = expected_values[0]
+    try:
+        if operator == "Equal":
+            return actual == expected
+        if operator == "GreaterThanEqual":
+            return actual >= expected
+        if operator == "LessThanEqual":
+            return actual <= expected
+        if operator == "GreaterThan":
+            return actual > expected
+        if operator == "LessThan":
+            return actual < expected
+    except TypeError:
+        return False
+    return False
 
 
 def request_json(
@@ -508,7 +556,13 @@ def _schema_property_map(schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(prop.get("name")): prop for prop in schema.get("properties", []) if isinstance(prop, dict)}
 
 
-def schema_gate(schema: dict[str, Any], strategy: str | None = None, ef: int | None = None) -> list[str]:
+def schema_gate(
+    schema: dict[str, Any],
+    strategy: str | None = None,
+    ef: int | None = None,
+    *,
+    require_build_provenance: bool = False,
+) -> list[str]:
     errors: list[str] = []
     if schema.get("class") not in (None, CLASS_NAME):
         errors.append(f"class={schema.get('class')!r}")
@@ -517,6 +571,16 @@ def schema_gate(schema: dict[str, Any], strategy: str | None = None, ef: int | N
     config = schema.get("vectorIndexConfig") or {}
     if str(config.get("distance", "")).lower() != "l2-squared":
         errors.append("distance must be l2-squared")
+    try:
+        max_connections = int(config.get("maxConnections", -1))
+        ef_construction = int(config.get("efConstruction", -1))
+    except (TypeError, ValueError):
+        max_connections = ef_construction = -1
+    if require_build_provenance:
+        if max_connections != FORMAL_HNSW_M:
+            errors.append(f"maxConnections must be {FORMAL_HNSW_M}")
+        if ef_construction != FORMAL_HNSW_EF_CONSTRUCTION:
+            errors.append(f"efConstruction must be {FORMAL_HNSW_EF_CONSTRUCTION}")
     if strategy is not None:
         try:
             cutoff = int(config.get("flatSearchCutoff", -1))
@@ -548,8 +612,17 @@ def schema_gate(schema: dict[str, Any], strategy: str | None = None, ef: int | N
     return errors
 
 
-def verify_schema(schema: dict[str, Any], strategy: str | None = None, ef: int | None = None) -> dict[str, Any]:
-    errors = schema_gate(schema, strategy, ef)
+def verify_schema(
+    schema: dict[str, Any],
+    strategy: str | None = None,
+    ef: int | None = None,
+    *,
+    require_build_provenance: bool = False,
+) -> dict[str, Any]:
+    errors = schema_gate(
+        schema, strategy, ef,
+        require_build_provenance=require_build_provenance,
+    )
     if errors:
         raise RuntimeError("schema gate failed: " + "; ".join(errors))
     return schema
@@ -631,7 +704,7 @@ def put_schema_definition(
     readback, read_retries = request_json(
         base_url, f"/v1/schema/{CLASS_NAME}", timeout=timeout, retries=retries
     )
-    verify_schema(readback, strategy, ef)
+    verify_schema(readback, strategy, ef, require_build_provenance=True)
     _verify_full_schema_readback(definition, readback)
     return readback, put_retries + read_retries
 
@@ -673,6 +746,15 @@ def query_once(
         if data.get("errors"):
             raise RuntimeError(json.dumps(data["errors"], sort_keys=True))
         objects = data["data"]["Get"][CLASS_NAME]
+        invalid_filter_ids = [
+            int(obj.get("row_id", -1))
+            for obj in objects
+            if not where_matches_object(where, obj)
+        ]
+        if invalid_filter_ids:
+            raise RuntimeError(
+                f"Weaviate returned IDs outside the requested filter: {invalid_filter_ids[:5]}"
+            )
         raw_ids = tuple(int(obj["row_id"]) for obj in objects)
         service_distances = [float(obj["_additional"]["distance"]) for obj in objects]
         if len(raw_ids) > request_limit:
@@ -694,9 +776,13 @@ def query_once(
         return QueryResult(
             ids, (time.perf_counter() - started) * 1000.0, retry_count, order_error, "",
             returned_count=len(raw_ids), request_limit=request_limit,
+            filter_membership_valid=True,
         )
     except Exception as exc:
-        return QueryResult((), (time.perf_counter() - started) * 1000.0, 0, "", f"{exc.__class__.__name__}: {exc}")
+        return QueryResult(
+            (), (time.perf_counter() - started) * 1000.0, 0, "",
+            f"{exc.__class__.__name__}: {exc}", filter_membership_valid=False,
+        )
 
 
 def exact_squared_l2(
@@ -868,12 +954,6 @@ def pair_calibration_summaries(
     )
 
 
-def pair_reached_highest_target(
-    summaries: Sequence[dict[str, Any]], highest_target: float
-) -> bool:
-    return any(reaches_target(summary, highest_target) for summary in summaries)
-
-
 def calibration_target_status(
     candidates: Sequence[dict[str, Any]], target: float, ef_values: Sequence[int]
 ) -> str:
@@ -920,9 +1000,9 @@ def validate_monotone_calibration_state(
         measured_efs = [int(row["ef"]) for row in candidates]
         if measured_efs != expected_efs[:len(measured_efs)] or len(measured_efs) != len(set(measured_efs)):
             raise RuntimeError(f"checkpoint calibration grid is not an ascending prefix: {strategy}/{filter_name}")
-        reached_at = [index for index, row in enumerate(candidates) if reaches_target(row, highest_target)]
-        if reached_at and reached_at[0] != len(candidates) - 1:
-            raise RuntimeError(f"checkpoint violates monotone early-stop: {strategy}/{filter_name}")
+        # A resumed formal run may contain any ascending prefix. Selection is
+        # delayed until the full grid is present because latency need not be
+        # monotone in ef.
 
 
 def common_attainable_targets(
@@ -1041,6 +1121,7 @@ def measurement_row(
         and len(result.ids) <= K
         and len(result_distances_sq) == len(result.ids)
         and query_id not in result.ids
+        and result.filter_membership_valid
     )
     return {
         "phase": phase,
@@ -1059,6 +1140,7 @@ def measurement_row(
         "latency_definition": "end_to_end_http_json_parse_row_id_transfer",
         "recall_at_10": tie_aware_recall(result_distances_sq, truth, K) if valid else NA,
         "recall_contract": "distance_threshold_tie_aware_v1",
+        "filter_membership_valid": result.filter_membership_valid,
         "truth_filtered_rows": truth.filtered_rows,
         "truth_kth_distance_sq": truth.kth_distance_sq,
         "truth_tie_tolerance": truth.tie_tolerance,
@@ -1413,12 +1495,70 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-seed", type=int, default=20260718)
     parser.add_argument("--resume", action="store_true", help="resume only from an exactly matching complete-block checkpoint")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--debug-nonformal-protocol", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
-def _dry_run(args: argparse.Namespace) -> int:
+def formal_protocol_errors(args: argparse.Namespace) -> list[str]:
+    errors: list[str] = []
+    if tuple(args.ef_values) != DEFAULT_EF_VALUES:
+        errors.append("ef_values must be the complete formal ef=20..100000 grid")
+    if tuple(args.targets) != DEFAULT_TARGETS:
+        errors.append("targets must be exactly 0.90,0.95,0.99")
+    if args.k != K:
+        errors.append(f"k must be {K}")
+    return errors
+
+
+def dry_run_payload(args: argparse.Namespace) -> dict[str, Any]:
     strategies = [args.strategy] if args.strategy else args.strategies
-    print(json.dumps({"dry_run": True, "network": False, "files_read": False, "files_written": False, "class": CLASS_NAME, "k": K, "configured_filter_strategies": strategies, "reported_strategies": [reported_strategy(strategy) for strategy in strategies], "ef_values": args.ef_values, "targets": args.targets, "target_selection_rule": TARGET_SELECTION_RULE, "calibration_query_nos": [20, 99], "final_query_nos": [100, 199], "reserved_query_nos": [0, 19]}, sort_keys=True))
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--host", args.host,
+        "--port", str(args.port),
+        "--filters-csv", str(args.filters_csv),
+        "--truth-csv", str(args.truth_csv),
+        "--fbin", str(args.fbin),
+        "--out", str(args.out),
+        "--ef-values", *(str(value) for value in args.ef_values),
+        "--targets", *(str(value) for value in args.targets),
+        "--strategies", *strategies,
+    ]
+    errors = formal_protocol_errors(args)
+    return {
+        "dry_run": True,
+        "side_effects": {"network": False, "files_read": False, "files_written": False},
+        "formal_protocol_valid": not errors,
+        "formal_protocol_errors": errors,
+        "command": command,
+        "command_shell": shlex.join(command),
+        "class": CLASS_NAME,
+        "k": K,
+        "configured_filter_strategies": strategies,
+        "reported_strategies": [reported_strategy(strategy) for strategy in strategies],
+        "index_provenance": {
+            "type": "hnsw",
+            "distance": "l2-squared",
+            "max_connections_m": FORMAL_HNSW_M,
+            "ef_construction": FORMAL_HNSW_EF_CONSTRUCTION,
+            "schema_readback_required": True,
+        },
+        "ef_values": list(args.ef_values),
+        "targets": list(args.targets),
+        "target_selection_rule": TARGET_SELECTION_RULE,
+        "calibration": {
+            "query_nos": [20, 99], "queries": 80, "repeats": 2,
+            "full_ef_grid_required": True,
+        },
+        "final": {"query_nos": [100, 199], "queries": 100, "repeats": 5},
+        "latency": "full HTTP request through response read, JSON parsing, filter-membership validation, and row_id extraction",
+        "ground_truth": "self-excluded exact SQL-valid top-10 with tie-aware squared-L2 threshold",
+    }
+
+
+def _dry_run(args: argparse.Namespace) -> int:
+    print(json.dumps(dry_run_payload(args), sort_keys=True))
     return 0
 
 
@@ -1518,6 +1658,7 @@ def artifact_gate_errors(
     target_statuses: dict[tuple[str, str, float], str] | None = None,
     calibration_summaries: Sequence[dict[str, Any]] = (),
     final_results: Sequence[dict[str, Any]] = (),
+    ef_values: Sequence[int] = (),
 ) -> list[str]:
     errors: list[str] = []
     expected = {
@@ -1528,6 +1669,26 @@ def artifact_gate_errors(
     }
     if set(selections) != expected:
         errors.append(f"selection grid mismatch: expected={len(expected)} actual={len(selections)}")
+    if ef_values:
+        expected_calibration = {
+            (strategy, spec.name, int(ef))
+            for strategy in strategies
+            for spec in filters
+            for ef in ef_values
+        }
+        observed_calibration = {
+            (
+                str(row.get("configured_filter_strategy")),
+                str(row.get("filter_name")),
+                int(row.get("ef", -1)),
+            )
+            for row in calibration_summaries
+        }
+        if observed_calibration != expected_calibration:
+            errors.append(
+                "calibration grid coverage mismatch: "
+                f"expected={len(expected_calibration)} actual={len(observed_calibration)}"
+            )
     by_key: dict[tuple[str, str, float], list[dict[str, Any]]] = {}
     for row in final_summaries:
         key = (
@@ -1596,6 +1757,9 @@ def run(args: argparse.Namespace) -> int:
     checkpoint = checkpoint_path(args.out)
     if args.k != K:
         raise ValueError(f"formal runner requires k={K}")
+    protocol_errors = formal_protocol_errors(args)
+    if protocol_errors and not args.debug_nonformal_protocol:
+        raise ValueError("non-formal matched-recall protocol: " + "; ".join(protocol_errors))
     if sorted(set(args.targets)) != list(args.targets) or any(target <= 0 or target > 1 for target in args.targets):
         raise ValueError("targets must be sorted, unique, and in (0, 1]")
     if sorted(set(args.ef_values)) != list(args.ef_values) or any(ef <= 0 for ef in args.ef_values):
@@ -1677,7 +1841,7 @@ def run(args: argparse.Namespace) -> int:
         for block in completed_blocks
     }
     try:
-        verify_schema(initial_schema)
+        verify_schema(initial_schema, require_build_provenance=True)
         service_meta, _ = request_json(base_url, "/v1/meta", timeout=args.timeout, retries=args.retries)
         initial_nodes, node_retries = get_ready_nodes(base_url, args.timeout, args.retries)
         node_records.append({"phase": "initial", "retries": node_retries, "nodes": initial_nodes})
@@ -1706,16 +1870,9 @@ def run(args: argparse.Namespace) -> int:
             if actual != spec.expected_rows:
                 raise RuntimeError(f"filter count mismatch for {spec.name}: expected={spec.expected_rows} actual={actual}")
 
-        highest_target = float(args.targets[-1])
         for schedule_index, strategy, ef in configuration_schedule:
-            active_specs = [
-                spec for spec in rotated(filters, schedule_index)
-                if not pair_reached_highest_target(
-                    pair_calibration_summaries(calibration_summaries, strategy, spec.name), highest_target
-                )
-            ]
             pending_specs = [
-                spec for spec in active_specs
+                spec for spec in rotated(filters, schedule_index)
                 if _block_key("calibration", strategy, spec.name, ef) not in completed_keys
             ]
             if not pending_specs:
@@ -1855,6 +2012,7 @@ def run(args: argparse.Namespace) -> int:
         selections=selections, final_summaries=final_summaries, raw_rows=raw_rows,
         target_statuses=target_statuses, calibration_summaries=calibration_summaries,
         final_results=final_result_summaries,
+        ef_values=args.ef_values,
     )
     errors = measurement_errors + gate_errors
     common_targets = common_attainable_targets(strategies, filters, args.targets, selections)
@@ -1930,6 +2088,13 @@ def run(args: argparse.Namespace) -> int:
         "schema_timings": schema_timings,
         "node_records": node_records,
         "measurement_mode": "single_client_sequential",
+        "formal_protocol_valid": not protocol_errors,
+        "formal_protocol_errors": protocol_errors,
+        "hnsw_build": {
+            "max_connections_m": FORMAL_HNSW_M,
+            "ef_construction": FORMAL_HNSW_EF_CONSTRUCTION,
+            "provenance": "full schema read-back",
+        },
     }
     outcome_counts = target_outcome_counts(final_summaries, target_statuses.values())
     outcome_notes = [

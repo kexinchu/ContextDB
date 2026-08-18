@@ -16,7 +16,7 @@
 #include "utils/sampling.h"
 #include "vector.h"
 
-#define SQLENS_BUILD_ID "sqlens-v12-dual-frontier-prioritization-20260718-r11"
+#define SQLENS_BUILD_ID "sqlens-v16-distance-aware-route-budget-ef500k-20260801-r41"
 
 #if PG_VERSION_NUM >= 190000
 typedef Pointer Item;
@@ -51,7 +51,7 @@ typedef Pointer Item;
 #define HNSW_MAX_EF_CONSTRUCTION		1000
 #define HNSW_DEFAULT_EF_SEARCH	40
 #define HNSW_MIN_EF_SEARCH		1
-#define HNSW_MAX_EF_SEARCH		100000
+#define HNSW_MAX_EF_SEARCH		500000
 
 /* Tuple types */
 #define HNSW_ELEMENT_TUPLE_TYPE  1
@@ -71,6 +71,7 @@ typedef Pointer Item;
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 #define HNSW_PROFILE_MAX_TIDS 1000
 #define HNSW_PROFILE_MAX_PROOFS 128
+#define HNSW_INDEX_PAGE_TRACE_SAMPLE_LIMIT 64
 #define HNSW_INDEX_PAGE_UNIQUE_LIMIT 65536
 #define HNSW_INDEX_PAGE_UNIQUE_SLOTS (HNSW_INDEX_PAGE_UNIQUE_LIMIT * 2)
 
@@ -143,6 +144,8 @@ extern int	hnsw_traversal_guided_max_bridge_work;
 extern double hnsw_traversal_guided_min_skip_rate;
 extern bool hnsw_traversal_guided_prioritization;
 extern int	hnsw_traversal_guided_burst;
+extern bool hnsw_traversal_guided_early_stop;
+extern double hnsw_traversal_guided_early_stop_distance_ratio;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
 
@@ -198,7 +201,8 @@ typedef enum HnswTraversalStockBypassReason
 	HNSW_TRAVERSAL_BYPASS_NO_PROVEN_GUIDE,
 	HNSW_TRAVERSAL_BYPASS_SKIP_ESTIMATE_UNAVAILABLE,
 	HNSW_TRAVERSAL_BYPASS_LOW_ESTIMATED_SKIP_RATE,
-	HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN
+	HNSW_TRAVERSAL_BYPASS_ITERATIVE_SCAN,
+	HNSW_TRAVERSAL_BYPASS_STALE_RELATION
 } HnswTraversalStockBypassReason;
 
 typedef enum HnswTraversalAdmissionReason
@@ -209,17 +213,15 @@ typedef enum HnswTraversalAdmissionReason
 	HNSW_TRAVERSAL_ADMISSION_SKIP_ESTIMATE_UNAVAILABLE,
 	HNSW_TRAVERSAL_ADMISSION_LOW_ESTIMATED_SKIP_RATE,
 	HNSW_TRAVERSAL_ADMISSION_DEFAULT_VALIDATION_ONLY,
-	HNSW_TRAVERSAL_ADMISSION_ADMITTED
+	HNSW_TRAVERSAL_ADMISSION_ADMITTED,
+	HNSW_TRAVERSAL_ADMISSION_STALE_RELATION
 } HnswTraversalAdmissionReason;
 
 typedef enum HnswTraversalFallbackReason
 {
 	HNSW_TRAVERSAL_FALLBACK_NONE,
 	HNSW_TRAVERSAL_FALLBACK_INSUFFICIENT_MATCHES,
-	HNSW_TRAVERSAL_FALLBACK_BRIDGE_HOPS,
-	HNSW_TRAVERSAL_FALLBACK_BRIDGE_WORK,
 	HNSW_TRAVERSAL_FALLBACK_MAX_SCAN_TUPLES,
-	HNSW_TRAVERSAL_FALLBACK_MEMORY_LIMIT,
 	HNSW_TRAVERSAL_FALLBACK_INVALID_NEIGHBOR
 } HnswTraversalFallbackReason;
 
@@ -323,20 +325,16 @@ typedef struct HnswTraversalGuidanceState
 	bool		estimatedSkipRateValid;
 	double		estimatedSkipRate;
 	int			target;
-	int			maxBridgeHops;
-	int64		maxBridgeWork;
-	int64		bridgeWork;
 	int64		maxScanTuples;
 	MemoryContext phaseContext;
 	Size		maxMemory;
-	bool		hopLimitReached;
-	bool		workLimitReached;
 	bool		maxScanReached;
-	bool		memoryLimitReached;
 	bool		invalidNeighbor;
 	int			guidedResultCount;
 	int			bridgePendingAtTermination;
 	int			burst;
+	bool		earlyStop;
+	double		earlyStopDistanceRatio;
 	HnswIterativeScanMode iterativeScan;
 	HnswFilterStrategyMode filterStrategy;
 	HnswTraversalFinalPath finalPath;
@@ -377,12 +375,14 @@ typedef struct HnswTraversalProfile
 	int64		matchFrontierPops;
 	int64		noBridgeFrontierPops;
 	int64		noBridgeDeferred;
+	int64		priorityReorders;
 	int64		maxNoBridgeDebt;
 	int64		noBridgeExpansions;
 	int64		dualFrontierTerminationChecks;
 	int64		dualFrontierTerminationChecksWithBoth;
 	int64		dualFrontierTerminations;
 	int64		dualFrontierTerminationsWithBoth;
+	int64		guidedEarlyStopTerminations;
 	int64		candidateAdmissions;
 	int64		resultAdmissions;
 	int64		guidedAdmissions;
@@ -402,8 +402,22 @@ typedef struct HnswTraversalProfile
 typedef struct HnswScanProfile
 {
 	bool		valid;
+	int		traversalResultTarget;
+	int64		traversalGuidedResultCount;
+	bool		traversalMaxScanReached;
 	double		totalScanMs;
 	double		hnswSearchMs;
+	double		indexReadBufferMs;
+	double		indexReadBufferSharedReadMs;
+	double		indexReadBufferSharedHitMs;
+	double		indexReadBufferUnclassifiedMs;
+	double		distanceComputeMs;
+	double		hnswRemainingMs;
+	int64		indexReadBufferCalls;
+	int64		indexReadBufferSharedReadCalls;
+	int64		indexReadBufferSharedHitCalls;
+	int64		indexReadBufferUnclassifiedCalls;
+	int64		distanceComputeTimedCalls;
 	double		heapFetchMs;
 	double		vectorSearchMs;
 	int64		visitedTuples;
@@ -431,6 +445,17 @@ typedef struct HnswScanProfile
 	int64		indexPageDistinctPages;
 	BlockNumber indexPageLastBlock;
 	bool		indexPageDistinctPagesExact;
+	int64		indexPageTransitions;
+	int64		indexPageSameBlockTransitions;
+	int64		indexPageWithinOneTransitions;
+	int64		indexPageWithinFourTransitions;
+	int64		indexPageWithinSixteenTransitions;
+	int64		indexPageBackwardTransitions;
+	uint64		indexPageTotalAbsBlockDelta;
+	uint64		indexPageMaxAbsBlockDelta;
+	int			indexPageTraceSampleCount;
+	bool		indexPageTraceSampleTruncated;
+	BlockNumber indexPageTraceSample[HNSW_INDEX_PAGE_TRACE_SAMPLE_LIMIT];
 	int64		heapTidReturns;
 	int64		heapTidPageRuns;
 	int64		heapTidDistinctPages;
@@ -454,6 +479,7 @@ typedef struct HnswScanProfile
 	double		traversalEstimatedSkipRate;
 	int			traversalPrioritizationBurst;
 	HnswIterativeScanMode iterativeScan;
+	HnswIterativeScanMode effectiveIterativeScan;
 	HnswFilterStrategyMode filterStrategy;
 	int			plannerProofCount;
 	bool		plannerProofsTruncated;
@@ -474,6 +500,27 @@ typedef struct HnswIndexPageProfile
 	int64		runs;
 	int64		distinctPages;
 	BlockNumber lastBlock;
+	int64		transitions;
+	int64		sameBlockTransitions;
+	int64		withinOneTransitions;
+	int64		withinFourTransitions;
+	int64		withinSixteenTransitions;
+	int64		backwardTransitions;
+	uint64		totalAbsBlockDelta;
+	uint64		maxAbsBlockDelta;
+	int			traceSampleCount;
+	bool		traceSampleTruncated;
+	BlockNumber traceSample[HNSW_INDEX_PAGE_TRACE_SAMPLE_LIMIT];
+	double		indexReadBufferMs;
+	double		indexReadBufferSharedReadMs;
+	double		indexReadBufferSharedHitMs;
+	double		indexReadBufferUnclassifiedMs;
+	double		distanceComputeMs;
+	int64		indexReadBufferCalls;
+	int64		indexReadBufferSharedReadCalls;
+	int64		indexReadBufferSharedHitCalls;
+	int64		indexReadBufferUnclassifiedCalls;
+	int64		distanceComputeTimedCalls;
 }			HnswIndexPageProfile;
 
 typedef struct HnswIndexPageSet
@@ -838,6 +885,7 @@ HnswScanGuidance *HnswGuidancePrepareForScan(IndexScanDesc scan, void *planBindi
 bool		HnswGuidanceIsActiveForScan(HnswScanGuidance *guidance);
 bool		HnswGuidanceAllowsTid(HnswScanGuidance *guidance, ItemPointer tid);
 bool		HnswGuidanceGetEstimatedSkipRate(HnswScanGuidance *guidance, double *skipRate);
+bool		HnswGuidanceRequiresIterativeScan(HnswScanGuidance *guidance);
 void		HnswGuidanceEndScan(HnswScanGuidance *guidance);
 void		HnswGuidanceRecordScan(Oid heapOid, int64 candidates,
 							 int64 guidanceChecks, int64 guidanceSkips,

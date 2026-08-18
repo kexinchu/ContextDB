@@ -1,0 +1,35 @@
+{
+  "amazon": {
+    "popular_ge3284": {
+      "guidance": false,
+      "stock": {"ef_search": 42, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 42, "iterative_scan": "off"}
+    },
+    "popular_ge4559": {
+      "guidance": false,
+      "stock": {"ef_search": 50, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 50, "iterative_scan": "off"}
+    },
+    "rating5_price_le10": {
+      "guidance": false,
+      "stock": {"ef_search": 250, "iterative_scan": "off"},
+      "sqlens": {"ef_search": 250, "iterative_scan": "off"}
+    },
+    "grocery_rating5": {
+      "stock": {"ef_search": 800, "iterative_scan": "off"},
+      "sqlens": {
+        "ef_search": 12,
+        "max_scan_tuples": 5000,
+        "traversal_guided_target": 12
+      }
+    },
+    "helpful_ge20": {
+      "stock": {"ef_search": 10000, "iterative_scan": "off"},
+      "sqlens": {
+        "ef_search": 12,
+        "max_scan_tuples": 22000,
+        "traversal_guided_target": 12
+      }
+    }
+  }
+}
