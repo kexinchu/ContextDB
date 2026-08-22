@@ -3725,11 +3725,15 @@ def warm_database_cache(args: argparse.Namespace) -> dict[str, Any]:
         return {"passed": False, "enabled": False, "formal": False}
     relations = list(
         dict.fromkeys(
-            [
+            relation
+            for relation in (
                 args.insertion_table,
                 args.insertion_index,
+                getattr(args, "bfs_index", None),
+                getattr(args, "bfs_table", None),
                 args.query_table or args.insertion_table,
-            ]
+            )
+            if relation
         )
     )
     loaded: dict[str, int] = {}
@@ -3737,7 +3741,7 @@ def warm_database_cache(args: argparse.Namespace) -> dict[str, Any]:
         cur = conn.cursor()
         for relation in relations:
             try:
-                cur.execute("SELECT pg_prewarm(%s::regclass, 'buffer', 'read')", (relation,))
+                cur.execute("SELECT pg_prewarm(%s::regclass, 'buffer', 'main')", (relation,))
             except Exception as exc:  # noqa: BLE001
                 raise BenchmarkContractError(
                     "warm-cache gate requires the pg_prewarm extension and readable benchmark relations"

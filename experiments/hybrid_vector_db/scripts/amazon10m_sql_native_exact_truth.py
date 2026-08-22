@@ -62,15 +62,14 @@ PROTOCOL_Q200 = "q200"
 PROTOCOL_Q10200 = "q10200"
 PROTOCOLS = (PROTOCOL_Q200, PROTOCOL_Q10200)
 MAIN_WORKLOAD_NAMES = (
-    "acl_only",
-    "grant_temporal_selectivity",
-    "fact_temporal_selectivity",
+    "join_facts",
+    "join_catalog",
+    "join_acl",
 )
 MAIN_FILTER_NAMES = (
-    "popular_ge1000",
-    "price_10_to_20",
-    "rating5_price_le10",
+    "grocery_helpful",
     "helpful_ge20",
+    "grocery_long500",
 )
 CHECKPOINT_VERSION = 5
 QUERY_COHORT_PARSER_VERSION = 1
@@ -121,6 +120,7 @@ class WorkloadSpec:
     temporal_kind: str
     width: str = "base"
     boolean_predicate: str = ""
+    join_kind: str = "acl"
 
 
 @dataclass(frozen=True)
@@ -211,24 +211,50 @@ WORKLOADS = (
             "AND sibling_fact.valid_from <= fact.valid_from)"
         ),
     ),
+    WorkloadSpec(
+        "join_facts",
+        "hybrid search: reviews joined to review facts",
+        50.0,
+        "none",
+        "base",
+        "",
+        "facts",
+    ),
+    WorkloadSpec(
+        "join_catalog",
+        "hybrid search: reviews joined to facts and the product catalog",
+        50.0,
+        "none",
+        "base",
+        "",
+        "catalog",
+    ),
+    WorkloadSpec(
+        "join_acl",
+        "hybrid search: catalog join plus principal grant ACL",
+        50.0,
+        "none",
+        "base",
+        "",
+        "acl",
+    ),
 )
 
 
 def select_workloads(
     names: Sequence[str], protocol: str = PROTOCOL_Q200
 ) -> list[WorkloadSpec]:
-    selected = set(names)
-    if not selected:
-        selected = (
-            set(MAIN_WORKLOAD_NAMES)
-            if protocol == PROTOCOL_Q10200
-            else {workload.name for workload in WORKLOADS}
-        )
-    result = [workload for workload in WORKLOADS if workload.name in selected]
-    observed = {workload.name for workload in result}
-    if observed != selected:
-        raise ValueError(f"unknown workloads: {sorted(selected - observed)}")
-    return result
+    by_name = {workload.name: workload for workload in WORKLOADS}
+    if names:
+        order = list(names)
+    elif protocol == PROTOCOL_Q10200:
+        order = list(MAIN_WORKLOAD_NAMES)
+    else:
+        order = [workload.name for workload in WORKLOADS]
+    missing = {name for name in order if name not in by_name}
+    if missing:
+        raise ValueError(f"unknown workloads: {sorted(missing)}")
+    return [by_name[name] for name in order]
 
 
 def canonical_sha256(value: Any) -> str:
@@ -750,6 +776,52 @@ def boolean_predicate(workload: WorkloadSpec) -> str:
     return f"\n  AND ({predicate})"
 
 
+def join_kind(workload: WorkloadSpec) -> str:
+    kind = getattr(workload, "join_kind", "acl")
+    if kind not in {"none", "facts", "catalog", "acl"}:
+        raise ValueError(f"unknown join kind: {kind}")
+    return kind
+
+
+def relation_join_sql(workload: WorkloadSpec) -> str:
+    kind = join_kind(workload)
+    if kind == "none":
+        return ""
+    clauses = [
+        "JOIN public.amazon_review_facts AS fact\n  ON fact.review_id = v.id"
+    ]
+    if kind in {"catalog", "acl"}:
+        clauses.append(
+            "JOIN public.amazon_product_dim AS product\n"
+            "  ON product.parent_asin = fact.parent_asin"
+        )
+    if kind == "acl":
+        clauses.append(
+            "JOIN public.amazon_principal_tenant_grants AS grant_row\n"
+            "  ON grant_row.tenant_id = product.tenant_id"
+        )
+    return "\n".join(clauses)
+
+
+def grant_visibility_sql(workload: WorkloadSpec) -> str:
+    if join_kind(workload) != "acl":
+        return ""
+    return """
+  AND grant_row.principal_name = CURRENT_USER::text
+  AND grant_row.can_read"""
+
+
+def required_join_tokens(workload: WorkloadSpec) -> tuple[str, ...]:
+    if join_kind(workload) == "none":
+        return ()
+    tokens = ["join public.amazon_review_facts"]
+    if join_kind(workload) in {"catalog", "acl"}:
+        tokens.append("join public.amazon_product_dim")
+    if join_kind(workload) == "acl":
+        tokens.extend(("join public.amazon_principal_tenant_grants", "current_user"))
+    return tuple(tokens)
+
+
 def build_candidate_sql(
     table: str,
     predicate: str,
@@ -760,16 +832,10 @@ def build_candidate_sql(
     return f"""
 SELECT v.id
 FROM {qualified_name(table)} AS v
-JOIN public.amazon_review_facts AS fact
-  ON fact.review_id = v.id
-JOIN public.amazon_product_dim AS product
-  ON product.parent_asin = fact.parent_asin
-JOIN public.amazon_principal_tenant_grants AS grant_row
-  ON grant_row.tenant_id = product.tenant_id
+{relation_join_sql(workload)}
 WHERE ({qualify_predicate(predicate)})
   AND ({qualify_candidate_validity_predicate(candidate_validity_predicate)})
-  AND grant_row.principal_name = CURRENT_USER::text
-  AND grant_row.can_read
+{grant_visibility_sql(workload)}
 {temporal_predicate(workload)}
 {boolean_predicate(workload)}
 ORDER BY v.id
@@ -792,18 +858,12 @@ WITH query_vector AS (
 ), valid AS MATERIALIZED (
     SELECT v.id, v.embedding
     FROM {qualified_name(table)} AS v
-    JOIN public.amazon_review_facts AS fact
-      ON fact.review_id = v.id
-    JOIN public.amazon_product_dim AS product
-      ON product.parent_asin = fact.parent_asin
-    JOIN public.amazon_principal_tenant_grants AS grant_row
-      ON grant_row.tenant_id = product.tenant_id
+    {relation_join_sql(workload)}
     CROSS JOIN query_vector
     WHERE ({qualify_predicate(predicate)})
       AND ({qualify_candidate_validity_predicate(candidate_validity_predicate)})
       AND v.id <> query_vector.query_id
-      AND grant_row.principal_name = CURRENT_USER::text
-      AND grant_row.can_read
+{grant_visibility_sql(workload)}
 {temporal_predicate(workload)}
 {boolean_predicate(workload)}
 )
@@ -822,17 +882,21 @@ def validate_exact_sql_text(sql_text: str) -> None:
         raise RuntimeError(f"exact SQL contains approximate marker(s): {forbidden}")
 
 
-def validate_candidate_sql(sql_text: str) -> None:
+def validate_candidate_sql(sql_text: str, workload: WorkloadSpec | None = None) -> None:
     validate_exact_sql_text(sql_text)
     normalized = " ".join(sql_text.lower().split())
     if " limit " in f" {normalized} ":
         raise RuntimeError("candidate export SQL must never use LIMIT")
     required = (
-        "join public.amazon_review_facts",
-        "join public.amazon_product_dim",
-        "join public.amazon_principal_tenant_grants",
-        "current_user",
-        "order by v.id",
+        required_join_tokens(workload) + ("order by v.id",)
+        if workload is not None
+        else (
+            "join public.amazon_review_facts",
+            "join public.amazon_product_dim",
+            "join public.amazon_principal_tenant_grants",
+            "current_user",
+            "order by v.id",
+        )
     )
     missing = [token for token in required if token not in normalized]
     if missing:
@@ -1661,10 +1725,11 @@ def stream_candidate_ids(
     params: dict[str, Any],
     destination: Path,
     fetch_rows: int,
+    workload: WorkloadSpec | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Execute exactly once and atomically export the entire ordered candidate ID stream."""
     np = require_numpy()
-    validate_candidate_sql(sql_text)
+    validate_candidate_sql(sql_text, workload)
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
     values: list[int] = []
@@ -1916,7 +1981,7 @@ def execute_pair(
             workload,
             args.candidate_validity_predicate,
         )
-        validate_candidate_sql(candidate_sql)
+        validate_candidate_sql(candidate_sql, workload)
         validate_exact_sql_text(spot_sql)
         cur.execute("EXPLAIN (FORMAT JSON, VERBOSE, SETTINGS) " + candidate_sql, {"as_of": as_of})
         candidate_plan = cur.fetchone()[0]
@@ -1927,6 +1992,7 @@ def execute_pair(
         candidate_ids, candidate = stream_candidate_ids(
             conn, candidate_sql, {"as_of": as_of},
             _candidate_path(args.artifact_dir, workload.name, filter_spec.name), args.candidate_fetch_rows,
+            workload,
         )
         if candidate_ids.size == 0:
             raise RuntimeError(f"workload={workload.name} filter={filter_spec.name} has no SQL candidates")
@@ -2051,7 +2117,7 @@ def resolve_protocol_args(args: argparse.Namespace) -> argparse.Namespace:
             args.workload_names = list(MAIN_WORKLOAD_NAMES)
         if args.artifact_dir == DEFAULT_ARTIFACT_DIR:
             args.artifact_dir = (
-                ROOT / "results/hybrid_vector_db/amazon10m_sql_native_q10200_r43"
+                ROOT / "results/hybrid_vector_db/amazon10m_sql_native_q10200_r43_sqlops_join"
             )
     return args
 
@@ -2378,7 +2444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         and mainline_slice
     )
     manifest["paper_eligibility_gate"] = {
-        "mainline_3x4_q10200": mainline_slice,
+        "mainline_3x3_q10200": mainline_slice,
         "requested_slice_complete": requested_slice["complete"],
         "external_database_execution_required": True,
     }

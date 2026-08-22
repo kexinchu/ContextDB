@@ -325,6 +325,208 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             args.expected_vector_so_sha256,
             benchmark.SQLENS_R43_VECTOR_SO_SHA256,
         )
+        self.assertEqual(
+            args.exact_truth_csv.name,
+            "amazon10m_sql_native_exact_truth_q10200.csv",
+        )
+        self.assertEqual(
+            args.exact_truth_csv.parent.name,
+            "amazon10m_sql_native_q10200_r43_sqlops_join",
+        )
+        self.assertEqual(
+            args.exact_truth_manifest.name,
+            "amazon10m_sql_native_exact_truth_manifest.json",
+        )
+        self.assertEqual(
+            args.workload_names,
+            list(benchmark.P0_WORKLOAD_NAMES),
+        )
+        self.assertEqual(
+            args.filter_names,
+            list(benchmark.P0_FILTER_NAMES),
+        )
+        self.assertGreaterEqual(min(args.ef_search_values), benchmark.P0_MIN_EF_SEARCH)
+        self.assertNotIn("popular_ge1000", args.filter_names)
+        self.assertNotIn("price_10_to_20", args.filter_names)
+        self.assertNotIn("acl_only", args.workload_names)
+        self.assertNotIn("boolean_complex_narrow_exists", args.workload_names)
+        self.assertNotIn("fact_temporal_selectivity", args.workload_names)
+        self.assertEqual(args.workload_names, ["join_facts", "join_catalog", "join_acl"])
+
+    def test_q10200_rejects_legacy_acl_popular_matrix(self):
+        args = benchmark.resolve_protocol_args(
+            benchmark.create_argument_parser().parse_args(
+                [
+                    "--protocol",
+                    "q10200",
+                    "--workload-names",
+                    "acl_only",
+                    "grant_temporal_selectivity",
+                    "fact_temporal_selectivity",
+                    "--filter-names",
+                    "popular_ge1000",
+                    "price_10_to_20",
+                    "rating5_price_le10",
+                    "helpful_ge20",
+                ]
+            )
+        )
+        source_filters = benchmark.read_filters(benchmark.DEFAULT_FILTERS)
+        filters = benchmark.read_filters(
+            benchmark.DEFAULT_FILTERS, set(args.filter_names)
+        )
+        workloads = benchmark.select_workloads(
+            args.workload_names, args.protocol
+        )
+        with self.assertRaisesRegex(RuntimeError, "facts-join, catalog-join, and ACL-join"):
+            benchmark.validate_formal_dimensions(
+                args, filters, workloads, source_filters
+            )
+
+    def test_q10200_confirmation_resolves_q2k_r1_and_parallel_sql_first(self):
+        args = benchmark.resolve_protocol_args(
+            benchmark.create_argument_parser().parse_args(
+                ["--protocol", "q10200", "--confirmation"]
+            )
+        )
+        source_filters = benchmark.read_filters(benchmark.DEFAULT_FILTERS)
+        filters = benchmark.read_filters(
+            benchmark.DEFAULT_FILTERS, set(args.filter_names)
+        )
+        workloads = benchmark.select_workloads(
+            args.workload_names, args.protocol
+        )
+        benchmark.validate_formal_dimensions(
+            args, filters, workloads, source_filters
+        )
+        self.assertTrue(args.confirmation)
+        self.assertEqual(args.final_query_offset, 200)
+        self.assertEqual(args.final_queries, 2_000)
+        self.assertEqual(args.final_repeats, 1)
+        self.assertEqual(
+            args.sql_first_workers, benchmark.P0_CONFIRMATION_SQL_FIRST_WORKERS
+        )
+        self.assertEqual(
+            args.out.name,
+            "amazon10m_sql_native_p0_r43_q2k_r1_sqlops_join_confirm.csv",
+        )
+        self.assertEqual(
+            args.workload_names,
+            [
+                "join_facts",
+                "join_catalog",
+                "join_acl",
+            ],
+        )
+        self.assertEqual(
+            args.filter_names,
+            ["grocery_helpful", "helpful_ge20", "grocery_long500"],
+        )
+        self.assertNotIn("popular_ge1000", args.filter_names)
+        self.assertGreaterEqual(min(args.ef_search_values), benchmark.P0_MIN_EF_SEARCH)
+
+    def test_q10200_screening_resolves_q1k_r1(self):
+        args = benchmark.resolve_protocol_args(
+            benchmark.create_argument_parser().parse_args(
+                ["--protocol", "q10200", "--screening"]
+            )
+        )
+        source_filters = benchmark.read_filters(benchmark.DEFAULT_FILTERS)
+        filters = benchmark.read_filters(
+            benchmark.DEFAULT_FILTERS, set(args.filter_names)
+        )
+        workloads = benchmark.select_workloads(
+            args.workload_names, args.protocol
+        )
+        benchmark.validate_formal_dimensions(
+            args, filters, workloads, source_filters
+        )
+        self.assertTrue(args.screening)
+        self.assertFalse(args.confirmation)
+        self.assertEqual(args.final_queries, 1_000)
+        self.assertEqual(args.final_repeats, 1)
+        self.assertEqual(
+            args.out.name,
+            "amazon10m_sql_native_p0_r43_q1k_r1_sqlops_join_screen.csv",
+        )
+
+    def test_p0_sql_exposes_facts_catalog_and_acl_join_depths(self):
+        table = "public.amazon_grocery_reviews_10m_pgvector"
+        predicate = "v.rating = 5 AND v.has_price AND v.price <= 10"
+        by_name = {item.name: item for item in benchmark.WORKLOADS}
+        facts_sql = benchmark.build_hybrid_sql(
+            table, predicate, workload=by_name["join_facts"]
+        )
+        catalog_sql = benchmark.build_hybrid_sql(
+            table, predicate, workload=by_name["join_catalog"]
+        )
+        acl_sql = benchmark.build_hybrid_sql(
+            table, predicate, workload=by_name["join_acl"]
+        )
+        for sql_text in (facts_sql, catalog_sql, acl_sql):
+            self.assertIn("JOIN public.amazon_review_facts", sql_text)
+            self.assertIn("ORDER BY", sql_text)
+        self.assertNotIn("JOIN public.amazon_product_dim", facts_sql)
+        self.assertNotIn("CURRENT_USER", facts_sql)
+        self.assertIn("JOIN public.amazon_product_dim", catalog_sql)
+        self.assertNotIn("CURRENT_USER", catalog_sql)
+        self.assertIn("JOIN public.amazon_principal_tenant_grants", acl_sql)
+        self.assertIn("CURRENT_USER", acl_sql)
+
+    def test_attributes_shape_is_where_only_hybrid_search(self):
+        table = "public.amazon_grocery_reviews_10m_pgvector"
+        predicate = "v.main_category = 'Grocery' AND v.helpful_vote >= 1"
+        attributes = benchmark.WorkloadSpec(
+            "attributes",
+            "row-local WHERE hybrid search",
+            50.0,
+            False,
+            "base",
+            "",
+            "none",
+            "none",
+        )
+        sql_text = benchmark.build_hybrid_sql(
+            table, predicate, workload=attributes
+        )
+        self.assertIn("ORDER BY", sql_text)
+        self.assertIn("LIMIT", sql_text)
+        self.assertNotIn("JOIN public.amazon_review_facts", sql_text)
+        self.assertNotIn("CURRENT_USER", sql_text)
+        candidate = exact_truth.build_candidate_sql(table, predicate, attributes)
+        self.assertIn("ORDER BY v.id", candidate)
+        self.assertNotIn("<->", candidate)
+        self.assertNotIn("JOIN public.amazon_review_facts", candidate)
+
+    def test_binding_atoms_stay_filter_local_for_join_workloads(self):
+        filters = benchmark.read_filters(
+            benchmark.DEFAULT_FILTERS, {"helpful_ge20"}
+        )
+        by_name = {item.name: item for item in benchmark.WORKLOADS}
+        for name in ("join_facts", "join_catalog", "join_acl"):
+            self.assertEqual(
+                benchmark.binding_atoms_for(by_name[name], filters[0]),
+                filters[0].atoms,
+            )
+
+    def test_partition_measurement_schedule_keeps_sqlens_sequential(self):
+        keys = [("acl_only", "popular_ge1000", 200, 0)]
+        schedule = benchmark.interleaved_schedule(
+            keys, benchmark.P0_MODES, seed=7
+        )
+        sequential, parallel = benchmark.partition_measurement_schedule(
+            schedule, benchmark.SQL_FIRST_MODE
+        )
+        self.assertEqual(len(schedule), 3)
+        self.assertEqual(len(parallel), 1)
+        self.assertEqual(len(sequential), 2)
+        self.assertEqual(parallel[0][2], benchmark.SQL_FIRST_MODE)
+        self.assertNotIn(
+            benchmark.SQL_FIRST_MODE, [mode for _, _, mode in sequential]
+        )
+        self.assertEqual(
+            {item[0] for item in sequential + parallel}, {0, 1, 2}
+        )
 
     def test_run_spec_integrity_hash_survives_json_integer_key_roundtrip(self):
         run_spec = {
@@ -489,10 +691,13 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         sql_text = benchmark.build_hybrid_sql("public.amazon_grocery_reviews_10m_pgvector", "rating = 5")
         exact_text = benchmark.build_hybrid_sql("public.amazon_grocery_reviews_10m_pgvector", "rating = 5", exact=True)
         normalized = " ".join(sql_text.lower().split())
-        self.assertIn("order by v.embedding <-> query_vector.embedding", normalized)
-        self.assertIn("v.id <> query_vector.query_id", normalized)
+        self.assertIn(
+            "order by v.embedding <-> %(query_embedding)s::vector",
+            normalized,
+        )
+        self.assertIn("v.id <> %(query_id)s", normalized)
         self.assertIn("v.embedding_valid", normalized)
-        self.assertIn("query_row.embedding_valid", normalized)
+        self.assertNotIn("query_vector", normalized)
         self.assertIn("vector_hnsw_guidance_bind", normalized)
         self.assertIn("%(binding_kind)s", sql_text)
         self.assertNotIn("vector_hnsw_guidance_bind", exact_text.lower())
@@ -500,7 +705,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         benchmark.validate_exact_sql_text(exact_text)
         with self.assertRaisesRegex(RuntimeError, "guidance/HNSW"):
             benchmark.validate_exact_sql_text(exact_text + " SELECT vector_hnsw_guidance_bind()")
-        self.assertNotIn("order by v.embedding <-> query_vector.embedding, v.id", normalized)
+        self.assertNotIn("order by v.embedding <-> %(query_embedding)s::vector, v.id", normalized)
         self.assertIn("valid as materialized", exact_text.lower())
         exact_normalized = " ".join(exact_text.lower().split())
         self.assertIn(
@@ -517,7 +722,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertIn("fact.valid_from <= %(as_of)s", normalized)
         self.assertIn("v.rating = 5", normalized)
         self.assertIn("v.embedding_valid", exact_normalized)
-        self.assertEqual(normalized.count("select"), 3)
+        self.assertEqual(normalized.count("select"), 2)
 
     def test_candidate_validity_predicate_rejects_nonformal_expressions(self):
         for predicate in (
@@ -782,7 +987,15 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             workload.name: benchmark.build_hybrid_sql("t", "rating = 5", workload=workload)
             for workload in benchmark.WORKLOADS
         }
-        self.assertEqual(len(set(sql_by_workload.values())), len(benchmark.WORKLOADS))
+        self.assertEqual(
+            sql_by_workload["join_acl"], sql_by_workload["acl_only"]
+        )
+        distinct = {
+            name: sql
+            for name, sql in sql_by_workload.items()
+            if name != "join_acl"
+        }
+        self.assertEqual(len(set(distinct.values())), len(distinct))
         self.assertNotIn("valid_from <= %(as_of)s", sql_by_workload["acl_only"])
         self.assertIn("grant_row.valid_from <= %(as_of)s", sql_by_workload["grant_temporal_selectivity"])
         self.assertIn("fact.valid_from <= %(as_of)s", sql_by_workload["fact_temporal_selectivity"])
@@ -890,6 +1103,76 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertNotIn("RESET ROLE", cursor.statements)
         self.assertFalse(any(item.startswith("SET ROLE") for item in cursor.statements))
 
+    def test_ensure_fragment_catalog_resets_role_then_grants_principal(self):
+        class _Cursor:
+            def __init__(self) -> None:
+                self.role = "amazon10m_sql_native_benchmark"
+                self.statements: list[str] = []
+                self._row: tuple[object, ...] | None = None
+
+            def execute(self, sql: str, params: tuple[object, ...] | None = None) -> None:
+                normalized = " ".join(sql.split())
+                self.statements.append(normalized)
+                if normalized == "SELECT current_user, session_user":
+                    self._row = (self.role, "postgres")
+                elif normalized == "RESET ROLE":
+                    self.role = "postgres"
+                    self._row = None
+                elif normalized.startswith("SET ROLE"):
+                    self.role = "amazon10m_sql_native_benchmark"
+                    self._row = None
+                elif self.role != "postgres":
+                    raise AssertionError(f"catalog DDL must run as postgres: {sql!r}")
+                else:
+                    self._row = None
+
+            def fetchone(self) -> tuple[object, ...] | None:
+                return self._row
+
+        cursor = _Cursor()
+        proof = benchmark.ensure_sqlens_fragment_catalog(
+            cursor,
+            "amazon10m_sql_native_benchmark",
+            "public.amazon_grocery_reviews_10m_pgvector",
+            enable_tracking=True,
+        )
+        self.assertTrue(proof["valid"])
+        self.assertEqual(cursor.role, "amazon10m_sql_native_benchmark")
+        self.assertEqual(cursor.statements[0], "SELECT current_user, session_user")
+        self.assertEqual(cursor.statements[1], "RESET ROLE")
+        self.assertTrue(
+            any("CREATE TABLE IF NOT EXISTS public.pgvector_hnsw_fragment_store" in sql for sql in cursor.statements)
+        )
+        self.assertTrue(
+            any(
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON public.pgvector_hnsw_fragment_store TO "amazon10m_sql_native_benchmark"'
+                in sql
+                for sql in cursor.statements
+            )
+        )
+        self.assertTrue(
+            any(
+                'GRANT CREATE ON SCHEMA public TO "amazon10m_sql_native_benchmark"' in sql
+                for sql in cursor.statements
+            )
+        )
+        self.assertIn(
+            "SELECT vector_hnsw_fragment_tracking_enable(%s::regclass)",
+            cursor.statements,
+        )
+        self.assertEqual(
+            cursor.statements[-1],
+            'SET ROLE "amazon10m_sql_native_benchmark"',
+        )
+
+    def test_ensure_fragment_catalog_rejects_unsafe_principal(self):
+        cursor = mock.MagicMock()
+        with self.assertRaises(RuntimeError):
+            benchmark.ensure_sqlens_fragment_catalog(
+                cursor, 'evil"; DROP TABLE x; --', "public.vectors"
+            )
+        cursor.execute.assert_not_called()
+
     def test_filter_loader_preserves_config_predicate_and_atoms(self):
         filters = benchmark.read_filters(ROOT / "configs" / "amazon10m_selectivity14_filters.csv")
         self.assertEqual(len(filters), 14)
@@ -914,9 +1197,54 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertIn("SET hnsw.index_page_access = off", stock_calls)
         self.assertIn("SET hnsw.page_access = off", guided_calls)
         self.assertIn("SET hnsw.index_page_access = off", guided_calls)
+        for calls in (stock_calls, guided_calls):
+            self.assertIn("SET enable_seqscan = off", calls)
+            self.assertIn("SET enable_bitmapscan = off", calls)
+            self.assertIn("SET join_collapse_limit = 1", calls)
+            self.assertIn("SET from_collapse_limit = 1", calls)
         self.assertEqual(
             benchmark.build_hybrid_sql("t", "rating = 5"),
             benchmark.build_hybrid_sql("t", "rating = 5"),
+        )
+
+    def test_heap_competing_indexes_are_toggled_as_postgres(self):
+        class Cursor:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params=None) -> None:
+                self.calls.append(" ".join(str(sql).split()))
+                if params is not None:
+                    self.params = params
+
+            def fetchone(self):
+                return ("amazon10m_sql_native_benchmark", "postgres")
+
+            def fetchall(self):
+                return [("amazon_grocery_reviews_10m_pgvector_helpful_vote_idx",)]
+
+        cursor = Cursor()
+        names = benchmark.set_heap_competing_indexes_valid(
+            cursor, "public.amazon_grocery_reviews_10m_pgvector", valid=False
+        )
+        self.assertEqual(
+            names, ["amazon_grocery_reviews_10m_pgvector_helpful_vote_idx"]
+        )
+        self.assertTrue(any("RESET ROLE" in call for call in cursor.calls))
+        self.assertTrue(
+            any(
+                "UPDATE pg_index" in call
+                and "am.amname <> 'hnsw'" in call
+                and "indisprimary" not in call
+                for call in cursor.calls
+            )
+        )
+        self.assertEqual(cursor.params, (False, "amazon_grocery_reviews_10m_pgvector"))
+        self.assertTrue(
+            any(
+                'SET ROLE "amazon10m_sql_native_benchmark"' in call
+                for call in cursor.calls
+            )
         )
 
     def test_bootstrap_lcb_is_reproducible_and_mean_recall_selects_config(self):
@@ -1050,6 +1378,8 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         benchmark.validate_checkpoint_run_spec(checkpoint, run_spec)
         with self.assertRaisesRegex(RuntimeError, "run-spec mismatch"):
             benchmark.validate_checkpoint_run_spec(checkpoint, {"k": 20, "queries": [[0, 10]]})
+        runner_only = {**run_spec, "runner_sha256": "ab" * 32}
+        benchmark.validate_checkpoint_run_spec(checkpoint, runner_only)
 
     def test_checkpoint_directory_uses_atomic_immutable_shards(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1254,6 +1584,54 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         paired = benchmark.paired_summary(rows, rows, expected_keys=expected, target_recall=0.90, bootstrap_samples=100, seed=1)
         self.assertEqual(paired["speedup_vs_stock"], benchmark.NA)
         self.assertEqual(paired["status"], benchmark.NA)
+
+    def test_paired_summary_can_skip_per_cell_adaptive_evidence(self):
+        expected = {("grant_temporal_selectivity", "helpful_ge20", q, 0) for q in (0, 1)}
+        stock = [
+            {
+                "workload": "grant_temporal_selectivity",
+                "filter_name": "helpful_ge20",
+                "query_no": q,
+                "repeat": 0,
+                "pair_key": f"grant_temporal_selectivity|helpful_ge20|q{q}|r0",
+                "query_id": 10 + q,
+                "predicate": "helpful_vote >= 20",
+                "query_sql_sha256": "same",
+                "exact_gt_ids": "1",
+                "e2e_ms": 40.0,
+                "query_ms": 40.0,
+                "recall": 1.0,
+                "error": "",
+                "mode": "stock",
+            }
+            for q in (0, 1)
+        ]
+        sqlens = [
+            {
+                **row,
+                "mode": "d1_d2_d3",
+                "e2e_ms": 20.0,
+                "query_ms": 20.0,
+                "adaptive_probe_observed": False,
+                "adaptive_materialized": False,
+                "adaptive_active": True,
+                "adaptive_admission_observed": True,
+                "hidden_prebuilt_fragment_reused": False,
+            }
+            for row in stock
+        ]
+        blocked = benchmark.paired_summary(
+            stock, sqlens, expected_keys=expected, target_recall=0.90,
+            bootstrap_samples=100, seed=1, method_mode="d1_d2_d3",
+        )
+        self.assertEqual(blocked["status"], benchmark.NA)
+        allowed = benchmark.paired_summary(
+            stock, sqlens, expected_keys=expected, target_recall=0.90,
+            bootstrap_samples=100, seed=1, method_mode="d1_d2_d3",
+            require_adaptive_evidence=False,
+        )
+        self.assertEqual(allowed["status"], "complete")
+        self.assertAlmostEqual(float(allowed["speedup_vs_stock"]), 2.0)
 
     def test_paired_sql_contract_rejects_different_query_or_exact_gt(self):
         stock = [{"pair_key": "p", "query_id": 1, "predicate": "rating = 5", "query_sql_sha256": "sql", "exact_gt_ids": "1,2"}]
@@ -1537,6 +1915,7 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                 None,
                 7,
                 selected_modes=("stock",),
+                query_embeddings={1: "[1,0,0]"},
             )
         self.assertEqual({row["mode"] for row in rows}, {"stock"})
         self.assertEqual(len(plans), 1)
@@ -1548,6 +1927,124 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
             rows[0]["e2e_ms"],
             rows[0]["activation_ms"] + rows[0]["query_ms"],
         )
+
+    def test_sql_first_workers_execute_on_pooled_cursors(self):
+        class NamedCursor:
+            def __init__(self, name):
+                self.name = name
+                self.calls = []
+
+            def execute(self, sql, params=None):
+                self.calls.append((str(sql), params))
+
+            def fetchone(self):
+                return (
+                    [{"Plan": {"Node Type": "Index Scan", "Index Name": "price_idx"}}],
+                )
+
+            def fetchall(self):
+                return [(1, 0.25)]
+
+            def close(self):
+                pass
+
+        class NamedConnection:
+            def __init__(self, name):
+                self.name = name
+                self.cursors = []
+
+            def cursor(self):
+                cursor = NamedCursor(self.name)
+                self.cursors.append(cursor)
+                return cursor
+
+        main = NamedConnection("main")
+        worker = NamedConnection("worker")
+        spec = benchmark.FilterSpec("f", "1%", "rating = 5", ("sql:rating = 5",), 1, 1.0)
+        context = {
+            "current_user": "principal",
+            "app_as_of": "1000",
+            "preferred_index": "public.vector_hnsw_idx",
+            "filter_strategy": "forced_indexed_exact",
+            "page_access": "off",
+            "index_page_access": "off",
+        }
+        with (
+            mock.patch.object(benchmark, "set_mode"),
+            mock.patch.object(
+                benchmark,
+                "configure_guidance",
+                return_value={
+                    "sql_first_forced_indexed_exact": True,
+                    "guidance_enabled": False,
+                    "guidance_route": benchmark.SQL_FIRST_MODE,
+                    "activation_atom_count": 0,
+                    "activation_ms": 0.0,
+                    "before": {},
+                    "after_activation": {},
+                },
+            ),
+            mock.patch.object(benchmark, "runtime_sql_context", return_value=context),
+            mock.patch.object(
+                benchmark,
+                "explain",
+                return_value=(
+                    [{"Plan": {"Index Name": "price_idx"}}],
+                    {"valid": True, "require_hnsw": False},
+                ),
+            ),
+            mock.patch.object(
+                benchmark,
+                "validate_sql_first_explain_gate",
+                return_value={"valid": True, "require_hnsw": False},
+            ),
+            mock.patch.object(
+                benchmark,
+                "prepare_explain_without_runtime_state",
+                return_value={"guidance": {}, "cache": {}},
+            ),
+            mock.patch.object(
+                benchmark,
+                "finish_explain_without_runtime_state",
+                return_value={"valid": True},
+            ),
+        ):
+            rows, plans = benchmark.run_measurements(
+                {benchmark.SQL_FIRST_MODE: main},
+                {benchmark.SQL_FIRST_MODE: benchmark.SQL_FIRST_CONFIG},
+                [benchmark.WORKLOADS[0]],
+                [spec],
+                {0: 1},
+                {("acl_only", "f", 0): (1,)},
+                {"acl_only": 1000},
+                "t",
+                "public.vector_hnsw_idx",
+                "public.vector_hnsw_clone_idx",
+                "principal",
+                1,
+                1,
+                "measurement",
+                0.9,
+                7,
+                selected_modes=(benchmark.SQL_FIRST_MODE,),
+                registered_scalar_indexes=("public.price_idx",),
+                sql_first_workers=2,
+                sql_first_connections=[worker],
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["mode"], benchmark.SQL_FIRST_MODE)
+        self.assertFalse(rows[0]["error"])
+        worker_sql = [sql for cursor in worker.cursors for sql, _ in cursor.calls]
+        shared_sql = [sql for sql, _ in main.cursors[0].calls]
+        self.assertTrue(
+            any("FROM" in sql and "rating = 5" in sql for sql in worker_sql),
+            worker_sql,
+        )
+        self.assertFalse(
+            any("FROM" in sql and "rating = 5" in sql for sql in shared_sql),
+            shared_sql,
+        )
+        self.assertEqual(len(plans), 1)
 
     def test_dry_run_does_not_read_missing_inputs_or_connect(self):
         output = io.StringIO()
@@ -2048,6 +2545,38 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
         self.assertTrue(proof["d3_probe_exception"])
         self.assertFalse(proof["reported_active"])
         self.assertEqual(proof["exception_reason"], "workload_driven_probe_stock_route")
+
+    def test_d3_probe_counts_r43_post_scan_adaptive_probes(self):
+        activation = {
+            "before": {"binding_attempts": 0, "binding_matches": 0, "adaptive_probes": 0},
+            "after_activation": {"active": False, "adaptive_state": "probing"},
+            "guidance_enabled": False,
+            "guidance_route": "d3_probing",
+        }
+        execution = {
+            "active": False,
+            "effective_active": False,
+            "statement_bound": False,
+            "binding_attempts": 1,
+            "binding_matches": 0,
+            "binding_scan_checks": 0,
+            "binding_scan_matches": 0,
+            "binding_scan_bypasses": 0,
+            "adaptive_state": "probing",
+            "adaptive_probes": 0,
+        }
+        post = {**execution, "adaptive_probes": 1, "binding_attempts": 1}
+        scan = {"valid": True, "guidance_checks": 0, "final_path": "stock"}
+        self.assertFalse(
+            benchmark.guidance_execution_proof(
+                "d1_d2_d3", activation, execution, scan
+            )["valid"]
+        )
+        proof = benchmark.guidance_execution_proof(
+            "d1_d2_d3", activation, execution, scan, post
+        )
+        self.assertTrue(proof["valid"])
+        self.assertTrue(proof["d3_probe_exception"])
 
     def test_invalid_artifact_does_not_publish_csv_or_summary_and_keeps_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:

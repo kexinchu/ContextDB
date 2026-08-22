@@ -64,9 +64,26 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
         self.assertNotIn("valid_from <= %(as_of)s", sql_by_workload["acl_only"])
         self.assertIn("grant_row.valid_from <= %(as_of)s", sql_by_workload["grant_temporal_selectivity"])
         self.assertIn("fact.valid_from <= %(as_of)s", sql_by_workload["fact_temporal_selectivity"])
-        for sql_text in sql_by_workload.values():
-            truth.validate_candidate_sql(sql_text)
-            self.assertNotIn("hnsw", sql_text.lower())
+        for name in truth.MAIN_WORKLOAD_NAMES:
+            self.assertIn("JOIN public.amazon_review_facts", sql_by_workload[name])
+        self.assertNotIn("JOIN public.amazon_product_dim", sql_by_workload["join_facts"])
+        self.assertNotIn("CURRENT_USER", sql_by_workload["join_facts"])
+        self.assertIn("JOIN public.amazon_product_dim", sql_by_workload["join_catalog"])
+        self.assertNotIn("CURRENT_USER", sql_by_workload["join_catalog"])
+        self.assertIn("JOIN public.amazon_principal_tenant_grants", sql_by_workload["join_acl"])
+        self.assertIn("CURRENT_USER", sql_by_workload["join_acl"])
+        self.assertIn(
+            "EXISTS (SELECT 1 FROM public.amazon_review_facts AS sibling_fact",
+            sql_by_workload["boolean_complex_narrow_exists"],
+        )
+        self.assertIn("NOT EXISTS", sql_by_workload["boolean_complex_narrow_not_exists"])
+        self.assertNotIn(
+            "EXISTS (SELECT 1 FROM public.amazon_review_facts AS sibling_fact",
+            sql_by_workload["grant_temporal_selectivity"],
+        )
+        for workload in truth.WORKLOADS:
+            truth.validate_candidate_sql(sql_by_workload[workload.name], workload)
+            self.assertNotIn("hnsw", sql_by_workload[workload.name].lower())
         spot_sql = truth.build_spot_check_sql(
             "public.vectors", "rating = 5", truth.WORKLOADS[0], "embedding_valid"
         )
@@ -291,15 +308,26 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
         self.assertEqual(args.final_queries, 10_100)
         self.assertEqual(args.query_ids_csv, truth.DEFAULT_Q10200_QUERY_IDS)
         self.assertEqual(
-            tuple(workload.name for workload in workloads),
-            truth.MAIN_WORKLOAD_NAMES,
+            args.artifact_dir.name,
+            "amazon10m_sql_native_q10200_r43_sqlops_join",
         )
         self.assertEqual(
-            tuple(spec.name for spec in filters), truth.MAIN_FILTER_NAMES
+            tuple(workload.name for workload in workloads),
+            (
+                "join_facts",
+                "join_catalog",
+                "join_acl",
+            ),
         )
+        self.assertEqual(
+            tuple(spec.name for spec in filters),
+            ("grocery_helpful", "helpful_ge20", "grocery_long500"),
+        )
+        self.assertNotIn("popular_ge1000", args.filter_names)
+        self.assertNotIn("acl_only", args.workload_names)
         self.assertEqual(
             len(workloads) * len(filters) * 10_200,
-            122_400,
+            91_800,
         )
 
     def test_q10200_workload_subset_remains_appendix_compatible(self) -> None:
@@ -335,7 +363,7 @@ class Amazon10MSqlNativeExactTruthTests(unittest.TestCase):
             [workload.name for workload in truth.WORKLOADS[:3]],
             ["acl_only", "grant_temporal_selectivity", "fact_temporal_selectivity"],
         )
-        boolean = truth.WORKLOADS[3:]
+        boolean = [workload for workload in truth.WORKLOADS if workload.width != "base"]
         self.assertEqual(len(boolean), 6)
         self.assertEqual(
             [workload.width for workload in boolean],

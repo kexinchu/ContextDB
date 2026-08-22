@@ -14,9 +14,12 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from queue import Queue
 from typing import Any, Iterable, Mapping, Sequence
 
 try:
@@ -66,9 +69,31 @@ P0_CALIBRATION_REPEATS = 2
 P0_MEASUREMENT_QUERY_OFFSET = 200
 P0_MEASUREMENT_QUERIES = 10_000
 P0_MEASUREMENT_REPEATS = 3
+P0_CONFIRMATION_QUERIES = 2_000
+P0_CONFIRMATION_REPEATS = 1
+P0_CONFIRMATION_SQL_FIRST_WORKERS = 8
+P0_SCREENING_QUERIES = 1_000
+P0_SCREENING_REPEATS = 1
 P0_TARGET_RECALLS = (0.90,)
-P0_WORKLOAD_NAMES = exact_truth_contract.MAIN_WORKLOAD_NAMES
-P0_FILTER_NAMES = exact_truth_contract.MAIN_FILTER_NAMES
+# Figure 5 is SQL-native hybrid search: one vector ORDER BY plus an explicit
+# relational JOIN. The three families increase join depth: review facts,
+# product catalog, then principal ACL. Filters vary JOIN-side selectivity.
+P0_WORKLOAD_NAMES = (
+    "join_facts",
+    "join_catalog",
+    "join_acl",
+)
+P0_FILTER_NAMES = (
+    "grocery_helpful",
+    "helpful_ge20",
+    "grocery_long500",
+)
+P0_MIN_EF_SEARCH = 100
+# Only heap predicates that appear in the executed SQL may be bound. The
+# product-dimension EXISTS is correlated on amazon_product_dim, so
+# item_rating_number is not implied on the review heap and must not be
+# activated as a VisGuide atom (planner proof: predicate_not_implied).
+WORKLOAD_GUIDANCE_ATOMS: dict[str, tuple[str, ...]] = {}
 DEFAULT_BOOTSTRAP_SAMPLES = 10_000
 DEFAULT_EF_SEARCH_VALUES = (
     20,
@@ -194,6 +219,18 @@ class WorkloadSpec:
     width: str = "base"
     boolean_predicate: str = ""
     temporal_kind: str = "none"
+    join_kind: str = "acl"
+
+
+def binding_atoms_for(workload: WorkloadSpec, spec: FilterSpec) -> tuple[str, ...]:
+    """Filter atoms plus any heap-local atoms implied by the SQL operator."""
+    ordered = list(spec.atoms)
+    seen = set(spec.atoms)
+    for atom in WORKLOAD_GUIDANCE_ATOMS.get(workload.name, ()):
+        if atom not in seen:
+            ordered.append(atom)
+            seen.add(atom)
+    return tuple(ordered)
 
 
 @dataclass(frozen=True)
@@ -316,6 +353,7 @@ WORKLOADS = tuple(
         workload.width,
         workload.boolean_predicate,
         workload.temporal_kind,
+        workload.join_kind,
     )
     for workload in exact_truth_contract.WORKLOADS
 )
@@ -324,18 +362,17 @@ WORKLOADS = tuple(
 def select_workloads(
     names: Sequence[str], protocol: str = exact_truth_contract.PROTOCOL_Q200
 ) -> list[WorkloadSpec]:
-    selected = set(names)
-    if not selected:
-        selected = (
-            set(P0_WORKLOAD_NAMES)
-            if protocol == P0_PROTOCOL
-            else {workload.name for workload in WORKLOADS}
-        )
-    result = [workload for workload in WORKLOADS if workload.name in selected]
-    observed = {workload.name for workload in result}
-    if observed != selected:
-        raise ValueError(f"unknown workloads: {sorted(selected - observed)}")
-    return result
+    by_name = {workload.name: workload for workload in WORKLOADS}
+    if names:
+        order = list(names)
+    elif protocol == P0_PROTOCOL:
+        order = list(P0_WORKLOAD_NAMES)
+    else:
+        order = [workload.name for workload in WORKLOADS]
+    missing = {name for name in order if name not in by_name}
+    if missing:
+        raise ValueError(f"unknown workloads: {sorted(missing)}")
+    return [by_name[name] for name in order]
 
 
 def positive_int(value: str) -> int:
@@ -713,13 +750,41 @@ def build_hybrid_sql(
     candidate_validity = exact_truth_contract.qualify_candidate_validity_predicate(
         candidate_validity_predicate
     )
+    query_id_predicate = (
+        "v.id <> query_vector.query_id"
+        if exact
+        else "v.id <> %(query_id)s"
+    )
+    query_distance = (
+        "v.embedding <-> query_vector.embedding"
+        if exact
+        else "v.embedding <-> %(query_embedding)s::vector"
+    )
+    grant_sql = (
+        exact_truth_contract.grant_visibility_sql(workload)
+        if isinstance(workload, WorkloadSpec)
+        else """
+  AND grant_row.principal_name = CURRENT_USER::text
+  AND grant_row.can_read"""
+    )
+    joins = (
+        exact_truth_contract.relation_join_sql(workload)
+        if isinstance(workload, WorkloadSpec)
+        else (
+            "JOIN public.amazon_review_facts AS fact\n"
+            "  ON fact.review_id = v.id\n"
+            "JOIN public.amazon_product_dim AS product\n"
+            "  ON product.parent_asin = fact.parent_asin\n"
+            "JOIN public.amazon_principal_tenant_grants AS grant_row\n"
+            "  ON grant_row.tenant_id = product.tenant_id"
+        )
+    )
     validity = f"""
   WHERE ({qualify_predicate(predicate)})
   AND ({candidate_validity})
-  AND v.id <> query_vector.query_id
+  AND {query_id_predicate}
 {binding_predicate}
-  AND grant_row.principal_name = CURRENT_USER::text
-  AND grant_row.can_read
+{grant_sql}
 {temporal_predicate}"""
     validity += boolean_sql
     if not exact:
@@ -729,24 +794,12 @@ def build_hybrid_sql(
             else ",\n       vector_hnsw_guidance_profile() AS execution_guidance_profile"
         )
         return f"""
-WITH query_vector AS (
-    SELECT id AS query_id, embedding
-    FROM {table} AS query_row
-    WHERE query_row.id = %(query_id)s
-      AND ({exact_truth_contract.qualify_candidate_validity_predicate(candidate_validity_predicate, 'query_row')})
-)
 SELECT v.id,
-       v.embedding <-> query_vector.embedding AS distance{profile_column}
+       {query_distance} AS distance{profile_column}
 FROM {table} AS v
-JOIN public.amazon_review_facts AS fact
-  ON fact.review_id = v.id
-JOIN public.amazon_product_dim AS product
-  ON product.parent_asin = fact.parent_asin
-JOIN public.amazon_principal_tenant_grants AS grant_row
-  ON grant_row.tenant_id = product.tenant_id
-CROSS JOIN query_vector
+{joins}
 {validity}
-ORDER BY v.embedding <-> query_vector.embedding
+ORDER BY {query_distance}
 LIMIT %(k)s
 """.strip()
     return f"""
@@ -758,12 +811,7 @@ WITH query_vector AS (
 ), valid AS MATERIALIZED (
     SELECT v.id, v.embedding
     FROM {table} AS v
-    JOIN public.amazon_review_facts AS fact
-      ON fact.review_id = v.id
-    JOIN public.amazon_product_dim AS product
-      ON product.parent_asin = fact.parent_asin
-    JOIN public.amazon_principal_tenant_grants AS grant_row
-      ON grant_row.tenant_id = product.tenant_id
+    {joins}
     CROSS JOIN query_vector
     {validity}
 )
@@ -774,6 +822,52 @@ CROSS JOIN query_vector
 ORDER BY distance, valid.id
 LIMIT %(k)s
 """.strip()
+
+
+def load_query_embeddings(
+    cur: Any,
+    table: str,
+    query_ids: Sequence[int],
+    candidate_validity_predicate: str = DEFAULT_CANDIDATE_VALIDITY_PREDICATE,
+) -> dict[int, str]:
+    """Load query vectors as postgres so approximate SQL can bind PARAM_EXTERN.
+
+    r43 refuses planner-proof attachment on PARAM_EXEC (InitPlan). A bound
+    ``vector`` parameter is folded to Const for safe_guided validation.
+    """
+    wanted = [int(query_id) for query_id in dict.fromkeys(query_ids)]
+    if not wanted:
+        return {}
+    table = ".".join(parse_qualified_name(table))
+    validity = exact_truth_contract.qualify_candidate_validity_predicate(
+        candidate_validity_predicate, "query_row"
+    )
+    cur.execute(
+        f"SELECT query_row.id, query_row.embedding::text "
+        f"FROM {table} AS query_row "
+        f"WHERE query_row.id = ANY(%s) AND ({validity})",
+        (wanted,),
+    )
+    loaded = {int(row[0]): str(row[1]) for row in cur.fetchall() if row and row[1]}
+    missing = [query_id for query_id in wanted if query_id not in loaded]
+    if missing:
+        raise RuntimeError(
+            f"missing query embeddings for ids={missing[:8]} count={len(missing)}"
+        )
+    return loaded
+
+
+def bind_query_embedding(
+    params: dict[str, Any],
+    query_id: int,
+    query_embeddings: Mapping[int, str],
+) -> dict[str, Any]:
+    embedding = query_embeddings.get(int(query_id))
+    if not embedding:
+        raise RuntimeError(f"missing query embedding for query_id={query_id}")
+    bound = dict(params)
+    bound["query_embedding"] = embedding
+    return bound
 
 
 def validate_exact_sql_text(sql_text: str) -> None:
@@ -822,6 +916,38 @@ def interleaved_schedule(
         rng.shuffle(order)
         schedule.extend((key, mode) for mode in order)
     return schedule
+
+
+def partition_measurement_schedule(
+    schedule: Sequence[tuple[tuple[Any, ...], str]],
+    parallel_mode: str,
+) -> tuple[
+    list[tuple[int, tuple[Any, ...], str]],
+    list[tuple[int, tuple[Any, ...], str]],
+]:
+    sequential: list[tuple[int, tuple[Any, ...], str]] = []
+    parallel: list[tuple[int, tuple[Any, ...], str]] = []
+    for position, (key, mode) in enumerate(schedule):
+        item = (position, key, mode)
+        if mode == parallel_mode:
+            parallel.append(item)
+        else:
+            sequential.append(item)
+    return sequential, parallel
+
+
+def prepare_sql_first_session(
+    cur: Any,
+    principal: str,
+    vector_table: str,
+    source_index: str,
+    clone_index: str,
+) -> None:
+    cur.execute("SET hnsw.guidance_require_epoch = on")
+    ensure_sqlens_fragment_catalog(cur, principal, vector_table)
+    cur.execute(f'SET ROLE "{principal}"')
+    set_preferred_index(cur, mode_index(SQL_FIRST_MODE, source_index, clone_index))
+    set_mode(cur, SQL_FIRST_MODE, SQL_FIRST_CONFIG, source_index)
 
 
 def build_balanced_mixed_trace(
@@ -1629,15 +1755,18 @@ def paired_summary(
     bootstrap_samples: int,
     seed: int,
     method_mode: str = "d1",
+    require_adaptive_evidence: bool = True,
 ) -> dict[str, Any]:
     validate_paired_query_contract(stock_rows, method_rows)
     stock = summarize_rows(
         stock_rows, expected_keys=expected_keys, target_recall=target_recall,
         bootstrap_samples=bootstrap_samples, seed=seed,
+        require_adaptive_evidence=require_adaptive_evidence,
     )
     method = summarize_rows(
         method_rows, expected_keys=expected_keys, target_recall=target_recall,
         bootstrap_samples=bootstrap_samples, seed=seed + 10,
+        require_adaptive_evidence=require_adaptive_evidence,
     )
     stock_by_query: dict[int, list[float]] = {}
     method_by_query: dict[int, list[float]] = {}
@@ -1690,6 +1819,158 @@ def paired_summary(
     }
 
 
+def configure_hnsw_driven_planner(cur: Any) -> None:
+    """Force HNSW as the driving access path on join/RLS SQL.
+
+    ``hnsw.preferred_index`` only prices competing HNSW indexes to infinity.
+    With ACL/grant joins, PostgreSQL otherwise starts from the grant/product
+    side and uses the reviews primary key, which fails the approximate EXPLAIN
+    gate. Pin the written FROM order (vector heap first) and disable seq/bitmap
+    scans so ``ORDER BY embedding <-> query`` selects the preferred HNSW index.
+    EXISTS/NOT EXISTS still keep heap btree and primary-key scans attractive;
+    those indexes are hidden for the approximate arm by
+    ``set_heap_competing_indexes_valid``.
+    """
+    cur.execute("SET enable_seqscan = off")
+    cur.execute("SET enable_bitmapscan = off")
+    cur.execute("SET enable_indexscan = on")
+    cur.execute("SET join_collapse_limit = 1")
+    cur.execute("SET from_collapse_limit = 1")
+
+
+def set_heap_competing_indexes_valid(
+    cur: Any, vector_table: str, *, valid: bool
+) -> list[str]:
+    """Hide or restore every non-HNSW heap index, including the primary key.
+
+    EXISTS SQL otherwise starts from ``helpful_vote`` or the heap PK after the
+    cheaper btree is hidden. Catalog-global, so SQL-first must run after the
+    approximate arm and this must be restored in ``finally``. Join indexes on
+    facts/products/grants stay valid. HNSW indexes stay valid.
+    """
+    heap_name = parse_qualified_name(vector_table)[-1]
+    restored_role = _restore_session_user(cur)
+    try:
+        cur.execute(
+            """
+            UPDATE pg_index AS idx
+            SET indisvalid = %s
+            FROM pg_class AS index_rel,
+                 pg_class AS heap_rel,
+                 pg_namespace AS ns,
+                 pg_am AS am
+            WHERE idx.indexrelid = index_rel.oid
+              AND idx.indrelid = heap_rel.oid
+              AND heap_rel.relnamespace = ns.oid
+              AND index_rel.relam = am.oid
+              AND ns.nspname = 'public'
+              AND heap_rel.relname = %s
+              AND am.amname <> 'hnsw'
+            RETURNING index_rel.relname
+            """,
+            (valid, heap_name),
+        )
+        names = [str(row[0]) for row in (cur.fetchall() or [])]
+    finally:
+        if restored_role is not None:
+            cur.execute(f'SET ROLE "{restored_role}"')
+    return names
+
+
+def _restore_session_user(cur: Any) -> str | None:
+    """RESET ROLE when needed and return the role that must be restored."""
+    cur.execute("SELECT current_user, session_user")
+    row = cur.fetchone()
+    current_user = str(row[0]) if row else ""
+    session_user = str(row[1]) if row and len(row) > 1 else ""
+    if current_user and session_user and current_user != session_user:
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", current_user):
+            raise RuntimeError(f"refusing to restore unsafe role {current_user!r}")
+        cur.execute("RESET ROLE")
+        return current_user
+    return None
+
+
+def ensure_sqlens_fragment_catalog(
+    cur: Any,
+    principal: str,
+    vector_table: str,
+    *,
+    enable_tracking: bool = False,
+) -> dict[str, Any]:
+    """Create the r43 FragReuse catalog as postgres and grant the SQL-native role.
+
+    Frozen r43 ``vector.so`` issues ``CREATE TABLE IF NOT EXISTS`` /
+    ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` from the current user on the
+    first FragReuse use, and again after an abort resets the backend-local
+    ready flag. The SQL-native principal is a non-owner without BYPASSRLS, so
+    those SPI statements fail unless the catalog exists and the role can DML
+    it. This does not grant BYPASSRLS or ownership of the reviews heap.
+    """
+    if not re.fullmatch(r"[a-z_][a-z0-9_]*", principal):
+        raise RuntimeError(f"refusing unsafe principal {principal!r}")
+    restored_role = _restore_session_user(cur)
+    try:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS public.pgvector_hnsw_fragment_store ("
+            "heap_oid oid NOT NULL,"
+            "filter_name text NOT NULL,"
+            "kind text NOT NULL,"
+            "rows bigint NOT NULL,"
+            "pages bigint NOT NULL,"
+            "bloom_bit_count bigint NOT NULL,"
+            "payload bytea NOT NULL,"
+            "format_version integer NOT NULL DEFAULT 3,"
+            "built_at timestamptz NOT NULL DEFAULT pg_catalog.now(),"
+            "build_epoch bigint NOT NULL DEFAULT 0,"
+            "relfilenode oid NOT NULL DEFAULT 0,"
+            "PRIMARY KEY (heap_oid, filter_name, kind))"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS public.pgvector_hnsw_fragment_epoch ("
+            "heap_oid oid PRIMARY KEY,"
+            "epoch bigint NOT NULL DEFAULT 0,"
+            "updated_at timestamptz NOT NULL DEFAULT pg_catalog.now())"
+        )
+        cur.execute(
+            "ALTER TABLE public.pgvector_hnsw_fragment_store "
+            "ADD COLUMN IF NOT EXISTS build_epoch bigint NOT NULL DEFAULT 0, "
+            "ADD COLUMN IF NOT EXISTS relfilenode oid NOT NULL DEFAULT 0, "
+            "ADD COLUMN IF NOT EXISTS format_version integer NOT NULL DEFAULT 1"
+        )
+        cur.execute(
+            f'GRANT SELECT, INSERT, UPDATE, DELETE '
+            f'ON public.pgvector_hnsw_fragment_store TO "{principal}"'
+        )
+        cur.execute(
+            f'GRANT SELECT, INSERT, UPDATE, DELETE '
+            f'ON public.pgvector_hnsw_fragment_epoch TO "{principal}"'
+        )
+        # r43 SPI always issues CREATE TABLE IF NOT EXISTS as the current user.
+        cur.execute(f'GRANT CREATE ON SCHEMA public TO "{principal}"')
+        cur.execute(
+            f'ALTER TABLE public.pgvector_hnsw_fragment_store OWNER TO "{principal}"'
+        )
+        cur.execute(
+            f'ALTER TABLE public.pgvector_hnsw_fragment_epoch OWNER TO "{principal}"'
+        )
+        if enable_tracking:
+            # SHARE ROW EXCLUSIVE on the reviews heap. Must run before the
+            # formal data guard holds its long-lived transaction lock.
+            cur.execute(
+                "SELECT vector_hnsw_fragment_tracking_enable(%s::regclass)",
+                (vector_table,),
+            )
+    finally:
+        if restored_role is not None:
+            cur.execute(f'SET ROLE "{restored_role}"')
+    return {
+        "valid": True,
+        "principal": principal,
+        "vector_table": vector_table,
+    }
+
+
 def set_preferred_index(cur: Any, vector_index: str) -> str:
     """Bind hnsw.preferred_index from a privileged session, then restore ROLE.
 
@@ -1698,19 +1979,8 @@ def set_preferred_index(cur: Any, vector_index: str) -> str:
     (postgres) before or after SET ROLE. Session-level set_config survives
     the subsequent SET ROLE used for query execution.
     """
-    cur.execute("SELECT current_user, session_user")
-    row = cur.fetchone()
-    current_user = str(row[0]) if row else ""
-    session_user = str(row[1]) if row and len(row) > 1 else ""
-    restored_role: str | None = None
+    restored_role = _restore_session_user(cur)
     try:
-        if current_user and session_user and current_user != session_user:
-            if not re.fullmatch(r"[a-z_][a-z0-9_]*", current_user):
-                raise RuntimeError(
-                    f"refusing to restore unsafe role {current_user!r}"
-                )
-            restored_role = current_user
-            cur.execute("RESET ROLE")
         cur.execute(
             "SELECT set_config('hnsw.preferred_index', %s, false)",
             (vector_index,),
@@ -1742,6 +2012,8 @@ def set_mode(
         cur.execute("SET enable_seqscan = off")
         cur.execute("SET enable_indexscan = on")
         cur.execute("SET enable_bitmapscan = on")
+        cur.execute("SET join_collapse_limit = 8")
+        cur.execute("SET from_collapse_limit = 8")
         cur.execute("SET hnsw.page_access = off")
         cur.execute("SET hnsw.index_page_access = off")
         preferred = set_preferred_index(cur, vector_index)
@@ -1750,6 +2022,7 @@ def set_mode(
             "preferred_index": preferred,
         }
     set_search_config(cur, config)
+    configure_hnsw_driven_planner(cur)
     # D2 is the physical BFS clone only. Keep heap/index prefetch out of this
     # factorial comparison and prove the settings again immediately per query.
     cur.execute("SET hnsw.page_access = off")
@@ -1937,6 +2210,7 @@ def guidance_execution_proof(
     activation: dict[str, Any],
     execution_profile: dict[str, Any],
     scan_profile: dict[str, Any],
+    post_guidance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if mode not in MODE_SPECS:
         raise ValueError(f"unknown benchmark mode: {mode}")
@@ -2026,6 +2300,13 @@ def guidance_execution_proof(
             "exception_reason": "",
         }
 
+    # r43 increments adaptive_probes on the session profile after the scan,
+    # not on the bind-time execution snapshot attached to the result row.
+    probe_profile = (
+        post_guidance
+        if isinstance(post_guidance, dict) and post_guidance
+        else execution_profile
+    )
     d3_probe = (
         mode == "d1_d2_d3"
         and execution_profile_complete
@@ -2035,7 +2316,7 @@ def guidance_execution_proof(
         and attempts_delta > 0
         and matches_delta == 0
         and str(execution_profile.get("adaptive_state", "")) == "probing"
-        and _profile_counter(execution_profile, "adaptive_probes")
+        and _profile_counter(probe_profile, "adaptive_probes")
         > _profile_counter(before, "adaptive_probes")
         and scan_valid
         and guidance_checks == 0
@@ -2084,8 +2365,13 @@ def recorded_guidance_proof_is_valid(row: dict[str, Any]) -> bool:
     if not all(isinstance(value, dict) for value in (activation, execution, scan, stored)):
         return False
     try:
+        post_guidance = row.get("post_query_guidance_profile")
         recomputed = guidance_execution_proof(
-            str(row.get("mode")), activation, execution, scan
+            str(row.get("mode")),
+            activation,
+            execution,
+            scan,
+            post_guidance if isinstance(post_guidance, dict) else None,
         )
     except (RuntimeError, TypeError, ValueError):
         return False
@@ -2937,13 +3223,9 @@ def _artifact_pair_map(
             raise _artifact_error(f"candidate SQL scalar/validity contract is stale: {key}")
         validate_exact_sql_text(candidate_sql)
         normalized_candidate = " ".join(candidate_sql.lower().split())
-        required_candidate_tokens = (
-            "join public.amazon_review_facts",
-            "join public.amazon_product_dim",
-            "join public.amazon_principal_tenant_grants",
-            "current_user",
-            "order by v.id",
-        )
+        required_candidate_tokens = exact_truth_contract.required_join_tokens(
+            exact_workload
+        ) + ("order by v.id",)
         if " limit " in f" {normalized_candidate} " or any(token not in normalized_candidate for token in required_candidate_tokens):
             raise _artifact_error(f"candidate SQL is not the required unbounded relational export: {key}")
         _artifact_plan_is_non_hnsw(pair.get("candidate_explain_gate"), f"candidate {key}")
@@ -3559,6 +3841,8 @@ def build_run_spec(
             "query_ids": [[query_no, query_id] for query_no, query_id in final.items()],
             "repeats": args.final_repeats,
         },
+        "confirmation": bool(getattr(args, "confirmation", False)),
+        "sql_first_workers": int(getattr(args, "sql_first_workers", 1)),
         "config_grids": {
             mode: [asdict(config) for config in build_config_grid(args, mode)]
             for mode in tunable_modes
@@ -3583,12 +3867,55 @@ def build_run_spec(
     return result
 
 
+def _json_ready(value: Any) -> Any:
+    """Normalize tuples so JSON-reloaded checkpoints compare equal to live specs."""
+    if isinstance(value, tuple):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    return value
+
+
+def _run_spec_without_runner(run_spec: dict[str, Any]) -> dict[str, Any]:
+    filtered = dict(run_spec)
+    filtered.pop("runner_sha256", None)
+    return _json_ready(filtered)
+
+
 def validate_checkpoint_run_spec(checkpoint: dict[str, Any], run_spec: dict[str, Any]) -> None:
     if int(checkpoint.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
         raise RuntimeError("checkpoint version mismatch")
-    expected_hash = canonical_sha256(run_spec)
-    if checkpoint.get("run_spec_sha256") != expected_hash or checkpoint.get("run_spec") != run_spec:
+    stored = checkpoint.get("run_spec")
+    if not isinstance(stored, dict):
         raise RuntimeError("checkpoint run-spec mismatch; refusing stale resume")
+    if checkpoint.get("run_spec_sha256") != canonical_sha256(stored):
+        raise RuntimeError("checkpoint run-spec hash is corrupt")
+    # Runner bugfixes must not discard valid measurement shards. Every other
+    # contract field (SQL, GT, indexes, binary, queries) still has to match.
+    stored_contract = _run_spec_without_runner(stored)
+    live_contract = _run_spec_without_runner(run_spec)
+    if stored_contract != live_contract:
+        diffs: list[str] = []
+        for key in sorted(set(stored_contract) | set(live_contract)):
+            if stored_contract.get(key) == live_contract.get(key):
+                continue
+            left = stored_contract.get(key)
+            right = live_contract.get(key)
+            if isinstance(left, dict) and isinstance(right, dict):
+                nested = [
+                    nested_key
+                    for nested_key in sorted(set(left) | set(right))
+                    if left.get(nested_key) != right.get(nested_key)
+                ]
+                diffs.append(f"{key}:{nested[:12]}")
+            else:
+                diffs.append(key)
+        raise RuntimeError(
+            "checkpoint run-spec mismatch; refusing stale resume; "
+            f"fields={diffs[:20]}"
+        )
 
 
 def checkpoint_entry_path(path: Path, section: str, key: str) -> Path:
@@ -4058,6 +4385,11 @@ def run_measurements(
     request_keys: Sequence[tuple[str, str, int, int]] | None = None,
     registered_scalar_indexes: Sequence[str] = (),
     configs_by_cell: Mapping[tuple[str, str, str], Config] | None = None,
+    query_embeddings: Mapping[int, str] | None = None,
+    sql_first_workers: int = 1,
+    sql_first_connections: Sequence[Any] | None = None,
+    progress_every: int = 0,
+    sql_first_after_sequential: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     active_modes = tuple(selected_modes or MODES)
     if not active_modes or any(mode not in ALL_MODES for mode in active_modes):
@@ -4086,6 +4418,8 @@ def run_measurements(
         raise ValueError("request_keys contains duplicate or out-of-slice requests")
     if SQL_FIRST_MODE in active_modes and not registered_scalar_indexes:
         raise ValueError("SQL-first measurement requires registered scalar indexes")
+    if SQL_FIRST_MODE in active_modes:
+        sql_first_after_sequential = True
     rows: list[dict[str, Any]] = []
     plans: list[dict[str, Any]] = []
     cursors = {mode: connections[mode].cursor() for mode in active_modes}
@@ -4105,14 +4439,33 @@ def run_measurements(
             return selected
         return configs[mode]
 
+    approx_modes = [mode for mode in active_modes if mode != SQL_FIRST_MODE]
+    control_cur = cursors[approx_modes[0]] if approx_modes else next(iter(cursors.values()))
+
+    def hide_heap_competing_indexes() -> None:
+        if approx_modes:
+            set_heap_competing_indexes_valid(control_cur, table, valid=False)
+
+    def restore_heap_competing_indexes() -> None:
+        if approx_modes:
+            set_heap_competing_indexes_valid(control_cur, table, valid=True)
+
     try:
+        hide_heap_competing_indexes()
         for mode in active_modes:
             set_mode(
                 cursors[mode], mode, configs[mode], selected_indexes[mode], d3_settings
             )
             active_config_labels[mode] = configs[mode].label
         schedule = interleaved_schedule(keys, active_modes, schedule_seed)
-        for position, (key, mode) in enumerate(schedule):
+
+        def run_one(
+            position: int,
+            key: tuple[Any, ...],
+            mode: str,
+            cur: Any,
+            labels: dict[str, str],
+        ) -> dict[str, Any]:
             workload_name, filter_name, query_no, repeat = key
             workload = next(item for item in workloads if item.name == workload_name)
             spec = next(item for item in filters if item.name == filter_name)
@@ -4130,10 +4483,15 @@ def run_measurements(
                 "as_of": as_of_by_workload[workload.name],
                 "k": k,
                 "vector_index": selected_indexes[mode],
-                "binding_atoms": list(spec.atoms),
+                "binding_atoms": list(binding_atoms_for(workload, spec)),
                 "binding_kind": MODE_SPECS[mode].guidance_kind or "bloom",
             }
-            cur = cursors[mode]
+            if mode != SQL_FIRST_MODE:
+                params = bind_query_embedding(
+                    params, query_id, query_embeddings or {}
+                )
+            if cur is None:
+                raise RuntimeError(f"measurement cursor is missing for {mode}")
             error = ""
             ids: list[int] = []
             result_pairs: list[tuple[int, float]] = []
@@ -4148,16 +4506,17 @@ def run_measurements(
             try:
                 if (
                     mode != SQL_FIRST_MODE
-                    and active_config_labels.get(mode) != request_config.label
+                    and labels.get(mode) != request_config.label
                 ):
                     set_search_config(cur, request_config)
-                    active_config_labels[mode] = request_config.label
+                    labels[mode] = request_config.label
                 if mode != SQL_FIRST_MODE:
                     cur.execute("SELECT vector_hnsw_reset_scan_profile()")
                 e2e_started = time.perf_counter()
                 set_as_of(cur, as_of_by_workload[workload.name])
                 activation = configure_guidance(
-                    cur, mode, selected_indexes[mode], spec.atoms
+                    cur, mode, selected_indexes[mode],
+                    binding_atoms_for(workload, spec),
                 )
                 activation_ms = float(activation["activation_ms"])
                 query_started = time.perf_counter()
@@ -4190,6 +4549,8 @@ def run_measurements(
                 error = f"{exc.__class__.__name__}: {exc}"
                 try:
                     cur.execute("ROLLBACK")
+                    # Abort resets r43's backend-local fragment-store ready flag.
+                    ensure_sqlens_fragment_catalog(cur, principal, table)
                     set_mode(
                         cur,
                         mode,
@@ -4228,7 +4589,7 @@ def run_measurements(
             )
             final_path = str(scan_profile.get("final_path", ""))
             execution_proof = guidance_execution_proof(
-                mode, activation, execution_guidance, scan_profile
+                mode, activation, execution_guidance, scan_profile, post_guidance
             )
             if not error and not execution_proof["valid"]:
                 error = (
@@ -4243,8 +4604,7 @@ def run_measurements(
                     or final_path in {"guided", "legacy_guided", "unknown", ""}
                 )
             )
-            rows.append(
-                {
+            return {
                     "phase": phase,
                     "target_recall": target_recall if target_recall is not None else "",
                     "workload": workload.name,
@@ -4338,7 +4698,114 @@ def run_measurements(
                     "scan_profile": scan_profile,
                     "error": error,
                 }
-            )
+
+        sequential_items, parallel_items = partition_measurement_schedule(
+            schedule, SQL_FIRST_MODE
+        )
+        worker_conns = list(sql_first_connections or ())
+        use_pool = (
+            SQL_FIRST_MODE in active_modes
+            and int(sql_first_workers) > 1
+            and bool(parallel_items)
+            and len(worker_conns) >= 1
+        )
+        collected: list[dict[str, Any] | None] = [None] * len(schedule)
+        progress_lock = threading.Lock()
+        progress_done = {"sequential": 0, "sql_first": 0}
+
+        def emit_progress(group: str, total: int) -> None:
+            if progress_every <= 0:
+                return
+            with progress_lock:
+                progress_done[group] += 1
+                done = progress_done[group]
+            if done == total or done % progress_every == 0:
+                print(
+                    json.dumps(
+                        {
+                            "progress": "measurement_tick",
+                            "group": group,
+                            "completed": done,
+                            "total": total,
+                        }
+                    ),
+                    flush=True,
+                )
+
+        def run_sequential() -> None:
+            labels = dict(active_config_labels)
+            for position, key, mode in sequential_items:
+                collected[position] = run_one(
+                    position, key, mode, cursors[mode], labels
+                )
+                emit_progress("sequential", len(sequential_items))
+
+        if use_pool:
+            pool: Queue[Any] = Queue()
+            for conn in worker_conns:
+                pool.put(conn)
+
+            def run_sql_first_item(
+                item: tuple[int, tuple[Any, ...], str]
+            ) -> tuple[int, dict[str, Any]]:
+                position, key, mode = item
+                conn = pool.get()
+                try:
+                    cur = conn.cursor()
+                    try:
+                        row = run_one(position, key, mode, cur, {})
+                    finally:
+                        cur.close()
+                    return position, row
+                finally:
+                    pool.put(conn)
+
+            worker_count = min(int(sql_first_workers), len(worker_conns), len(parallel_items))
+            with ThreadPoolExecutor(max_workers=max(worker_count, 1) + 1) as pool_exec:
+                if sql_first_after_sequential:
+                    run_sequential()
+                    restore_heap_competing_indexes()
+                    parallel_futures = [
+                        pool_exec.submit(run_sql_first_item, item)
+                        for item in parallel_items
+                    ]
+                    for future in as_completed(parallel_futures):
+                        position, row = future.result()
+                        collected[position] = row
+                        emit_progress("sql_first", len(parallel_items))
+                else:
+                    sequential_future = pool_exec.submit(run_sequential)
+                    parallel_futures = [
+                        pool_exec.submit(run_sql_first_item, item)
+                        for item in parallel_items
+                    ]
+                    pending = {sequential_future, *parallel_futures}
+                    for future in as_completed(pending):
+                        if future is sequential_future:
+                            future.result()
+                            continue
+                        position, row = future.result()
+                        collected[position] = row
+                        emit_progress("sql_first", len(parallel_items))
+        elif SQL_FIRST_MODE in active_modes and sql_first_after_sequential:
+            run_sequential()
+            restore_heap_competing_indexes()
+            labels = dict(active_config_labels)
+            for position, key, mode in parallel_items:
+                collected[position] = run_one(
+                    position, key, mode, cursors[mode], labels
+                )
+                emit_progress("sql_first", len(parallel_items))
+        else:
+            labels = dict(active_config_labels)
+            for position, (key, mode) in enumerate(schedule):
+                collected[position] = run_one(
+                    position, key, mode, cursors[mode], labels
+                )
+                emit_progress("sequential", len(schedule))
+        rows.extend(row for row in collected if row is not None)
+        if any(row is None for row in collected):
+            raise RuntimeError("measurement schedule produced an incomplete row set")
         for workload in workloads:
             for spec in filters:
                 params = {
@@ -4346,10 +4813,18 @@ def run_measurements(
                     "as_of": as_of_by_workload[workload.name],
                     "k": k,
                     "vector_index": "",
-                    "binding_atoms": list(spec.atoms),
+                    "binding_atoms": list(binding_atoms_for(workload, spec)),
                     "binding_kind": "bloom",
                 }
+                if any(mode != SQL_FIRST_MODE for mode in active_modes):
+                    params = bind_query_embedding(
+                        params, int(params["query_id"]), query_embeddings or {}
+                    )
                 for mode in active_modes:
+                    if mode == SQL_FIRST_MODE:
+                        restore_heap_competing_indexes()
+                    else:
+                        hide_heap_competing_indexes()
                     request_config = config_for(
                         workload.name, spec.name, mode
                     )
@@ -4424,6 +4899,7 @@ def run_measurements(
                         }
                     )
     finally:
+        restore_heap_competing_indexes()
         for cur in cursors.values():
             cur.close()
     return rows, plans
@@ -4490,14 +4966,23 @@ def validate_p0_mixed_block(
             str(row["mode"]),
         )
         config = configs_by_cell.get(key)
-        if (
-            config is None
-            or row.get("config") != config.label
-            or row.get("error")
-            or row.get("e2e_ms") in (None, NA)
-            or not recorded_guidance_proof_is_valid(row)
-        ):
-            raise RuntimeError(f"P0 mixed row is invalid: {key}")
+        if config is None:
+            raise RuntimeError(f"P0 mixed row is invalid: {key} missing per-cell config")
+        if row.get("config") != config.label:
+            raise RuntimeError(
+                f"P0 mixed row is invalid: {key} config "
+                f"{row.get('config')!r} != {config.label!r}"
+            )
+        if row.get("error"):
+            raise RuntimeError(
+                f"P0 mixed row is invalid: {key} error={row.get('error')!r}"
+            )
+        if row.get("e2e_ms") in (None, NA):
+            raise RuntimeError(f"P0 mixed row is invalid: {key} missing e2e_ms")
+        if not recorded_guidance_proof_is_valid(row):
+            raise RuntimeError(
+                f"P0 mixed row is invalid: {key} guidance execution proof failed"
+            )
     expected_plan_keys = {
         (
             str(request["workload"]),
@@ -4635,7 +5120,21 @@ def publish_benchmark_artifacts(
         if isinstance(requested, dict)
         else True
     )
-    manifest["paper_eligible"] = bool(valid and requested_complete)
+    if getattr(args, "screening", False):
+        manifest["paper_eligible"] = False
+        manifest["confirmation_only"] = True
+        manifest["screening_only"] = True
+        manifest["confirmation_reason"] = (
+            "q1k/r1 screening slice; not the paper q10k/r3 measurement"
+        )
+    elif getattr(args, "confirmation", False):
+        manifest["paper_eligible"] = False
+        manifest["confirmation_only"] = True
+        manifest["confirmation_reason"] = (
+            "q2k/r1 confirmation slice; not the paper q10k/r3 measurement"
+        )
+    else:
+        manifest["paper_eligible"] = bool(valid and requested_complete)
     manifest["formal_outputs_published"] = True
     atomic_write_json(manifest_path, manifest)
     remove_checkpoint(checkpoint_path)
@@ -4889,6 +5388,28 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="DEBUG ONLY: compute PostgreSQL exact GT instead of requiring the precomputed artifact",
     )
     parser.add_argument("--resume", action="store_true", help="strictly resume a matching atomic checkpoint")
+    parser.add_argument(
+        "--confirmation",
+        action="store_true",
+        help="q2k/r1 confirmation slice with parallel SQL-first; not paper-eligible",
+    )
+    parser.add_argument(
+        "--screening",
+        action="store_true",
+        help="q1k/r1 screening slice for retune loops; not paper-eligible",
+    )
+    parser.add_argument(
+        "--sql-first-workers",
+        type=positive_int,
+        default=1,
+        help="parallel connections for SQL-first exact only; stock/SQLens stay sequential",
+    )
+    parser.add_argument(
+        "--reuse-calibration-from",
+        type=Path,
+        default=None,
+        help="copy completed calibration_blocks from another checkpoint into a new run",
+    )
     return parser
 
 
@@ -4922,21 +5443,66 @@ def resolve_protocol_args(args: argparse.Namespace) -> argparse.Namespace:
     if args.exact_truth_csv == DEFAULT_EXACT_TRUTH_CSV:
         args.exact_truth_csv = (
             DEFAULT_RESULTS
-            / "amazon10m_sql_native_q10200_r43/exact_truth.csv"
+            / "amazon10m_sql_native_q10200_r43_sqlops_join"
+            / "amazon10m_sql_native_exact_truth_q10200.csv"
         )
     if args.exact_truth_manifest == DEFAULT_EXACT_TRUTH_MANIFEST:
         args.exact_truth_manifest = (
             DEFAULT_RESULTS
-            / "amazon10m_sql_native_q10200_r43/exact_truth.manifest.json"
+            / "amazon10m_sql_native_q10200_r43_sqlops_join"
+            / "amazon10m_sql_native_exact_truth_manifest.json"
         )
     if args.out == DEFAULT_RESULTS / "amazon10m_sql_native_benchmark.csv":
         args.out = (
-            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3.csv"
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3_sqlops_join.csv"
         )
+    if list(args.ef_search_values) == list(DEFAULT_EF_SEARCH_VALUES):
+        args.ef_search_values = [
+            value for value in args.ef_search_values if value >= P0_MIN_EF_SEARCH
+        ]
     if args.expected_sqlens_build_id is None:
         args.expected_sqlens_build_id = SQLENS_R43_BUILD_ID
     if args.expected_vector_so_sha256 is None:
         args.expected_vector_so_sha256 = SQLENS_R43_VECTOR_SO_SHA256
+    if args.screening and args.confirmation:
+        raise RuntimeError("--screening and --confirmation cannot be combined")
+    if args.screening:
+        if args.final_queries in {DEFAULT_FINAL_QUERIES, P0_MEASUREMENT_QUERIES}:
+            args.final_queries = P0_SCREENING_QUERIES
+        if args.final_repeats in {DEFAULT_FINAL_REPEATS, P0_MEASUREMENT_REPEATS}:
+            args.final_repeats = P0_SCREENING_REPEATS
+        if args.sql_first_workers == 1:
+            args.sql_first_workers = P0_CONFIRMATION_SQL_FIRST_WORKERS
+        if args.out in {
+            DEFAULT_RESULTS / "amazon10m_sql_native_benchmark.csv",
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3.csv",
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3_sqlops.csv",
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3_sqlops_v2.csv",
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3_sqlops_join.csv",
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q2k_r1_sqlops_v2_confirm.csv",
+        }:
+            args.out = (
+                DEFAULT_RESULTS
+                / "amazon10m_sql_native_p0_r43_q1k_r1_sqlops_join_screen.csv"
+            )
+    elif args.confirmation:
+        if args.final_queries in {DEFAULT_FINAL_QUERIES, P0_MEASUREMENT_QUERIES}:
+            args.final_queries = P0_CONFIRMATION_QUERIES
+        if args.final_repeats in {DEFAULT_FINAL_REPEATS, P0_MEASUREMENT_REPEATS}:
+            args.final_repeats = P0_CONFIRMATION_REPEATS
+        if args.sql_first_workers == 1:
+            args.sql_first_workers = P0_CONFIRMATION_SQL_FIRST_WORKERS
+        if args.out in {
+            DEFAULT_RESULTS / "amazon10m_sql_native_benchmark.csv",
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3.csv",
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3_sqlops.csv",
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3_sqlops_v2.csv",
+            DEFAULT_RESULTS / "amazon10m_sql_native_p0_r43_q10k_r3_sqlops_join.csv",
+        }:
+            args.out = (
+                DEFAULT_RESULTS
+                / "amazon10m_sql_native_p0_r43_q2k_r1_sqlops_join_confirm.csv"
+            )
     return args
 
 
@@ -4958,16 +5524,43 @@ def validate_formal_dimensions(
             or args.calibration_repeats != P0_CALIBRATION_REPEATS
         ):
             problems.append("q10200 calibration must be q80/r2 over q20..q99")
-        if (
+        if args.screening:
+            if (
+                args.final_query_offset != P0_MEASUREMENT_QUERY_OFFSET
+                or args.final_queries != P0_SCREENING_QUERIES
+                or args.final_repeats != P0_SCREENING_REPEATS
+            ):
+                problems.append(
+                    "q10200 screening must be balanced q1k/r1 over q200..q1199"
+                )
+        elif args.confirmation:
+            if (
+                args.final_query_offset != P0_MEASUREMENT_QUERY_OFFSET
+                or args.final_queries != P0_CONFIRMATION_QUERIES
+                or args.final_repeats != P0_CONFIRMATION_REPEATS
+            ):
+                problems.append(
+                    "q10200 confirmation must be balanced q2k/r1 over q200..q2199"
+                )
+        elif (
             args.final_query_offset != P0_MEASUREMENT_QUERY_OFFSET
             or args.final_queries != P0_MEASUREMENT_QUERIES
             or args.final_repeats != P0_MEASUREMENT_REPEATS
         ):
             problems.append("q10200 measurement must be balanced q10k/r3 over q200..q10199")
         if tuple(item.name for item in workloads) != P0_WORKLOAD_NAMES:
-            problems.append("q10200 mainline requires the three registered SQL-native workloads")
+            problems.append(
+                "q10200 mainline requires facts-join, catalog-join, and ACL-join workloads"
+            )
         if tuple(item.name for item in filters) != P0_FILTER_NAMES:
-            problems.append("q10200 mainline requires the four representative filters")
+            problems.append(
+                "q10200 mainline requires the three selective filters "
+                "grocery_helpful, helpful_ge20, grocery_long500"
+            )
+        if min(int(value) for value in args.ef_search_values) < P0_MIN_EF_SEARCH:
+            problems.append(
+                f"q10200 approximate grid must start at ef>={P0_MIN_EF_SEARCH}"
+            )
         if [float(value) for value in args.targets] != list(P0_TARGET_RECALLS):
             problems.append("q10200 mainline target must be Recall@10 0.90")
     else:
@@ -5136,7 +5729,7 @@ def _manifest(
         "sql_contract": {
             "single_select": True,
             "all_modes_same_sql_text_and_relational_semantics": True,
-            "statement_binding": "uncorrelated InitPlan; mismatch fails open to stock HNSW",
+            "statement_binding": "PARAM_EXTERN query vector; planner proof folds it to Const for safe_guided",
             "marker_semantics": "the approximate SQL binding marker is always true; per-row executor binding and scan proof controls guidance claims",
             "approx_order_by": "vector distance only; no secondary v.id key so HNSW can satisfy the order",
             "exact_gt": "valid AS MATERIALIZED isolates exact vector sorting; B-tree JOIN indexes remain available; ORDER BY distance, id",
@@ -5773,6 +6366,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
     conninfo = pg_config_from_env().conninfo
     checkpoint_path = args.checkpoint or args.out.with_suffix(".checkpoint")
     connections: dict[str, Any] = {}
+    sql_first_worker_conns: list[Any] = []
     database: dict[str, Any] = {}
     as_of_by_workload: dict[str, int] = {}
     truth: dict[tuple[str, str, int], ExactTruth] = {}
@@ -5813,6 +6407,18 @@ def run_benchmark(args: argparse.Namespace) -> int:
         fragment_conn = psycopg.connect(conninfo, autocommit=True)
         fragment_cur = fragment_conn.cursor()
         record_binary_identity(fragment_cur, "experiment_start", "fragment_store")
+        ensure_sqlens_fragment_catalog(
+            fragment_cur,
+            args.principal,
+            args.vector_table,
+            enable_tracking=True,
+        )
+        query_embeddings = load_query_embeddings(
+            fragment_cur,
+            args.vector_table,
+            list({**calibration, **final}.values()),
+            args.candidate_validity_predicate,
+        )
         persistent_fragment_reset = clear_fragment_store(
             fragment_cur, args.vector_table
         )
@@ -5834,6 +6440,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
             record_binary_identity(cur, "connection_open", mode)
             # Superuser-context GUCs must be set before SET ROLE drops privileges.
             cur.execute("SET hnsw.guidance_require_epoch = on")
+            ensure_sqlens_fragment_catalog(cur, args.principal, args.vector_table)
+            set_heap_competing_indexes_valid(cur, args.vector_table, valid=True)
             cur.execute(f'SET ROLE "{args.principal}"')
             set_preferred_index(
                 cur, mode_index(mode, args.source_index, args.clone_index)
@@ -6008,6 +6616,38 @@ def run_benchmark(args: argparse.Namespace) -> int:
             initialize_checkpoint(checkpoint_path, checkpoint)
         else:
             persist_checkpoint_meta(checkpoint_path, checkpoint)
+        if args.reuse_calibration_from is not None:
+            if args.resume:
+                raise RuntimeError(
+                    "--reuse-calibration-from cannot be combined with --resume"
+                )
+            source_checkpoint = load_checkpoint(args.reuse_calibration_from)
+            reused = 0
+            for block in source_checkpoint.get("calibration_blocks", []):
+                if not isinstance(block, dict) or "block_id" not in block:
+                    raise RuntimeError("reuse calibration block is missing block_id")
+                persist_checkpoint_entry(
+                    checkpoint_path,
+                    "calibration_blocks",
+                    str(block["block_id"]),
+                    block,
+                )
+                checkpoint["calibration_blocks"].append(block)
+                reused += 1
+            if reused == 0:
+                raise RuntimeError(
+                    f"reuse calibration source has no blocks: {args.reuse_calibration_from}"
+                )
+            print(
+                json.dumps(
+                    {
+                        "progress": "reuse_calibration",
+                        "source": str(args.reuse_calibration_from),
+                        "blocks": reused,
+                    }
+                ),
+                flush=True,
+            )
 
         record_binary_identity(guard_cur, "pre_exact_truth", "data_guard")
 
@@ -6280,6 +6920,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
                                         d3_settings=d3_settings,
                                         fragment_store_reset=block_fragment_reset,
                                         candidate_validity_predicate=args.candidate_validity_predicate,
+                                        query_embeddings=query_embeddings,
+                                        progress_every=50,
                                     )
                                 except BaseException as exc:
                                     persist_checkpoint_entry(
@@ -6432,6 +7074,35 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 p0_blocks[repeat] = block
 
             record_binary_identity(guard_cur, "pre_final", "data_guard")
+            if args.sql_first_workers > 1:
+                for worker_no in range(args.sql_first_workers):
+                    worker_conn = psycopg.connect(conninfo, autocommit=True)
+                    worker_cur = worker_conn.cursor()
+                    try:
+                        record_binary_identity(
+                            worker_cur,
+                            "connection_open",
+                            f"{SQL_FIRST_MODE}_worker{worker_no}",
+                        )
+                        prepare_sql_first_session(
+                            worker_cur,
+                            args.principal,
+                            args.vector_table,
+                            args.source_index,
+                            args.clone_index,
+                        )
+                    finally:
+                        worker_cur.close()
+                    sql_first_worker_conns.append(worker_conn)
+                print(
+                    json.dumps(
+                        {
+                            "progress": "sql_first_workers",
+                            "workers": len(sql_first_worker_conns),
+                        }
+                    ),
+                    flush=True,
+                )
             for repeat in range(args.final_repeats):
                 if repeat in p0_blocks:
                     continue
@@ -6473,6 +7144,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
                             "registered_scalar_indexes"
                         ],
                         configs_by_cell=configs_by_cell,
+                        query_embeddings=query_embeddings,
+                        sql_first_workers=args.sql_first_workers,
+                        sql_first_connections=sql_first_worker_conns,
+                        sql_first_after_sequential=True,
+                        progress_every=50,
                     )
                 except BaseException as exc:
                     persist_checkpoint_entry(
@@ -6603,6 +7279,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                         bootstrap_samples=args.bootstrap_samples,
                         seed=args.bootstrap_seed + int(target * 1000),
                         method_mode="d1_d2_d3",
+                        require_adaptive_evidence=False,
                     )
                     summaries.append(
                         {
@@ -6691,7 +7368,9 @@ def run_benchmark(args: argparse.Namespace) -> int:
             artifact_errors = database_contract_errors(database)
             if not completion["complete"]:
                 artifact_errors.append(
-                    "requested q10k/r3 mixed measurement slice is incomplete"
+                    "requested "
+                    f"q{completion['requested_queries']}/r{args.final_repeats} "
+                    "mixed measurement slice is incomplete"
                 )
             if any(
                 row.get("status") != "complete"
@@ -6762,6 +7441,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
                         "query_repeat_interleaved": True,
                         "arms": list(P0_MODES),
                         "d3_reset_scope": "once_per_complete_trace_repeat",
+                        "sql_first_workers": int(args.sql_first_workers),
+                        "confirmation": bool(args.confirmation),
                     },
                 }
             )
@@ -6870,6 +7551,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                         d3_settings=d3_settings,
                         fragment_store_reset=block_fragment_reset,
                         candidate_validity_predicate=args.candidate_validity_predicate,
+                        query_embeddings=query_embeddings,
                     )
                 except BaseException as exc:
                     persist_checkpoint_entry(
@@ -7160,6 +7842,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
             fingerprint_cur.close()
         for conn in connections.values():
             conn.close()
+        for conn in sql_first_worker_conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
         if guard_cur is not None:
             guard_cur.close()
         if guard_conn is not None:
