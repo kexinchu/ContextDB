@@ -2004,6 +2004,8 @@ def set_mode(
     config: Config,
     vector_index: str,
     d3_settings: dict[str, Any] | None = None,
+    *,
+    reset_cache: bool = True,
 ) -> dict[str, str]:
     if mode not in MODE_SPECS:
         raise ValueError(f"unknown benchmark mode: {mode}")
@@ -2064,7 +2066,8 @@ def set_mode(
     )
     cur.execute(f"SET hnsw.filter_strategy = {spec.filter_strategy}")
     preferred = set_preferred_index(cur, vector_index)
-    cur.execute("SELECT vector_hnsw_metadata_cache_reset()")
+    if reset_cache:
+        cur.execute("SELECT vector_hnsw_metadata_cache_reset()")
     return {
         "filter_strategy": spec.filter_strategy,
         "preferred_index": preferred,

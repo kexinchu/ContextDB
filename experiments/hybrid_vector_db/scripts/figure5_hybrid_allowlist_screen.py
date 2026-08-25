@@ -201,6 +201,41 @@ def lcb95(values: list[float]) -> float:
     return mean - 1.96 * se
 
 
+def set_cohort(offset: int, count: int) -> None:
+    global QUERY_OFFSET, QUERY_COUNT
+    QUERY_OFFSET = int(offset)
+    QUERY_COUNT = int(count)
+
+
+def fragment_memory(cur: Any) -> dict[str, Any]:
+    audit = bench.audit_fragment_store(cur, TABLE)
+    store_bytes = 0
+    try:
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(pg_column_size(store_row)), 0)
+            FROM public.pgvector_hnsw_fragment_store AS store_row
+            WHERE store_row.heap_oid = to_regclass(%s)
+            """,
+            (TABLE,),
+        )
+        store_bytes = int(cur.fetchone()[0])
+    except Exception as exc:  # noqa: BLE001
+        store_bytes = -1
+        audit = {**audit, "size_error": str(exc)}
+    cache: dict[str, Any] = {}
+    try:
+        cache = bench.fetch_json_object(cur, "SELECT vector_hnsw_metadata_cache_profile()")
+    except Exception:
+        cache = {}
+    return {
+        "store_count": audit.get("count", 0),
+        "store_bytes": store_bytes,
+        "store_mib": round(store_bytes / (1024 * 1024), 3) if store_bytes >= 0 else None,
+        "cache": cache,
+    }
+
+
 def prepare_pg(cur: Any) -> None:
     bench.ensure_sqlens_fragment_catalog(cur, PRINCIPAL, TABLE)
     cur.execute("SET hnsw.guidance_require_epoch = on")
@@ -655,7 +690,13 @@ def summarize(
             }
         )
     return {
-        "paper_eligible": False,
+        "paper_eligible": bool(
+            QUERY_COUNT >= 10_000
+            and all(cell.get("stock_n") == QUERY_COUNT for cell in cells)
+            and all(cell.get("sqlens_n") == QUERY_COUNT for cell in cells)
+            and all(cell.get("faiss_n") == QUERY_COUNT for cell in cells)
+            and all(cell.get("beats_stock") for cell in cells)
+        ),
         "filter_name": filter_name,
         "queries": QUERY_COUNT,
         "cells": cells,
@@ -746,9 +787,19 @@ def main() -> int:
     parser.add_argument("--plot-only", action="store_true")
     parser.add_argument("--retune", action="store_true")
     parser.add_argument("--hot-guidance", action="store_true")
+    parser.add_argument("--formal", action="store_true")
+    parser.add_argument("--query-offset", type=int, default=QUERY_OFFSET)
+    parser.add_argument("--query-count", type=int, default=0)
     parser.add_argument("--reuse-faiss-from", type=Path)
     parser.add_argument("--out-dir", type=Path, default=OUT_DIR)
     args = parser.parse_args()
+    count = args.query_count
+    if count <= 0:
+        count = 10_000 if args.formal else QUERY_COUNT
+    set_cohort(args.query_offset, count)
+    if args.formal:
+        args.hot_guidance = False
+        args.retune = False
     args.out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = args.out_dir / "screen.csv"
     if args.plot_only:
@@ -790,7 +841,9 @@ def main() -> int:
     faiss_efs: dict[str, dict[str, Any]] = {}
     all_rows: list[dict[str, Any]] = []
     selected_efs: dict[str, Any] = {}
-    if args.reuse_faiss_from is not None:
+    memory_log: dict[str, Any] = {}
+    reuse_ef_only = bool(args.formal and args.reuse_faiss_from is not None)
+    if args.reuse_faiss_from is not None and not reuse_ef_only:
         frozen_csv = args.reuse_faiss_from / "screen.csv"
         allow_path = args.reuse_faiss_from / "allowlist.json"
         ef_path = args.reuse_faiss_from / "faiss_ef.json"
@@ -814,7 +867,21 @@ def main() -> int:
             ),
             flush=True,
         )
-    else:
+    if args.reuse_faiss_from is not None and reuse_ef_only:
+        ef_path = args.reuse_faiss_from / "faiss_ef.json"
+        if ef_path.is_file():
+            faiss_efs = json.loads(ef_path.read_text(encoding="utf-8"))
+        print(
+            json.dumps(
+                {
+                    "progress": "reuse_faiss_ef_only",
+                    "source": str(args.reuse_faiss_from),
+                    "efs": {name: row.get("ef") for name, row in faiss_efs.items()},
+                }
+            ),
+            flush=True,
+        )
+    if args.reuse_faiss_from is None or reuse_ef_only:
         import faiss
 
         vectors, vector_rows, _ = read_fbin_memmap(FBIN)
@@ -857,18 +924,25 @@ def main() -> int:
                     ),
                     flush=True,
                 )
-                ef, attained, bound = choose_faiss_ef(
-                    index,
-                    faiss,
-                    vectors,
-                    allow["selector"],
-                    query_ids,
-                    truth_by_shape[name],
-                )
+                frozen = faiss_efs.get(name) if reuse_ef_only else None
+                if frozen and frozen.get("ef"):
+                    ef = int(frozen["ef"])
+                    attained = bool(frozen.get("lcb_attained", True))
+                    bound = float(frozen.get("calib_lcb95") or 0.0)
+                else:
+                    ef, attained, bound = choose_faiss_ef(
+                        index,
+                        faiss,
+                        vectors,
+                        allow["selector"],
+                        query_ids,
+                        truth_by_shape[name],
+                    )
                 faiss_efs[name] = {
                     "ef": ef,
                     "lcb_attained": attained,
                     "calib_lcb95": bound,
+                    "reused_ef": bool(frozen),
                 }
                 all_rows.extend(
                     run_faiss_shape(
@@ -913,6 +987,44 @@ def main() -> int:
                 )
                 for name, title, join_kind in SHAPES:
                     workload = _workload(name, join_kind)
+                    if args.formal:
+                        bench.clear_fragment_store(cur, TABLE)
+                        for mode in ("stock", "d1_d2_d3"):
+                            if mode != "stock":
+                                bench.clear_fragment_store(cur, TABLE)
+                            print(
+                                json.dumps(
+                                    {
+                                        "progress": "pg_start",
+                                        "filter": filter_name,
+                                        "shape": name,
+                                        "mode": mode,
+                                        "ef": EF_PG,
+                                        "formal": True,
+                                    }
+                                ),
+                                flush=True,
+                            )
+                            all_rows.extend(
+                                run_pg_shape(
+                                    cur,
+                                    workload,
+                                    spec,
+                                    mode,
+                                    query_ids,
+                                    embeddings,
+                                    truth_by_shape[name],
+                                    as_of,
+                                    EF_PG,
+                                )
+                            )
+                        memory_log[f"{filter_name}|{name}"] = fragment_memory(cur)
+                        selected_efs[f"{filter_name}|{name}"] = {
+                            "ef": EF_PG,
+                            "mode": "d1_d2_d3",
+                            "formal": True,
+                        }
+                        continue
                     if args.hot_guidance:
                         if name == "attributes":
                             bench.clear_fragment_store(cur, TABLE)
@@ -1046,6 +1158,9 @@ def main() -> int:
     )
     (args.out_dir / "selected_efs.json").write_text(
         json.dumps(selected_efs, indent=2), encoding="utf-8"
+    )
+    (args.out_dir / "fragment_memory.json").write_text(
+        json.dumps(memory_log, indent=2, default=str), encoding="utf-8"
     )
     payload: dict[str, Any] = {}
     for filter_name in filter_names:
