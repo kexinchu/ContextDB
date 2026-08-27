@@ -110,7 +110,15 @@ CREATE FUNCTION vector_hnsw_reset_scan_profile() RETURNS void
 
 -- kind = adaptive is backend-local D3/FragReuse admission. It observes the
 -- first requests without pruning, then activates page/Bloom fragments only.
+CREATE FUNCTION vector_hnsw_guidance_extract_atoms(text) RETURNS text[]
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
 CREATE FUNCTION vector_hnsw_guidance_activate(regclass, text[], text) RETURNS int4
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
+-- Offline/async fragment rebuild. activate() fail-opens on a stale epoch and
+-- does not rebuild on the reader query path.
+CREATE FUNCTION vector_hnsw_guidance_rebuild(regclass, text[], text) RETURNS int4
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
 -- A query must call this from an uncorrelated initplan with the same index,

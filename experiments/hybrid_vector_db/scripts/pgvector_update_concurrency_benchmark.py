@@ -405,9 +405,11 @@ def load_fixed_recall_selector(
         row, "sqlens", sqlens_full=True, burst=args.traversal_guided_burst
     )
     configs = {
-        (filter_spec.name, method, 0.90): stock if method == "stock" else sqlens
+        (filter_spec.name, method, 0.90): (
+            sqlens if method == "sqlens_full" else stock
+        )
         for filter_spec in filters
-        for method in METHODS
+        for method in SUPPORTED_METHODS
     }
     args.insertion_table = str(row["stock_table"])
     args.insertion_index = str(row["stock_index"])
@@ -988,9 +990,14 @@ def validate_args(args: argparse.Namespace) -> tuple[list[float], list[int], lis
         if tuple(targets) != FORMAL_TARGETS:
             raise BenchmarkContractError("P0-6 formal protocol requires target recall 0.90")
         if tuple(methods) != METHODS:
-            raise BenchmarkContractError(
-                "P0-6 formal protocol requires methods stock,sqlens_full"
+            w3_fail_open = (
+                bool(getattr(args, "fail_open_stale", False))
+                and tuple(methods) == ("stock", "sqlens_d1")
             )
+            if not w3_fail_open:
+                raise BenchmarkContractError(
+                    "P0-6 formal protocol requires methods stock,sqlens_full"
+                )
         if tuple(args.filter_names) != FORMAL_FILTERS:
             raise BenchmarkContractError(
                 "P0-6 formal protocol requires the 50%/5%/0.5% sensitivity filters"
@@ -1145,11 +1152,22 @@ def live_identity_gate(args: argparse.Namespace, matched: throughput.MatchedReca
     database = database_fingerprint(args, str(args.expected_sqlens_build_id))
     index_gate = throughput.validate_database_index_gate(database, args.insertion_index)
     if args.protocol == FORMAL_PROTOCOL:
-        bfs_gate = throughput.validate_database_index_gate(database, args.bfs_index)
-        matched_gate = {
-            "passed": True,
-            "source": "r36_fixed_selector_plus_live_source_and_bfs_index_gates",
-        }
+        if "sqlens_full" in list(getattr(args, "methods", ())):
+            bfs_gate = throughput.validate_database_index_gate(database, args.bfs_index)
+            matched_gate = {
+                "passed": True,
+                "source": "r36_fixed_selector_plus_live_source_and_bfs_index_gates",
+            }
+        else:
+            bfs_gate = {
+                "passed": True,
+                "skipped": True,
+                "reason": "sqlens_full not in methods; BFS stays in single-thread locality",
+            }
+            matched_gate = {
+                "passed": True,
+                "source": "w3_fail_open_source_visguide_index_gate",
+            }
     else:
         bfs_gate = None
         matched_gate = throughput.validate_live_matched_recall_provenance(
@@ -1432,9 +1450,8 @@ def mutation_sql(
         ).format(relation, relation),
         "insert": sql.SQL(
             "INSERT INTO {} ({}) SELECT {} FROM {} AS donor WHERE donor.id = %s "
-            "ON CONFLICT (id) DO UPDATE SET embedding=EXCLUDED.embedding, "
-            "has_price=EXCLUDED.has_price, price=EXCLUDED.price"
-        ).format(relation, insert_columns, selected_columns, relation),
+            "AND NOT EXISTS (SELECT 1 FROM {} existing WHERE existing.id = %s)"
+        ).format(relation, insert_columns, selected_columns, relation, relation),
         "delete": sql.SQL("DELETE FROM {} WHERE id = %s").format(relation),
         "restore": sql.SQL(
             "UPDATE {} AS target SET embedding=original.embedding, "
@@ -1480,7 +1497,12 @@ def execute_mutation(
                 return mutation, affected, target
         return mutation, 0, target
     elif mutation == "insert":
-        cur.execute(statements[mutation], (int(lifecycle_id), int(donor_id)))
+        cur.execute(
+            statements[mutation],
+            (int(lifecycle_id), int(donor_id), int(lifecycle_id)),
+        )
+        if int(cur.rowcount) <= 0:
+            return mutation, 0, int(lifecycle_id)
         lifecycle_ids.append(int(lifecycle_id))
         target = int(lifecycle_id)
     elif mutation == "delete":
@@ -1609,13 +1631,23 @@ def execute_profiled_search(
             table, _ = mode_table_index(args, runtime.mode)
             binding = None
         else:
-            activation_profile = activate(
-                runtime.cur, args, runtime.mode, filter_spec.name, read_profile=False
-            )
-            table = str(activation_profile["table"])
-            binding = activation_binding(
-                args, runtime.mode, filter_spec.name, activation_profile
-            )
+            table, _ = mode_table_index(args, runtime.mode)
+            stale_fail_open = False
+            if bool(getattr(args, "fail_open_stale", False)):
+                guide_epoch = getattr(runtime, "fail_open_guide_epoch", None)
+                if guide_epoch is not None:
+                    current_epoch = read_relation_epoch(runtime.cur, table)
+                    stale_fail_open = current_epoch != int(guide_epoch)
+            if stale_fail_open:
+                binding = None
+            else:
+                activation_profile = activate(
+                    runtime.cur, args, runtime.mode, filter_spec.name, read_profile=False
+                )
+                table = str(activation_profile["table"])
+                binding = activation_binding(
+                    args, runtime.mode, filter_spec.name, activation_profile
+                )
         activation_finished = time.perf_counter()
         self_exclusion = candidate_self_exclusion(args, table)
         ids, distances, _ = run_query(
@@ -2085,6 +2117,10 @@ def run_overlap(
                     field: int(profile.get(field, 0) or 0)
                     for field in GUIDANCE_COUNTER_FIELDS
                 })
+            if bool(getattr(args, "fail_open_stale", False)) and method != "stock":
+                warmup_epoch = read_relation_epoch(runtimes[0].cur, table)
+                for runtime in runtimes:
+                    runtime.fail_open_guide_epoch = warmup_epoch
 
         writer_conns: list[Any] = []
         writer_statements: list[Mapping[str, Any]] = []
@@ -2679,11 +2715,13 @@ def run_experiment(args: argparse.Namespace) -> int:
     )
     blocking = list(protocol["failed_checks"])
     if bool(getattr(args, "paper_table_slice", False)):
-        blocking = [
-            name
-            for name in blocking
-            if name not in {"readers_1_4_8_16_32_64", "update_rates_0_10_100_1000"}
-        ]
+        waived = {"readers_1_4_8_16_32_64", "update_rates_0_10_100_1000"}
+        if (
+            bool(getattr(args, "fail_open_stale", False))
+            and tuple(methods) == ("stock", "sqlens_d1")
+        ):
+            waived.add("methods_stock_sqlens_full")
+        blocking = [name for name in blocking if name not in waived]
     if args.protocol == FORMAL_PROTOCOL and blocking:
         raise BenchmarkContractError(
             "formal P0-6 protocol gate failed: "
@@ -2827,6 +2865,12 @@ def run_experiment(args: argparse.Namespace) -> int:
             "tail_uncertainty": "repeat_cluster_bootstrap_ci95",
             "minimum_update_delivery_ratio": args.min_update_delivery_ratio,
             "update_delivery_policy": "record_overload_and_continue_full_matrix",
+            "fail_open_stale": bool(getattr(args, "fail_open_stale", False)),
+            "fail_open_policy": (
+                "warmup_epoch_then_stock_without_activate"
+                if bool(getattr(args, "fail_open_stale", False))
+                else "activate_may_rebuild_on_stale_epoch"
+            ),
             "exact_audit_control_scope": "target_filter_repeat",
             "exact_audit_control_method": (
                 "sqlens_full" if "sqlens_full" in methods
@@ -3020,7 +3064,15 @@ def run_experiment(args: argparse.Namespace) -> int:
                                 }
                                 atomic_json(paths["manifest"], manifest)
                                 if any(row.get("error") for row in rows):
-                                    raise BenchmarkContractError("read/write worker error or timeout")
+                                    details = [
+                                        f"{row.get('kind')}:{row.get('error')}"
+                                        for row in rows
+                                        if row.get("error")
+                                    ]
+                                    raise BenchmarkContractError(
+                                        "read/write worker error or timeout: "
+                                        + "; ".join(details[:5])
+                                    )
                     after = exact_sql_valid_spot_audit(
                         args,
                         audit_method,
@@ -3294,6 +3346,11 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-git-revision",
         default=os.environ.get("SQLENS_GIT_REVISION", ""),
+    )
+    parser.add_argument(
+        "--fail-open-stale",
+        action="store_true",
+        help="after warmup, stale fragment epoch skips activate and uses stock",
     )
     return parser
 

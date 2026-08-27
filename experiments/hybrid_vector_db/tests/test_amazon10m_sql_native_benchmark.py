@@ -509,6 +509,41 @@ class Amazon10MSqlNativeBenchmarkTests(unittest.TestCase):
                 filters[0].atoms,
             )
 
+    def test_extract_matches_named_bind_for_amazon14_and_grocery_helpful(self):
+        filters = benchmark.read_filters(benchmark.DEFAULT_FILTERS)
+        names = {item.name for item in filters}
+        self.assertIn("grocery_helpful", names)
+        self.assertEqual(len(filters), 14)
+        for spec in filters:
+            extracted = benchmark.extract_row_local_atoms(spec.predicate)
+            self.assertEqual(extracted, spec.atoms, spec.name)
+            self.assertEqual(
+                benchmark.binding_atoms_for(benchmark.WORKLOADS[0], spec),
+                spec.atoms,
+            )
+            self.assertEqual(
+                benchmark.binding_atoms_for(
+                    benchmark.WORKLOADS[0], spec, override=spec.atoms
+                ),
+                spec.atoms,
+            )
+
+    def test_extract_rejects_join_and_volatile_atoms(self):
+        with self.assertRaises(ValueError):
+            benchmark.extract_row_local_atoms(
+                "public.amazon_review_facts.verified = true"
+            )
+        with self.assertRaises(ValueError):
+            benchmark.extract_row_local_atoms(
+                "main_category = 'Grocery' AND current_user = 'alice'"
+            )
+        with self.assertRaises(ValueError):
+            benchmark.extract_row_local_atoms("helpful_vote >= 1 AND now() > date")
+        with self.assertRaises(ValueError):
+            benchmark.extract_row_local_atoms(
+                "main_category = 'Grocery' JOIN facts ON true"
+            )
+
     def test_partition_measurement_schedule_keeps_sqlens_sequential(self):
         keys = [("acl_only", "popular_ge1000", 200, 0)]
         schedule = benchmark.interleaved_schedule(

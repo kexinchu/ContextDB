@@ -245,7 +245,7 @@ SELECT vector_hnsw_guidance_activate(
 	'hnsw_profile_guidance_idx'::regclass,
 	ARRAY['exact:sql:eligible'],
 	'exact'
-) = 1 AS stale_guide_rebuilt_after_fail_open;
+) = 0 AS stale_activate_fails_open_without_rebuild;
 
 DO $$
 DECLARE

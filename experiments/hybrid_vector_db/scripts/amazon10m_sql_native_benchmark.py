@@ -222,10 +222,121 @@ class WorkloadSpec:
     join_kind: str = "acl"
 
 
-def binding_atoms_for(workload: WorkloadSpec, spec: FilterSpec) -> tuple[str, ...]:
-    """Filter atoms plus any heap-local atoms implied by the SQL operator."""
-    ordered = list(spec.atoms)
-    seen = set(spec.atoms)
+_ATOM_UNSAFE = (
+    " select ",
+    " from ",
+    " join ",
+    " exists ",
+    " with ",
+    " union ",
+    " current_user ",
+    " session_user ",
+    " current_",
+    " localtime",
+    " localtimestamp",
+    " random(",
+    " now(",
+    " clock_timestamp(",
+    " statement_timestamp(",
+    " timeofday(",
+)
+
+
+def _split_top_and(predicate: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote = ""
+    i = 0
+    text = predicate.strip()
+    while i < len(text):
+        char = text[i]
+        if quote:
+            buf.append(char)
+            if char == quote:
+                quote = ""
+            elif char == "\\" and i + 1 < len(text):
+                buf.append(text[i + 1])
+                i += 1
+            i += 1
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            buf.append(char)
+            i += 1
+            continue
+        if char == "(":
+            depth += 1
+            buf.append(char)
+            i += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            buf.append(char)
+            i += 1
+            continue
+        if depth == 0 and text[i : i + 5].upper() == " AND ":
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            i += 5
+            continue
+        buf.append(char)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _conjunct_family(conjunct: str) -> str:
+    match = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", conjunct)
+    if not match:
+        return conjunct.strip().lower()
+    name = match.group(1).lower()
+    if name.startswith("has_") and len(name) > 4:
+        return name[4:]
+    return name
+
+
+def extract_row_local_atoms(predicate: str) -> tuple[str, ...]:
+    """Walk a row-local immutable AND of atoms. JOIN/volatile are rejected."""
+    raw = (predicate or "").strip()
+    if not raw:
+        raise ValueError("empty guidance predicate")
+    if ";" in raw or "." in raw:
+        raise ValueError("JOIN or qualified name is not a heap-local atom")
+    padded = f" {raw.lower()} "
+    for token in _ATOM_UNSAFE:
+        if token in padded:
+            raise ValueError(f"JOIN or volatile token is not a heap-local atom: {token.strip()}")
+    conjuncts = _split_top_and(raw)
+    if not conjuncts:
+        raise ValueError("empty guidance predicate")
+    families: list[str] = []
+    grouped: dict[str, list[str]] = {}
+    for conjunct in conjuncts:
+        family = _conjunct_family(conjunct)
+        if family not in grouped:
+            families.append(family)
+            grouped[family] = []
+        grouped[family].append(conjunct)
+    return tuple(f"sql:{' AND '.join(grouped[family])}" for family in families)
+
+
+def binding_atoms_for(
+    workload: WorkloadSpec,
+    spec: FilterSpec,
+    *,
+    override: Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    """Extract heap-local atoms. Named activate atoms are an override."""
+    if override is not None:
+        ordered = [atom for atom in override if atom]
+    else:
+        ordered = list(extract_row_local_atoms(spec.predicate))
+    seen = set(ordered)
     for atom in WORKLOAD_GUIDANCE_ATOMS.get(workload.name, ()):
         if atom not in seen:
             ordered.append(atom)

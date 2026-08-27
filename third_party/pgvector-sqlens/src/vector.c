@@ -1573,6 +1573,186 @@ HnswMetadataHasOnlyAllowedStaticArrayCasts(const char *predicate)
 	return true;
 }
 
+static bool
+HnswGuidanceExtractIsUnsafeQual(const char *predicate)
+{
+	char	   *lower = pstrdup(predicate);
+	char	   *padded;
+	const char *unsafeTokens[] = {
+		" select ", " from ", " join ", " exists ", " with ",
+		" union ", " current_user ", " session_user ", " current_",
+		" localtime", " localtimestamp", " random(", " now(",
+		" clock_timestamp(", " statement_timestamp(", " timeofday("
+	};
+
+	for (char *cursor = lower; *cursor != '\0'; cursor++)
+		*cursor = pg_tolower((unsigned char) *cursor);
+	padded = psprintf(" %s ", lower);
+	if (strchr(predicate, ';') != NULL || strchr(predicate, '.') != NULL)
+	{
+		pfree(padded);
+		pfree(lower);
+		return true;
+	}
+	for (int i = 0; i < lengthof(unsafeTokens); i++)
+	{
+		if (strstr(padded, unsafeTokens[i]) != NULL)
+		{
+			pfree(padded);
+			pfree(lower);
+			return true;
+		}
+	}
+	pfree(padded);
+	pfree(lower);
+	return false;
+}
+
+static const char *
+HnswGuidanceExtractFamily(const char *conjunct)
+{
+	const char *cursor = conjunct;
+
+	while (*cursor != '\0' && !((*cursor >= 'A' && *cursor <= 'Z') ||
+		(*cursor >= 'a' && *cursor <= 'z') || *cursor == '_'))
+		cursor++;
+	if (*cursor == '\0')
+		return conjunct;
+	if (pg_strncasecmp(cursor, "has_", 4) == 0 && cursor[4] != '\0')
+		return cursor + 4;
+	return cursor;
+}
+
+static bool
+HnswGuidanceSameFamily(const char *left, const char *right)
+{
+	size_t		leftLen = 0;
+	size_t		rightLen = 0;
+
+	while (left[leftLen] != '\0' && (pg_tolower((unsigned char) left[leftLen]) != ' ' &&
+		left[leftLen] != '>' && left[leftLen] != '<' && left[leftLen] != '=' &&
+		left[leftLen] != '!'))
+		leftLen++;
+	while (right[rightLen] != '\0' && (pg_tolower((unsigned char) right[rightLen]) != ' ' &&
+		right[rightLen] != '>' && right[rightLen] != '<' && right[rightLen] != '=' &&
+		right[rightLen] != '!'))
+		rightLen++;
+	if (leftLen != rightLen)
+		return false;
+	return pg_strncasecmp(left, right, leftLen) == 0;
+}
+
+static List *
+HnswGuidanceExtractRowLocalAtoms(const char *predicate)
+{
+	List	   *atoms = NIL;
+	char	   *copy;
+	char	   *cursor;
+	char	   *start;
+	int			depth = 0;
+	bool		inQuote = false;
+	char	  **conjuncts;
+	const char **families;
+	int			count = 0;
+	int			cap = 16;
+
+	if (predicate == NULL || predicate[0] == '\0' ||
+		HnswGuidanceExtractIsUnsafeQual(predicate))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("HNSW guidance extract requires a row-local immutable predicate"),
+				 errhint("JOIN, volatile, and qualified names stay in the executor.")));
+
+	copy = pstrdup(predicate);
+	conjuncts = (char **) palloc(sizeof(char *) * cap);
+	families = (const char **) palloc(sizeof(const char *) * cap);
+	cursor = copy;
+	start = copy;
+	while (*cursor != '\0')
+	{
+		if (inQuote)
+		{
+			if (*cursor == '\'')
+				inQuote = false;
+			cursor++;
+			continue;
+		}
+		if (*cursor == '\'')
+		{
+			inQuote = true;
+			cursor++;
+			continue;
+		}
+		if (*cursor == '(')
+			depth++;
+		else if (*cursor == ')')
+			depth = Max(0, depth - 1);
+		else if (depth == 0 && pg_strncasecmp(cursor, " AND ", 5) == 0)
+		{
+			*cursor = '\0';
+			while (*start == ' ')
+				start++;
+			if (*start != '\0')
+			{
+				if (count >= cap)
+				{
+					cap *= 2;
+					conjuncts = (char **) repalloc(conjuncts, sizeof(char *) * cap);
+					families = (const char **) repalloc(families, sizeof(const char *) * cap);
+				}
+				conjuncts[count] = start;
+				families[count] = HnswGuidanceExtractFamily(start);
+				count++;
+			}
+			cursor += 5;
+			start = cursor;
+			continue;
+		}
+		cursor++;
+	}
+	while (*start == ' ')
+		start++;
+	if (*start != '\0')
+	{
+		if (count >= cap)
+		{
+			cap *= 2;
+			conjuncts = (char **) repalloc(conjuncts, sizeof(char *) * cap);
+			families = (const char **) repalloc(families, sizeof(const char *) * cap);
+		}
+		conjuncts[count] = start;
+		families[count] = HnswGuidanceExtractFamily(start);
+		count++;
+	}
+	for (int i = 0; i < count; i++)
+	{
+		StringInfoData buf;
+
+		if (conjuncts[i] == NULL)
+			continue;
+		initStringInfo(&buf);
+		appendStringInfoString(&buf, "sql:");
+		appendStringInfoString(&buf, conjuncts[i]);
+		for (int j = i + 1; j < count; j++)
+		{
+			if (conjuncts[j] != NULL &&
+				HnswGuidanceSameFamily(families[i], families[j]))
+			{
+				appendStringInfoString(&buf, " AND ");
+				appendStringInfoString(&buf, conjuncts[j]);
+				conjuncts[j] = NULL;
+			}
+		}
+		atoms = lappend(atoms, cstring_to_text(buf.data));
+		pfree(buf.data);
+	}
+	if (atoms == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("HNSW guidance extract found no row-local atoms")));
+	return atoms;
+}
+
 static void
 HnswMetadataValidateSqlPredicate(const char *predicate)
 {
@@ -4895,6 +5075,29 @@ vector_hnsw_guidance_reset(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+PG_FUNCTION_INFO_V1(vector_hnsw_guidance_extract_atoms);
+Datum
+vector_hnsw_guidance_extract_atoms(PG_FUNCTION_ARGS)
+{
+	text	   *predicateText = PG_GETARG_TEXT_PP(0);
+	char	   *predicate = text_to_cstring(predicateText);
+	List	   *atoms = HnswGuidanceExtractRowLocalAtoms(predicate);
+	Datum	   *datums;
+	int			count = list_length(atoms);
+	int			index = 0;
+	ListCell   *cell;
+	ArrayType  *result;
+
+	datums = (Datum *) palloc(sizeof(Datum) * count);
+	foreach(cell, atoms)
+		datums[index++] = PointerGetDatum(lfirst(cell));
+	result = construct_array(datums, count, TEXTOID, -1, false, 'i');
+	PG_RETURN_ARRAYTYPE_P(result);
+}
+
+/* Reader activate() fail-opens on a stale epoch. Offline rebuild sets this. */
+static bool hnsw_guidance_allow_query_path_rebuild = false;
+
 PG_FUNCTION_INFO_V1(vector_hnsw_guidance_activate);
 Datum
 vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
@@ -4954,7 +5157,9 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 	 * only while the complete guide identity matches. Relation version checking
 	 * is deliberately deferred to HnswGuidanceBeginScan, where it runs under the
 	 * actual query snapshot; a stale guide is deactivated and fails open to stock
-	 * HNSW before it can affect candidate admission. */
+	 * HNSW before it can affect candidate admission. Activate itself also fails
+	 * open on a stale epoch: it must not rebuild a fragment on the reader path.
+	 * Offline rebuild is vector_hnsw_guidance_rebuild(). */
 	if (!adaptive &&
 		hnsw_active_guidance.active &&
 		hnsw_active_guidance.indexOid == indexOid &&
@@ -5004,6 +5209,14 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 		if (!HnswAdaptiveDescriptorVersionMatches(descriptor, epochTracked,
 				relationEpoch, relationRelFileNode))
 		{
+			if (descriptor->adaptiveState != HNSW_ADAPTIVE_MISSING &&
+				!hnsw_guidance_allow_query_path_rebuild)
+			{
+				HnswAdaptiveMarkStale(descriptor);
+				HnswGuidanceDeactivate();
+				hnsw_last_adaptive_descriptor = descriptor;
+				PG_RETURN_INT32(0);
+			}
 			if (descriptor->adaptiveState != HNSW_ADAPTIVE_MISSING)
 				HnswAdaptiveMarkStale(descriptor);
 			HnswAdaptiveBeginProbeCycle(descriptor, epochTracked,
@@ -5086,7 +5299,13 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 				HNSW_GUIDANCE_KIND_PAGE : HNSW_GUIDANCE_KIND_BLOOM),
 				epochTracked, relationEpoch, relationRelFileNode, guidancePredicate));
 
-		/* STALE is observable until the next request starts its probe cycle. */
+		/* STALE stays fail-open on the query path. Offline rebuild starts
+		 * the next probe/rebuild cycle. */
+		if (!hnsw_guidance_allow_query_path_rebuild)
+		{
+			HnswGuidanceDeactivate();
+			PG_RETURN_INT32(0);
+		}
 		HnswAdaptiveBeginProbeCycle(descriptor, epochTracked, relationEpoch,
 			relationRelFileNode);
 		hnsw_adaptive_probe.descriptor = descriptor;
@@ -5150,6 +5369,40 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("negated guidance atoms require exact kind"),
 					 errhint("Page and bloom guidance can have false positives, so NOT would be unsafe.")));
+
+		if (!hnsw_guidance_allow_query_path_rebuild)
+		{
+			bool		foundExisting;
+			HnswMetadataCacheEntry *existing;
+
+			existing = FindHnswMetadataCache(heapOid, filterName, &foundExisting);
+			if (foundExisting)
+			{
+				bool		hasPayload = false;
+
+				switch (atomKind)
+				{
+					case HNSW_GUIDANCE_KIND_EXACT:
+						hasPayload = existing->tidHash != NULL;
+						break;
+					case HNSW_GUIDANCE_KIND_PAGE:
+						hasPayload = existing->pageBits != NULL;
+						break;
+					case HNSW_GUIDANCE_KIND_BLOOM:
+						hasPayload = existing->bloomBits != NULL;
+						break;
+					default:
+						break;
+				}
+				if (hasPayload &&
+					!HnswMetadataCacheVersionMatches(existing, epochTracked,
+						relationEpoch, relationRelFileNode))
+				{
+					HnswGuidanceDeactivate();
+					PG_RETURN_INT32(0);
+				}
+			}
+		}
 
 		switch (atomKind)
 		{
@@ -5226,6 +5479,25 @@ vector_hnsw_guidance_activate(PG_FUNCTION_ARGS)
 	/* Eviction can now protect every atom referenced by the new guide. */
 	HnswMetadataEvictIfNeeded(NULL);
 	PG_RETURN_INT32(nextGuidance.atoms);
+}
+
+PG_FUNCTION_INFO_V1(vector_hnsw_guidance_rebuild);
+Datum
+vector_hnsw_guidance_rebuild(PG_FUNCTION_ARGS)
+{
+	Datum		result = (Datum) 0;
+
+	hnsw_guidance_allow_query_path_rebuild = true;
+	PG_TRY();
+	{
+		result = vector_hnsw_guidance_activate(fcinfo);
+	}
+	PG_FINALLY();
+	{
+		hnsw_guidance_allow_query_path_rebuild = false;
+	}
+	PG_END_TRY();
+	return result;
 }
 
 PG_FUNCTION_INFO_V1(vector_hnsw_guidance_bind);
