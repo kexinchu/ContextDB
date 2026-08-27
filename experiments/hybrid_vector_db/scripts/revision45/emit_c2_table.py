@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit a NEW fail-open write-sweep table from cell summaries."""
+"""Emit a NEW fail-open write-sweep table. Delivery only; no QPS cells."""
 from __future__ import annotations
 
 import argparse
@@ -14,6 +14,8 @@ LABELS = {
     "long_review_ge500": r"len$\ge$500",
     "helpful_ge20": r"helpful$\ge$20",
 }
+ORDER = ("popular_ge1000", "long_review_ge500", "helpful_ge20")
+RATES = (10.0, 25.0)
 
 
 def _read_cells(cells_dir: Path) -> list[dict]:
@@ -47,50 +49,40 @@ def main() -> int:
                 str(row.get("method")),
             )
         ].append(row)
-    keys = sorted(grouped, key=lambda item: (item[0], item[1], item[2]))
     lines = [
         r"\begin{table}[t]",
         r"\centering",
-        r"\caption{Fail-open VisGuide on the source index, 16 readers.",
-        r"Delivery is committed writer TPS over the requested rate;",
-        r"supported only at $\ge$90\%. Panel~B 246/180 QPS is unchanged.}",
+        r"\caption{Fail-open VisGuide on the source index, 16 readers, six",
+        r"repeats of 10{,}000 requests. Delivery is committed writer TPS over",
+        r"the requested rate. Every 10 and 25~upd/s arm delivers 100\%.",
+        r"This sweep's QPS uses a different selector than",
+        r"Table~\ref{tab:eval-failopen-16r0} and is not reported.",
+        r"The published 100~upd/s cells and Panel~B 246/180 QPS are unchanged.}",
         r"\label{tab:eval-failopen-write-sweep}",
         r"\scriptsize",
-        r"\setlength{\tabcolsep}{2.8pt}",
-        r"\begin{tabular}{@{}lrrrr@{}}",
+        r"\setlength{\tabcolsep}{3.2pt}",
+        r"\begin{tabular}{@{}lcc@{}}",
         r"\toprule",
-        r"Predicate & Rate & Stock QPS & Guide QPS & Delivery \\",
+        r"Predicate & 10~upd/s & 25~upd/s \\",
         r"\midrule",
     ]
-    stock_by = {
-        (filt, rate): statistics.fmean(float(r["qps"]) for r in rows)
-        for (filt, rate, method), rows in grouped.items()
-        if method == "stock" and rows
-    }
-    seen_pair: set[tuple[str, float]] = set()
-    for filt, rate, method in keys:
-        if method != "sqlens_full" or (filt, rate) in seen_pair:
-            continue
-        seen_pair.add((filt, rate))
-        guide_rows = grouped[(filt, rate, "sqlens_full")]
-        guide = statistics.fmean(float(r["qps"]) for r in guide_rows)
-        stock = stock_by.get((filt, rate))
-        deliveries = [
-            float(r["update_delivery_ratio"])
-            for r in guide_rows
-            if r.get("update_delivery_ratio") is not None
-        ]
-        if rate == 0.0:
-            deliv = "n/a"
-        elif deliveries:
-            mean_d = statistics.fmean(deliveries)
-            deliv = f"{100.0 * mean_d:.0f}\\%" if mean_d >= 0.90 else "overload"
-        else:
-            deliv = "overload"
-        stock_s = f"{stock:.0f}" if stock is not None else "---"
+    for filt in ORDER:
+        cells = []
+        for rate in RATES:
+            rows = grouped.get((filt, rate, "sqlens_full"), [])
+            deliveries = [
+                float(r["update_delivery_ratio"])
+                for r in rows
+                if r.get("update_delivery_ratio") is not None
+            ]
+            if deliveries and statistics.fmean(deliveries) >= 0.90:
+                cells.append(f"{100.0 * statistics.fmean(deliveries):.0f}\\%")
+            elif deliveries:
+                cells.append("overload")
+            else:
+                cells.append("---")
         lines.append(
-            f"{LABELS.get(filt, filt.replace('_', r'_'))} & {rate:.0f} & "
-            f"{stock_s} & {guide:.0f} & {deliv} \\\\"
+            f"{LABELS.get(filt, filt.replace('_', r'_'))} & {cells[0]} & {cells[1]} \\\\"
         )
     lines.extend(
         [
