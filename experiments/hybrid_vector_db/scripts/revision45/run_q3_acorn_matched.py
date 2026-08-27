@@ -31,12 +31,11 @@ QUERY_OFFSET = 200
 QUERY_COUNT = 50
 K = 10
 TARGET_LCB = 0.90
-FILTER_NAMES = (
-    "long_review_ge500",
-    "grocery_helpful",
-    "helpful_ge20",
-    "grocery_long500",
-)
+def _default_filter_names() -> list[str]:
+    return [row["filter_name"] for row in csv.DictReader(FILTERS.open(encoding="utf-8"))]
+
+
+FILTER_NAMES = tuple(_default_filter_names())
 STOCK_GUIDE_EFS = (100, 250, 500, 750, 1000)
 ACORN_EFS = (100, 200, 400, 800, 1600)
 
@@ -240,8 +239,9 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=OUT_DIR)
     parser.add_argument("--filter-names", nargs="*", default=list(FILTER_NAMES))
     parser.add_argument("--query-count", type=int, default=QUERY_COUNT)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
-    names = args.filter_names
+    names = args.filter_names or list(FILTER_NAMES)
     contract = {
         "paper_eligible": False,
         "plan_item": "Q3",
@@ -265,15 +265,43 @@ def main() -> int:
     workload = _workload()
     specs = {spec.name: spec for spec in bench.read_filters(bench.DEFAULT_FILTERS, set(names))}
     cfg = pg_config_from_env()
+    score_path = args.out_dir / "score.json"
+    csv_path = args.out_dir / "screen.csv"
+    prior = (
+        json.loads(score_path.read_text(encoding="utf-8"))
+        if args.resume and score_path.exists()
+        else {}
+    )
+    cells = list(prior.get("cells") or [])
+    sweep = list(prior.get("sweep") or [])
+    done = {
+        str(cell["filter_name"])
+        for cell in cells
+        if cell.get("stock") and cell.get("d1") and cell.get("acorn1")
+    }
     all_rows: list[dict] = []
-    sweep: list[dict[str, Any]] = []
-    cells: list[dict[str, Any]] = []
+    if csv_path.exists():
+        with csv_path.open(encoding="utf-8", newline="") as handle:
+            all_rows.extend(csv.DictReader(handle))
     query_nos = list(range(QUERY_OFFSET, QUERY_OFFSET + int(args.query_count)))
+
+    def _checkpoint() -> None:
+        if all_rows:
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(all_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(all_rows)
+        payload = {**contract, "cells": cells, "sweep": sweep, "rows": len(all_rows)}
+        score_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
     with psycopg.connect(cfg.conninfo, autocommit=True) as conn:
         cur = conn.cursor()
         from rowlocal_faiss14_screen import load_attr_truth
 
         for name in names:
+            if name in done:
+                print(json.dumps({"progress": "resume_skip", "filter": name}), flush=True)
+                continue
             spec = specs[name]
             query_ids, truth, as_of = load_attr_truth(name)
             embed_ids = [query_ids[query_no] for query_no in query_nos if query_no in query_ids]
@@ -309,21 +337,12 @@ def main() -> int:
                 cell["all_met_target"] = all(
                     bool(cell[mode].get("met_target")) for mode in ("stock", "d1", "acorn1")
                 )
+            cells = [item for item in cells if item.get("filter_name") != name]
             cells.append(cell)
+            _checkpoint()
+            print(json.dumps({"progress": "filter_done", "filter": name}), flush=True)
 
-    csv_path = args.out_dir / "screen.csv"
-    if all_rows:
-        with csv_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(all_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(all_rows)
-    score = {
-        **contract,
-        "cells": cells,
-        "sweep": sweep,
-        "rows": len(all_rows),
-    }
-    (args.out_dir / "score.json").write_text(json.dumps(score, indent=2) + "\n", encoding="utf-8")
+    _checkpoint()
     (args.out_dir / "manifest.json").write_text(
         json.dumps({**contract, "rows": len(all_rows)}, indent=2) + "\n",
         encoding="utf-8",

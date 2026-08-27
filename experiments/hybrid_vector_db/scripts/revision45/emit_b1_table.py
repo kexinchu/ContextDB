@@ -50,6 +50,13 @@ def main() -> int:
     }
     cells = {cell["filter_name"]: cell for cell in score["cells"]}
     order = list(sel)
+    compact = (
+        "popular_ge1000",
+        "long_review_ge500",
+        "grocery_helpful",
+        "helpful_ge20",
+        "grocery_long500",
+    )
     rows: list[tuple[str, float, float, float, float, float]] = []
     for name in order:
         cell = cells.get(name)
@@ -68,9 +75,9 @@ def main() -> int:
         r"($k{=}10$, $\mathrm{ef}{=}100$, attributes SQL, q"
         + str(qn)
         + r").",
-        r"All fourteen atoms; SQL-first is exact with registered scalar",
-        r"indexes and no \hnsw. The four-atom q100 screen in",
-        r"Table~\ref{tab:eval-sql-first-q100} is unchanged.}",
+        r"Five representative selectivities plus the fourteen-atom geomean;",
+        r"SQL-first is exact with registered scalar indexes and no \hnsw.",
+        r"Table~\ref{tab:eval-sql-first-q100} is the four-atom q100 slice.}",
         r"\label{tab:eval-sql-first-14}",
         r"\scriptsize",
         r"\setlength{\tabcolsep}{2.6pt}",
@@ -80,6 +87,8 @@ def main() -> int:
         r"\midrule",
     ]
     for name, pct, stock, guide, first, ratio in rows:
+        if name not in compact:
+            continue
         lines.append(
             f"{LABELS.get(name, name.replace('_', r'_'))} & {pct:.1f}\\% & "
             f"{stock:.1f} & {guide:.1f} & {first:.1f} & {ratio:.2f}$\\times$ \\\\"
