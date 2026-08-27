@@ -12,6 +12,7 @@ import json
 import statistics
 import sys
 from pathlib import Path
+from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent))
@@ -34,7 +35,66 @@ def _workload() -> bench.WorkloadSpec:
     return fig5._workload("attributes", "none")
 
 
-def _summarize(rows: list[dict]) -> dict:
+def run_sql_first(
+    cur: Any,
+    workload: bench.WorkloadSpec,
+    spec: bench.FilterSpec,
+    query_ids: dict[int, int],
+    truth: dict[int, tuple[int, ...]],
+    as_of: int,
+    query_nos: list[int],
+) -> list[dict]:
+    """Materialize-then-rank SQL-first: exact SQL, no HNSW."""
+    import time
+
+    cur.execute("RESET ROLE")
+    bench.set_heap_competing_indexes_valid(cur, fig5.TABLE, valid=True)
+    bench.prepare_sql_first_session(
+        cur, fig5.PRINCIPAL, fig5.TABLE, fig5.SOURCE_INDEX, fig5.CLONE_INDEX
+    )
+    sql_text = bench.build_hybrid_sql(
+        fig5.TABLE, spec.predicate, workload=workload, exact=True
+    )
+    scalars = bench.collect_registered_scalar_indexes(cur)
+    first_id = query_ids[query_nos[0]]
+    params = {"query_id": first_id, "as_of": as_of, "k": K}
+    bench.set_as_of(cur, as_of)
+    plan, _ = bench.explain(
+        cur, sql_text, params, vector_index=fig5.SOURCE_INDEX, require_hnsw=False
+    )
+    bench.validate_sql_first_explain_gate(plan, scalars)
+    rows: list[dict] = []
+    for query_no in query_nos:
+        query_id = query_ids[query_no]
+        params = {"query_id": query_id, "as_of": as_of, "k": K}
+        error = ""
+        ids: list[int] = []
+        e2e_ms = 0.0
+        try:
+            started = time.perf_counter()
+            fetched = bench.query_results(cur, sql_text, params, exact=True)
+            e2e_ms = (time.perf_counter() - started) * 1000.0
+            ids = [row_id for row_id, _ in fetched]
+        except Exception as exc:  # noqa: BLE001
+            error = f"{exc.__class__.__name__}: {exc}"
+        rows.append(
+            {
+                "phase": "measurement",
+                "shape": workload.name,
+                "filter_name": spec.name,
+                "mode": bench.SQL_FIRST_MODE,
+                "query_no": query_no,
+                "query_id": query_id,
+                "ef_search": 0,
+                "e2e_ms": e2e_ms if not error else "",
+                "recall": fig5.recall_at_k(ids, truth[query_no], K) if not error else "",
+                "error": error,
+            }
+        )
+    return rows
+
+
+def _summarize(rows: list[dict], query_count: int) -> dict:
     summary = []
     for name in {str(row["filter_name"]) for row in rows}:
         cell = {"filter_name": name}
@@ -69,7 +129,7 @@ def _summarize(rows: list[dict]) -> dict:
     return {
         "paper_eligible": False,
         "plan_item": "B1",
-        "queries": QUERY_COUNT,
+        "queries": query_count,
         "query_offset": QUERY_OFFSET,
         "ef_search": EF_SEARCH,
         "k": K,
@@ -123,14 +183,8 @@ def main() -> int:
             embed_ids = [query_ids[query_no] for query_no in query_nos if query_no in query_ids]
             embeddings = bench.load_query_embeddings(cur, fig5.TABLE, embed_ids)
             print(json.dumps({"progress": "filter", "filter": name}), flush=True)
-            for mode in MODES:
-                bench.set_heap_competing_indexes_valid(
-                    cur, fig5.TABLE, valid=(mode == bench.SQL_FIRST_MODE)
-                )
-                if mode == bench.SQL_FIRST_MODE:
-                    bench.prepare_sql_first_session(
-                        cur, fig5.PRINCIPAL, fig5.TABLE, fig5.SOURCE_INDEX, fig5.CLONE_INDEX
-                    )
+            for mode in ("stock", "d1"):
+                bench.set_heap_competing_indexes_valid(cur, fig5.TABLE, valid=False)
                 rows = fig5.run_pg_shape(
                     cur,
                     workload,
@@ -150,6 +204,19 @@ def main() -> int:
                     json.dumps({"progress": "mode_done", "filter": name, "mode": mode, "n": len(rows)}),
                     flush=True,
                 )
+            rows = run_sql_first(cur, workload, spec, query_ids, truth, as_of, query_nos)
+            all_rows.extend(rows)
+            print(
+                json.dumps(
+                    {
+                        "progress": "mode_done",
+                        "filter": name,
+                        "mode": bench.SQL_FIRST_MODE,
+                        "n": len(rows),
+                    }
+                ),
+                flush=True,
+            )
 
     csv_path = args.out_dir / "screen.csv"
     if all_rows:
@@ -157,7 +224,7 @@ def main() -> int:
             writer = csv.DictWriter(handle, fieldnames=list(all_rows[0].keys()))
             writer.writeheader()
             writer.writerows(all_rows)
-    score = _summarize(all_rows)
+    score = _summarize(all_rows, int(args.query_count))
     (args.out_dir / "score.json").write_text(json.dumps(score, indent=2) + "\n", encoding="utf-8")
     (args.out_dir / "manifest.json").write_text(
         json.dumps({**contract, "paper_eligible": False, "rows": len(all_rows)}, indent=2) + "\n",

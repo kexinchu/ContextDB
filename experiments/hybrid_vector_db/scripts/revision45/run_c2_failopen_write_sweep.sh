@@ -19,7 +19,9 @@ container=${TABLE10_AMAZON_CONTAINER:-hybrid-pgvector-amazon-table10-r43}
 expected_build=sqlens-v17-predistance-promotion-20260806-r43
 expected_sha=2056a67b9b0012c401c6684d49915cbc31bc8fa770946dbfaddda9d779eecbf2
 readers=${C2_READERS:-16}
-update_rates=${C2_UPDATE_RATES:-0,10,25,50,100}
+update_rates=${C2_UPDATE_RATES:-0,10,25}
+requests=${C2_REQUESTS:-10000}
+repeats=${C2_REPEATS:-6}
 
 common=(
   --protocol p0_6_full
@@ -47,8 +49,8 @@ common=(
   --readers "$readers"
   --update-rates "$update_rates"
   --methods stock,sqlens_full
-  --requests 10000
-  --measurement-repeats 6
+  --requests "$requests"
+  --measurement-repeats "$repeats"
   --writer-clients 1
   --update-batch-size 1
   --update-id-pool-size 100000
@@ -57,7 +59,7 @@ common=(
 )
 
 if [[ ${1:-} != --execute ]]; then
-  echo "{\"dry_run\": true, \"plan_item\": \"C2\", \"paper_eligible\": false, \"readers\": \"$readers\", \"update_rates\": \"$update_rates\", \"fail_open_stale\": true}"
+  echo "{\"dry_run\": true, \"plan_item\": \"C2\", \"paper_eligible\": false, \"readers\": \"$readers\", \"update_rates\": \"$update_rates\", \"requests\": \"$requests\", \"repeats\": \"$repeats\", \"fail_open_stale\": true}"
   "$python" "$runner" "${common[@]}" --out "$out"
   exit 0
 fi
