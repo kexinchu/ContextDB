@@ -59,6 +59,13 @@ def main() -> int:
         row["filter_name"]: row["actual_pct"]
         for row in csv.DictReader(FILTERS.open(encoding="utf-8"))
     }
+    compact = (
+        "popular_ge1000",
+        "long_review_ge500",
+        "grocery_helpful",
+        "helpful_ge20",
+        "grocery_long500",
+    )
     cells = {cell["filter_name"]: cell for cell in score["cells"]}
     order = [name for name in sel if name in cells]
     rows: list[tuple] = []
@@ -88,9 +95,10 @@ def main() -> int:
         r"\centering",
         r"\caption{Stock, VisGuide, and in-engine \texttt{acorn1} after",
         r"independent Recall@10 LCB95 $\ge 0.90$ calibration",
-        r"($k{=}10$, attributes SQL, q50). Latencies are mean",
-        r"milliseconds. The 10{,}000-request headline is stock versus",
-        r"full \system.}",
+        r"($k{=}10$, attributes SQL, q50). Five representative",
+        r"selectivities plus the fourteen-atom geomean.",
+        r"This slice is VisGuide-only, not the 10{,}000-request",
+        r"full-\system headline.}",
         r"\label{tab:eval-acorn-matched}",
         r"\scriptsize",
         r"\setlength{\tabcolsep}{2.4pt}",
@@ -99,10 +107,11 @@ def main() -> int:
         r"Predicate & Sel. & Stock & Guide & ACORN & ACORN/guide & ACORN R \\",
         r"\midrule",
     ]
-    ratios: list[float] = []
+    ratios = [row[4] / row[3] for row in rows if row[3]]
     for name, pct, stock_ms, guide_ms, acorn_ms, _stock_r, acorn_r, *_efs, ok in rows:
+        if name not in compact:
+            continue
         ratio = acorn_ms / guide_ms if guide_ms else 0.0
-        ratios.append(ratio)
         mark = r"$^\dagger$" if not ok else ""
         lines.append(
             f"{LABELS.get(name, name.replace('_', r'_'))} & "

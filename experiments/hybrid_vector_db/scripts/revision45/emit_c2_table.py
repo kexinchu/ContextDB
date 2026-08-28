@@ -15,7 +15,7 @@ LABELS = {
     "helpful_ge20": r"helpful$\ge$20",
 }
 ORDER = ("popular_ge1000", "long_review_ge500", "helpful_ge20")
-RATES = (10.0, 25.0)
+RATES = (10.0, 25.0, 50.0)
 
 
 def _read_cells(cells_dir: Path) -> list[dict]:
@@ -31,7 +31,7 @@ def _read_cells(cells_dir: Path) -> list[dict]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cells", type=Path, required=True)
+    parser.add_argument("--cells", type=Path, nargs="+", required=True)
     parser.add_argument(
         "--out",
         type=Path,
@@ -39,7 +39,8 @@ def main() -> int:
     )
     args = parser.parse_args()
     grouped: dict[tuple[str, float, str], list[dict]] = defaultdict(list)
-    for row in _read_cells(args.cells):
+    for cells_dir in args.cells:
+        for row in _read_cells(cells_dir):
         if row.get("kind") != "read":
             continue
         grouped[
@@ -54,13 +55,14 @@ def main() -> int:
         r"\centering",
         r"\caption{Fail-open VisGuide on the source index, 16 readers, six",
         r"repeats of 10{,}000 requests. Delivery is committed writer TPS over",
-        r"the requested rate. Every 10 and 25~upd/s arm delivers 100\%.}",
+        r"the requested rate. 10 and 25~upd/s deliver 100\%;",
+        r"50~upd/s is a later envelope measurement.}",
         r"\label{tab:eval-failopen-write-sweep}",
         r"\scriptsize",
         r"\setlength{\tabcolsep}{3.2pt}",
-        r"\begin{tabular}{@{}lcc@{}}",
+        r"\begin{tabular}{@{}lccc@{}}",
         r"\toprule",
-        r"Predicate & 10~upd/s & 25~upd/s \\",
+        r"Predicate & 10~upd/s & 25~upd/s & 50~upd/s \\",
         r"\midrule",
     ]
     for filt in ORDER:
@@ -79,7 +81,7 @@ def main() -> int:
             else:
                 cells.append("---")
         lines.append(
-            f"{LABELS.get(filt, filt.replace('_', r'_'))} & {cells[0]} & {cells[1]} \\\\"
+            f"{LABELS.get(filt, filt.replace('_', r'_'))} & {cells[0]} & {cells[1]} & {cells[2]} \\\\"
         )
     lines.extend(
         [
