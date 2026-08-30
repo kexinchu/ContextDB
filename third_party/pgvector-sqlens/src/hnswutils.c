@@ -418,6 +418,17 @@ HnswGetEfConstruction(Relation index)
 }
 
 /*
+ * Whether the index was built with ACORN-1 level-0 construction.
+ */
+bool
+HnswGetAcornBuild(Relation index)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	return opts != NULL && opts->acorn;
+}
+
+/*
  * Get proc
  */
 FmgrInfo *
@@ -498,7 +509,7 @@ HnswInitNeighborArray(int lm, HnswAllocator * allocator)
  * Allocate neighbors
  */
 void
-HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * allocator)
+HnswInitNeighbors(char *base, HnswElement element, int m, bool acornBuild, HnswAllocator * allocator)
 {
 	int			level = element->level;
 	HnswNeighborArrayPtr *neighborList = (HnswNeighborArrayPtr *) HnswAlloc(allocator, sizeof(HnswNeighborArrayPtr) * (level + 1));
@@ -506,7 +517,7 @@ HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloca
 	HnswPtrStore(base, element->neighbors, neighborList);
 
 	for (int lc = 0; lc <= level; lc++)
-		HnswPtrStore(base, neighborList[lc], HnswInitNeighborArray(HnswGetLayerM(m, lc), allocator));
+		HnswPtrStore(base, neighborList[lc], HnswInitNeighborArray(HnswGetLayerM(m, lc, acornBuild), allocator));
 }
 
 /*
@@ -525,7 +536,7 @@ HnswAlloc(HnswAllocator * allocator, Size size)
  * Allocate an element
  */
 HnswElement
-HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel, HnswAllocator * allocator)
+HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel, bool acornBuild, HnswAllocator * allocator)
 {
 	HnswElement element = HnswAlloc(allocator, sizeof(HnswElementData));
 
@@ -543,7 +554,7 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 	/* Start at one to make it easier to find issues */
 	element->version = 1;
 
-	HnswInitNeighbors(base, element, m, allocator);
+	HnswInitNeighbors(base, element, m, acornBuild, allocator);
 
 	HnswPtrStore(base, element->value, (char *) NULL);
 
@@ -743,7 +754,7 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
  * Set neighbor tuple
  */
 void
-HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
+HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m, bool acornBuild)
 {
 	int			idx = 0;
 
@@ -752,7 +763,7 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
 	for (int lc = e->level; lc >= 0; lc--)
 	{
 		HnswNeighborArray *neighbors = HnswGetNeighbors(base, e, lc);
-		int			lm = HnswGetLayerM(m, lc);
+		int			lm = HnswGetLayerM(m, lc, acornBuild);
 
 		for (int i = 0; i < lm; i++)
 		{
@@ -1156,6 +1167,8 @@ HnswLoadNeighborTidsTracked(HnswElement element, ItemPointerData *indextids, Rel
 	Page		page;
 	HnswNeighborTuple ntup;
 	int			start;
+	bool		acornBuild = HnswGetAcornBuild(index);
+	int			expected = element->level * m + HnswGetLayerM(m, 0, acornBuild);
 
 	buf = HnswReadBufferTracked(index, element->neighborPage, profile);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -1167,7 +1180,7 @@ HnswLoadNeighborTidsTracked(HnswElement element, ItemPointerData *indextids, Rel
 	 * Ensure the neighbor tuple has not been deleted or replaced between
 	 * index scan iterations
 	 */
-	if (ntup->version != element->version || ntup->count != (element->level + 2) * m)
+	if (ntup->version != element->version || ntup->count != expected)
 	{
 		UnlockReleaseBuffer(buf);
 		return false;
@@ -1327,11 +1340,560 @@ HnswDualFrontierPop(HnswDualFrontier *frontier)
 		pairingheap_remove_first(frontier->noBridge));
 }
 
+#define HNSW_HYBRID_MAX_NEIGHBORS	(HNSW_MAX_M * 4)
+
+/*
+ * FAISS/hnswlib MinimaxHeap: ef-bounded candidate set with count_below termination.
+ */
+typedef struct HnswMinimaxHeap
+{
+	int			capacity;
+	int			size;
+	int			nvalid;
+	ItemPointerData *tids;
+	float	   *dists;
+	bool	   *valid;
+} HnswMinimaxHeap;
+
+static void
+HnswMinimaxHeapInit(HnswMinimaxHeap *heap, int capacity)
+{
+	heap->capacity = capacity;
+	heap->size = 0;
+	heap->nvalid = 0;
+	heap->tids = palloc(capacity * sizeof(ItemPointerData));
+	heap->dists = palloc(capacity * sizeof(float));
+	heap->valid = palloc(capacity * sizeof(bool));
+}
+
+static void
+HnswMinimaxHeapFree(HnswMinimaxHeap *heap)
+{
+	pfree(heap->tids);
+	pfree(heap->dists);
+	pfree(heap->valid);
+}
+
+static void
+HnswMinimaxHeapSiftUp(HnswMinimaxHeap *heap, int idx)
+{
+	while (idx > 0)
+	{
+		int			parent = (idx - 1) / 2;
+
+		if (heap->dists[parent] >= heap->dists[idx])
+			break;
+		{
+			float		td = heap->dists[parent];
+			ItemPointerData tt = heap->tids[parent];
+			bool		tv = heap->valid[parent];
+
+			heap->dists[parent] = heap->dists[idx];
+			heap->tids[parent] = heap->tids[idx];
+			heap->valid[parent] = heap->valid[idx];
+			heap->dists[idx] = td;
+			heap->tids[idx] = tt;
+			heap->valid[idx] = tv;
+		}
+		idx = parent;
+	}
+}
+
+static void
+HnswMinimaxHeapRemoveMax(HnswMinimaxHeap *heap)
+{
+	int			idx = 0;
+
+	if (heap->size <= 0)
+		return;
+	heap->size--;
+	heap->nvalid--;
+	if (heap->size == 0)
+		return;
+
+	heap->dists[0] = heap->dists[heap->size];
+	heap->tids[0] = heap->tids[heap->size];
+	heap->valid[0] = heap->valid[heap->size];
+	heap->valid[heap->size] = false;
+
+	while (true)
+	{
+		int			left = 2 * idx + 1;
+		int			right = left + 1;
+		int			largest = idx;
+
+		if (left < heap->size && heap->dists[left] > heap->dists[largest])
+			largest = left;
+		if (right < heap->size && heap->dists[right] > heap->dists[largest])
+			largest = right;
+		if (largest == idx)
+			break;
+		{
+			float		td = heap->dists[idx];
+			ItemPointerData tt = heap->tids[idx];
+			bool		tv = heap->valid[idx];
+
+			heap->dists[idx] = heap->dists[largest];
+			heap->tids[idx] = heap->tids[largest];
+			heap->valid[idx] = heap->valid[largest];
+			heap->dists[largest] = td;
+			heap->tids[largest] = tt;
+			heap->valid[largest] = tv;
+		}
+		idx = largest;
+	}
+}
+
+static void
+HnswMinimaxHeapPush(HnswMinimaxHeap *heap, ItemPointer tid, float dist)
+{
+	if (heap->size == heap->capacity)
+	{
+		if (dist >= heap->dists[0])
+			return;
+		HnswMinimaxHeapRemoveMax(heap);
+	}
+
+	heap->dists[heap->size] = dist;
+	heap->tids[heap->size] = *tid;
+	heap->valid[heap->size] = true;
+	heap->size++;
+	heap->nvalid++;
+	HnswMinimaxHeapSiftUp(heap, heap->size - 1);
+}
+
+static int
+HnswMinimaxHeapSize(HnswMinimaxHeap *heap)
+{
+	return heap->nvalid;
+}
+
+static bool
+HnswMinimaxHeapPopMin(HnswMinimaxHeap *heap, ItemPointer tid, float *dist_out)
+{
+	int			best = -1;
+	float		bestDist = 0.0f;
+
+	for (int i = 0; i < heap->size; i++)
+	{
+		if (!heap->valid[i])
+			continue;
+		if (best < 0 || heap->dists[i] < bestDist)
+		{
+			best = i;
+			bestDist = heap->dists[i];
+		}
+	}
+
+	if (best < 0)
+		return false;
+
+	if (dist_out != NULL)
+		*dist_out = bestDist;
+	*tid = heap->tids[best];
+	heap->valid[best] = false;
+	heap->nvalid--;
+	return true;
+}
+
+static int
+HnswMinimaxHeapCountBelow(HnswMinimaxHeap *heap, float thresh)
+{
+	int			below = 0;
+
+	for (int i = 0; i < heap->size; i++)
+	{
+		if (heap->valid[i] && heap->dists[i] < thresh)
+			below++;
+	}
+	return below;
+}
+
+static bool
+HnswHybridVisited(visited_hash * v, ItemPointer indextid)
+{
+	return tidhash_lookup(v->tids, *indextid) != NULL;
+}
+
+static bool
+HnswHybridMarkVisited(visited_hash * v, ItemPointer indextid)
+{
+	bool		found = false;
+
+	tidhash_insert(v->tids, *indextid, &found);
+	return !found;
+}
+
+static bool
+HnswHybridAdmitFiltered(char *base, HnswQuery * q, ItemPointer indextid, Relation index,
+						HnswSupport * support, HnswScanGuidance *guidance, visited_hash * v,
+						HnswMinimaxHeap *candidates, pairingheap *W, int *wlen, int ef,
+						HnswIndexPageProfileState *profile, int64 *distanceComputations,
+						HnswTraversalProfile *traversalProfile)
+{
+	HnswElement eElement = NULL;
+	double		eDistance;
+	HnswSearchCandidate *e;
+	BlockNumber blkno;
+	OffsetNumber offno;
+
+	if (HnswHybridVisited(v, indextid))
+		return false;
+
+	blkno = ItemPointerGetBlockNumber(indextid);
+	offno = ItemPointerGetOffsetNumber(indextid);
+	HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, false, NULL, &eElement, profile);
+	if (distanceComputations != NULL)
+		(*distanceComputations)++;
+
+	if (!HnswElementMatchesGuidance(eElement, guidance, traversalProfile, false))
+		return false;
+
+	if (!HnswHybridMarkVisited(v, indextid))
+		return false;
+
+	HnswMinimaxHeapPush(candidates, indextid, (float) eDistance);
+	e = HnswInitSearchCandidate(base, eElement, eDistance);
+	pairingheap_add(W, &e->w_node);
+	if (traversalProfile != NULL)
+	{
+		traversalProfile->candidateAdmissions++;
+		traversalProfile->resultAdmissions++;
+		traversalProfile->matchingExpanded++;
+	}
+	(*wlen)++;
+	if (*wlen > ef)
+	{
+		(void) HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+		if (traversalProfile != NULL)
+			traversalProfile->discardedPushes++;
+	}
+	return true;
+}
+
+static void
+HnswHybridExpandTwoHop(char *base, HnswQuery * q, ItemPointer bridgeTid, Relation index,
+					   HnswSupport * support, int m, int lm, bool acornBuild,
+					   HnswScanGuidance *guidance, visited_hash * v, HnswMinimaxHeap *candidates,
+					   pairingheap *W, int *wlen, int ef, int m2, int *numFound,
+					   bool *keepExpanding, HnswIndexPageProfileState *profile,
+					   int64 *distanceComputations, HnswTraversalProfile *traversalProfile,
+					   ItemPointerData *n2)
+{
+	HnswElement bridge = NULL;
+	BlockNumber blkno = ItemPointerGetBlockNumber(bridgeTid);
+	OffsetNumber offno = ItemPointerGetOffsetNumber(bridgeTid);
+	HnswElement eElement = NULL;
+	bool		matches;
+
+	HnswLoadElementImpl(blkno, offno, NULL, q, index, support, false, NULL, &bridge, profile);
+	if (bridge == NULL || !HnswLoadNeighborTids(bridge, n2, index, m, lm, 0))
+		return;
+
+	for (int k = 0; k < lm; k++)
+	{
+		if (!ItemPointerIsValid(&n2[k]))
+			break;
+
+		matches = false;
+		if (HnswHybridVisited(v, &n2[k]))
+		{
+			HnswLoadElementImpl(ItemPointerGetBlockNumber(&n2[k]),
+								ItemPointerGetOffsetNumber(&n2[k]),
+								NULL, q, index, support, false, NULL, &eElement, profile);
+			matches = HnswElementMatchesGuidance(eElement, guidance, traversalProfile, false);
+			if (matches)
+				(*numFound)++;
+			continue;
+		}
+
+		if (HnswHybridAdmitFiltered(base, q, &n2[k], index, support, guidance, v, candidates, W,
+									wlen, ef, profile, distanceComputations, traversalProfile))
+		{
+			(*numFound)++;
+			if (*numFound >= m2)
+			{
+				*keepExpanding = false;
+				if (traversalProfile != NULL)
+					traversalProfile->stockTerminations++;
+				return;
+			}
+		}
+	}
+}
+
+/*
+ * ACORN-1 hybrid greedy descent (FAISS/hnswlib gamma=1 upper-layer navigation).
+ */
+void
+HnswHybridGreedyUpdateNearest(char *base, HnswQuery * q, HnswElement * nearest, double *dNearest,
+							  int lc, Relation index, HnswSupport * support, int m, bool acornBuild,
+							  HnswScanGuidance *guidance, HnswIndexPageProfileState *profile,
+							  int64 *distanceComputations)
+{
+	int			lm = HnswGetLayerM(m, lc, acornBuild);
+	ItemPointerData *n1;
+	ItemPointerData *n2;
+	bool		nearestMatches;
+
+	n1 = palloc(lm * sizeof(ItemPointerData));
+	n2 = palloc(HnswGetLayerM(m, 0, acornBuild) * sizeof(ItemPointerData));
+
+	for (;;)
+	{
+		HnswElement prev = *nearest;
+		int			numFound = 0;
+
+		if (!HnswLoadNeighborTids(*nearest, n1, index, m, lm, lc))
+			break;
+
+		nearestMatches = HnswElementMatchesGuidance(*nearest, guidance, NULL, true);
+
+		for (int j = 0; j < lm; j++)
+		{
+			HnswElement vElement = NULL;
+			double		vDistance = 0.0;
+			BlockNumber blkno;
+			OffsetNumber offno;
+			bool		vMatches;
+
+			if (!ItemPointerIsValid(&n1[j]))
+				break;
+
+			blkno = ItemPointerGetBlockNumber(&n1[j]);
+			offno = ItemPointerGetOffsetNumber(&n1[j]);
+			HnswLoadElementImpl(blkno, offno, NULL, q, index, support, false, NULL,
+								&vElement, profile);
+			vMatches = HnswElementMatchesGuidance(vElement, guidance, NULL, true);
+
+			if (vMatches)
+			{
+				numFound++;
+				HnswLoadElementImpl(blkno, offno, &vDistance, q, index, support, false, NULL,
+									&vElement, profile);
+				if (distanceComputations != NULL)
+					(*distanceComputations)++;
+				if (vDistance < *dNearest || !nearestMatches)
+				{
+					*nearest = vElement;
+					*dNearest = vDistance;
+					nearestMatches = true;
+				}
+				if (numFound >= m)
+					break;
+			}
+
+			/* gamma=1: always expand 2-hop neighbors of each 1-hop node */
+			if (vElement != NULL && HnswLoadNeighborTids(vElement, n2, index, m, lm, lc))
+			{
+				for (int k = 0; k < lm; k++)
+				{
+					HnswElement v2Element = NULL;
+					double		v2Distance;
+					BlockNumber blkno2;
+					OffsetNumber offno2;
+
+					if (!ItemPointerIsValid(&n2[k]))
+						break;
+
+					blkno2 = ItemPointerGetBlockNumber(&n2[k]);
+					offno2 = ItemPointerGetOffsetNumber(&n2[k]);
+					HnswLoadElementImpl(blkno2, offno2, &v2Distance, q, index, support, false,
+										NULL, &v2Element, profile);
+					if (!HnswElementMatchesGuidance(v2Element, guidance, NULL, true))
+						continue;
+
+					numFound++;
+					if (distanceComputations != NULL)
+						(*distanceComputations)++;
+					if (v2Distance < *dNearest || !nearestMatches)
+					{
+						*nearest = v2Element;
+						*dNearest = v2Distance;
+						nearestMatches = true;
+					}
+					if (numFound >= m)
+						break;
+				}
+			}
+
+			if (numFound >= m)
+				break;
+		}
+
+		if (*nearest == prev)
+			break;
+	}
+}
+
+/*
+ * ACORN-1 hybrid level-0 search (FAISS/hnswlib gamma=1 with 2-hop expansion).
+ */
+List *
+HnswSearchHybridL0(char *base, HnswQuery * q, List *ep, int ef, Relation index,
+				   HnswSupport * support, int m, bool acornBuild, visited_hash * v,
+				   pairingheap **discarded, bool initVisited, int64 *tuples,
+				   int64 *distanceComputations, HnswTraversalProfile *traversalProfile,
+				   HnswScanGuidance *guidance, HnswIndexPageProfileState *indexPageProfile)
+{
+	List	   *w = NIL;
+	HnswMinimaxHeap candidates;
+	pairingheap *W;
+	int			wlen = 0;
+	visited_hash vh;
+	int			lm = HnswGetLayerM(m, 0, acornBuild);
+	int			mBeta = HnswAcornMBeta(m);
+	int			m2 = m * 2;
+	ItemPointerData *n1;
+	ItemPointerData *n2;
+	ListCell   *lc2;
+	bool		trackTraversal = traversalProfile != NULL;
+	int			gamma = 1;
+
+	n1 = palloc(lm * sizeof(ItemPointerData));
+	n2 = palloc(lm * sizeof(ItemPointerData));
+	HnswMinimaxHeapInit(&candidates, ef);
+	W = pairingheap_allocate(CompareFurthestCandidates, NULL);
+
+	if (v == NULL)
+	{
+		v = &vh;
+		initVisited = true;
+	}
+
+	if (initVisited)
+	{
+		InitVisited(base, v, false, ef, m);
+
+		if (discarded != NULL)
+			*discarded = pairingheap_allocate(CompareNearestDiscardedCandidates, NULL);
+	}
+
+	foreach(lc2, ep)
+	{
+		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc2);
+		HnswElement element = HnswPtrAccess(base, sc->element);
+		ItemPointerData indextid;
+
+		ItemPointerSet(&indextid, element->blkno, element->offno);
+		HnswHybridMarkVisited(v, &indextid);
+		HnswMinimaxHeapPush(&candidates, &indextid, (float) sc->distance);
+		pairingheap_add(W, &sc->w_node);
+		wlen++;
+		if (trackTraversal)
+			traversalProfile->candidateAdmissions++;
+	}
+
+	while (HnswMinimaxHeapSize(&candidates) > 0)
+	{
+		ItemPointerData cTid;
+		float		cDist;
+		HnswElement cElement = NULL;
+		BlockNumber cBlkno;
+		OffsetNumber cOffno;
+		int			numFound = 0;
+		bool		keepExpanding = true;
+		HnswElement hopElement = NULL;
+
+		if (!HnswMinimaxHeapPopMin(&candidates, &cTid, &cDist))
+			break;
+
+		if (HnswMinimaxHeapCountBelow(&candidates, cDist) >= ef)
+		{
+			if (trackTraversal)
+				traversalProfile->stockTerminations++;
+			break;
+		}
+
+		cBlkno = ItemPointerGetBlockNumber(&cTid);
+		cOffno = ItemPointerGetOffsetNumber(&cTid);
+		HnswLoadElementImpl(cBlkno, cOffno, NULL, q, index, support, false, NULL,
+							&cElement, indexPageProfile);
+		if (cElement == NULL)
+			continue;
+
+		if (trackTraversal)
+		{
+			traversalProfile->expandedNodes++;
+			if (HnswElementMatchesGuidance(cElement, guidance, NULL, true))
+				traversalProfile->matchingExpanded++;
+			else
+				traversalProfile->bridgeExpanded++;
+		}
+
+		HnswRecordIndexNeighborPage(indexPageProfile, cElement->neighborPage);
+		if (!HnswLoadNeighborTids(cElement, n1, index, m, lm, 0))
+			continue;
+
+		if (tuples != NULL)
+			(*tuples) += lm;
+		if (trackTraversal)
+			traversalProfile->neighborsExamined += lm;
+
+		for (int j = 0; j < lm; j++)
+		{
+			if (!ItemPointerIsValid(&n1[j]))
+				break;
+
+			matches = false;
+			if (HnswHybridVisited(v, &n1[j]))
+			{
+				HnswLoadElementImpl(ItemPointerGetBlockNumber(&n1[j]),
+									ItemPointerGetOffsetNumber(&n1[j]),
+									NULL, q, index, support, false, NULL,
+									&hopElement, indexPageProfile);
+				if (HnswElementMatchesGuidance(hopElement, guidance, traversalProfile, false))
+					numFound++;
+				continue;
+			}
+
+			if (HnswHybridAdmitFiltered(base, q, &n1[j], index, support, guidance, v, &candidates,
+										W, &wlen, ef, indexPageProfile, distanceComputations,
+										traversalProfile))
+			{
+				numFound++;
+				if (numFound >= m2)
+				{
+					keepExpanding = false;
+					if (trackTraversal)
+						traversalProfile->stockTerminations++;
+					break;
+				}
+			}
+
+			if ((j >= mBeta && keepExpanding) || gamma == 1)
+			{
+				HnswHybridExpandTwoHop(base, q, &n1[j], index, support, m, lm, acornBuild,
+									   guidance, v, &candidates, W, &wlen, ef, m2, &numFound,
+									   &keepExpanding, indexPageProfile, distanceComputations,
+									   traversalProfile, n2);
+				if (!keepExpanding)
+					break;
+			}
+		}
+	}
+
+	HnswMinimaxHeapFree(&candidates);
+
+	while (!pairingheap_is_empty(W))
+	{
+		HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+		w = lappend(w, sc);
+	}
+
+	if (trackTraversal)
+		traversalProfile->exhaustedTerminations++;
+
+	return w;
+}
+
 /*
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations, HnswTraversalProfile *traversalProfile, HnswScanGuidance *guidance, HnswTraversalGuidanceState *traversalGuidance, HnswIndexPageProfileState *indexPageProfile)
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations, HnswTraversalProfile *traversalProfile, HnswScanGuidance *guidance, HnswTraversalGuidanceState *traversalGuidance, HnswIndexPageProfileState *indexPageProfile, bool acornBuild)
 {
 	HnswSearchHeapCompareContext heapCompareContext = {base};
 	void	   *heapCompareArg = inserting && index == NULL &&
@@ -1349,7 +1911,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	ListCell   *lc2;
 	HnswNeighborArray *localNeighborhood = NULL;
 	Size		neighborhoodSize = 0;
-	int			lm = HnswGetLayerM(m, lc);
+	int			lm = HnswGetLayerM(m, lc, acornBuild);
 	HnswUnvisited *unvisited = NULL;
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
@@ -1545,6 +2107,28 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		}
 		else
 		{
+			if (inserting && lc == 0 && acornBuild)
+			{
+				if (wlen >= 2 * m)
+				{
+					if (trackTraversal)
+						traversalProfile->stockTerminations++;
+					terminationRecorded = true;
+					break;
+				}
+				if (f != NULL && !pairingheap_is_empty(C))
+				{
+					HnswSearchCandidate *peek = HnswGetSearchCandidate(c_node, pairingheap_first(C));
+
+					if (peek->distance > f->distance)
+					{
+						if (trackTraversal)
+							traversalProfile->stockTerminations++;
+						terminationRecorded = true;
+						break;
+					}
+				}
+			}
 			c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
 			if (f != NULL && wlen >= ef && c->distance > f->distance)
 			{
@@ -1612,6 +2196,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			traversalProfile->missBridgeEdges += unvisitedLength;
 		}
 
+		int			numIters = 0;
+
 		for (int i = 0; i < unvisitedLength; i++)
 		{
 			HnswElement eElement;
@@ -1621,6 +2207,13 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			bool		matchesGuidance = true;
 
 			CHECK_FOR_INTERRUPTS();
+
+			if (inserting && lc == 0 && acornBuild)
+			{
+				numIters++;
+				if (numIters > m)
+					break;
+			}
 
 			f = pairingheap_is_empty(W) ? NULL : HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
@@ -1746,6 +2339,13 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 							traversalProfile->discardedPushes++;
 					}
 				}
+			}
+
+			if (inserting && lc == 0 && acornBuild)
+			{
+				numIters++;
+				if (numIters > m)
+					break;
 			}
 		}
 	}
@@ -1940,6 +2540,72 @@ CheckElementCloser(char *base, HnswCandidate * e, List *r, HnswSupport * support
 }
 
 /*
+ * ACORN-1 level-0 neighbor shrink (ported from faiss/impl/ACORN.cpp).
+ */
+static List *
+SelectNeighborsAcorn(char *base, List *c, int maxSize, int mBeta, int m, HnswSupport *support)
+{
+	List	   *result = NIL;
+	HTAB	   *neighOfNeigh;
+	HASHCTL		ctl;
+	int			nodeNum = 0;
+
+	if (list_length(c) <= maxSize)
+		return list_copy(c);
+
+	if (base == NULL)
+		list_sort(c, CompareCandidateDistances);
+	else
+		list_sort(c, CompareCandidateDistancesOffset);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(HnswElement);
+	ctl.entrysize = sizeof(char);
+	ctl.hcxt = CurrentMemoryContext;
+	neighOfNeigh = hash_create("ACORN shrink neigh set", 256, &ctl, HASH_ELEM | HASH_BLOBS);
+
+	while (list_length(c) > 0)
+	{
+		HnswCandidate *v1 = (HnswCandidate *) llast(c);
+		HnswElement v1Element = HnswPtrAccess(base, v1->element);
+		bool		keep = true;
+
+		c = list_delete_last(c);
+		nodeNum++;
+
+		if (nodeNum > mBeta && hash_search(neighOfNeigh, &v1Element, HASH_FIND, NULL) != NULL)
+			keep = false;
+
+		if (!keep)
+			continue;
+
+		result = lappend(result, v1);
+		if (list_length(result) >= maxSize)
+			break;
+
+		hash_search(neighOfNeigh, &v1Element, HASH_ENTER, NULL);
+
+		if (nodeNum > mBeta)
+		{
+			HnswNeighborArray *nbrs = HnswGetNeighbors(base, v1Element, 0);
+
+			for (int j = 0; j < nbrs->length; j++)
+			{
+				HnswElement nbr = HnswPtrAccess(base, nbrs->items[j].element);
+
+				hash_search(neighOfNeigh, &nbr, HASH_ENTER, NULL);
+			}
+		}
+
+		if (hash_get_num_entries(neighOfNeigh) >= (unsigned) maxSize)
+			break;
+	}
+
+	hash_destroy(neighOfNeigh);
+	return result;
+}
+
+/*
  * Algorithm 4 from paper
  */
 static List *
@@ -2062,7 +2728,7 @@ AddConnections(char *base, HnswElement element, List *neighbors, int lc)
  * Update connections
  */
 void
-HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support)
+HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support, bool acornBuild, int layer)
 {
 	HnswCandidate newHc;
 
@@ -2088,6 +2754,34 @@ HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newE
 		for (int i = 0; i < neighbors->length; i++)
 			c = lappend(c, &neighbors->items[i]);
 		c = lappend(c, &newHc);
+
+		if (acornBuild && layer == 0)
+		{
+			int			m = index != NULL ? HnswGetM(index) : lm / 3;
+			List	   *picked = SelectNeighborsAcorn(base, c, lm, HnswAcornMBeta(m), m, support);
+			ListCell   *pick;
+			bool		keptNew = false;
+
+			neighbors->length = 0;
+			foreach(pick, picked)
+			{
+				HnswCandidate *hc = (HnswCandidate *) lfirst(pick);
+
+				neighbors->items[neighbors->length++] = *hc;
+				if (HnswPtrEqual(base, hc->element, newHc.element))
+					keptNew = true;
+			}
+			if (!keptNew)
+			{
+				if (neighbors->length >= lm)
+					neighbors->items[lm - 1] = newHc;
+				else
+					neighbors->items[neighbors->length++] = newHc;
+			}
+			if (updateIdx != NULL)
+				*updateIdx = -2;
+			return;
+		}
 
 		SelectNeighbors(base, c, lm, support, &neighbors->closerSet, &newHc, &pruned, true);
 
@@ -2177,7 +2871,7 @@ PrecomputeHash(char *base, HnswElement element)
  * Algorithm 1 from paper
  */
 void
-HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing)
+HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing, bool acornBuild)
 {
 	List	   *ep;
 	List	   *w;
@@ -2204,7 +2898,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL, NULL, NULL, NULL);
+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL, NULL, NULL, NULL, acornBuild);
 		ep = w;
 	}
 
@@ -2218,12 +2912,12 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	/* 2nd phase */
 	for (int lc = level; lc >= 0; lc--)
 	{
-		int			lm = HnswGetLayerM(m, lc);
+		int			lm = HnswGetLayerM(m, lc, acornBuild);
 		List	   *neighbors;
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL, NULL, NULL, NULL);
+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL, NULL, NULL, NULL, acornBuild);
 
 		/* Convert search candidates to candidates */
 		foreach(lc2, w)
@@ -2243,7 +2937,10 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 			lw = RemoveElements(base, lw, skipElement);
 
 		/* A seeded serial build uses heap TIDs to make every tie deterministic. */
-		neighbors = SelectNeighbors(base, lw, lm, support, &HnswGetNeighbors(base, element, lc)->closerSet, NULL, NULL, hnsw_build_seed >= 0);
+		if (acornBuild && lc == 0)
+			neighbors = SelectNeighborsAcorn(base, lw, lm, HnswAcornMBeta(m), m, support);
+		else
+			neighbors = SelectNeighbors(base, lw, lm, support, &HnswGetNeighbors(base, element, lc)->closerSet, NULL, NULL, hnsw_build_seed >= 0);
 
 		AddConnections(base, element, neighbors, lc);
 

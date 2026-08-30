@@ -101,6 +101,10 @@ RunScanItems(IndexScanDesc scan, Datum value)
 	char	   *base = NULL;
 	HnswQuery  *q = &so->q;
 
+	bool		acornBuild = HnswGetAcornBuild(index);
+	bool		useHybridL0 = hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 &&
+		HnswGuidanceIsActiveForScan(so->guidance);
+
 	/* Get m and entry point */
 	HnswGetMetaPageInfoTracked(index, &m, &entryPoint, &so->indexPageProfile);
 
@@ -114,17 +118,43 @@ RunScanItems(IndexScanDesc scan, Datum value)
 											 false, &so->indexPageProfile));
 	so->distanceComputations++;
 
-	for (int lc = entryPoint->level; lc >= 1; lc--)
+	if (useHybridL0)
 	{
-		instr_time start;
-		instr_time elapsed;
+		HnswSearchCandidate *entrySc = (HnswSearchCandidate *) linitial(ep);
+		HnswElement nearest = HnswPtrAccess(base, entrySc->element);
+		double		dNearest = entrySc->distance;
 
-		INSTR_TIME_SET_CURRENT(start);
-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, &so->distanceComputations, &so->traversal, so->guidance, &so->traversalGuidance, &so->indexPageProfile);
-		INSTR_TIME_SET_CURRENT(elapsed);
-		INSTR_TIME_SUBTRACT(elapsed, start);
-		so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
-		ep = w;
+		for (int lc = entryPoint->level; lc >= 1; lc--)
+		{
+			instr_time start;
+			instr_time elapsed;
+
+			INSTR_TIME_SET_CURRENT(start);
+			HnswHybridGreedyUpdateNearest(base, q, &nearest, &dNearest, lc, index, support,
+										  m, acornBuild, so->guidance, &so->indexPageProfile,
+										  &so->distanceComputations);
+			INSTR_TIME_SET_CURRENT(elapsed);
+			INSTR_TIME_SUBTRACT(elapsed, start);
+			so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
+		}
+
+		HnswPtrStore(base, entrySc->element, nearest);
+		entrySc->distance = dNearest;
+	}
+	else
+	{
+		for (int lc = entryPoint->level; lc >= 1; lc--)
+		{
+			instr_time start;
+			instr_time elapsed;
+
+			INSTR_TIME_SET_CURRENT(start);
+			w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, &so->distanceComputations, &so->traversal, so->guidance, &so->traversalGuidance, &so->indexPageProfile, acornBuild);
+			INSTR_TIME_SET_CURRENT(elapsed);
+			INSTR_TIME_SUBTRACT(elapsed, start);
+			so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
+			ep = w;
+		}
 	}
 
 	{
@@ -134,8 +164,15 @@ RunScanItems(IndexScanDesc scan, Datum value)
 
 		INSTR_TIME_SET_CURRENT(start);
 		so->traversal.initialBatches++;
-		next = HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v,
-									   HnswEffectiveIterativeScan(so) != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, &so->distanceComputations, &so->traversal, so->guidance, &so->traversalGuidance, &so->indexPageProfile);
+		if (useHybridL0)
+			next = HnswSearchHybridL0(base, q, ep, hnsw_ef_search, index, support, m, acornBuild,
+									  &so->v,
+									  HnswEffectiveIterativeScan(so) != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL,
+									  true, &so->tuples, &so->distanceComputations, &so->traversal,
+									  so->guidance, &so->indexPageProfile);
+		else
+			next = HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v,
+									   HnswEffectiveIterativeScan(so) != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, &so->distanceComputations, &so->traversal, so->guidance, &so->traversalGuidance, &so->indexPageProfile, acornBuild);
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, start);
 		so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);
@@ -178,7 +215,9 @@ HnswInitializeTraversalGuidance(HnswScanOpaque so)
 		hnsw_filter_strategy == HNSW_FILTER_STRATEGY_GUIDED_COLLECT)
 	{
 		state->finalPath = guidanceActive ?
-			HNSW_TRAVERSAL_PATH_LEGACY_GUIDED :
+			(hnsw_filter_strategy == HNSW_FILTER_STRATEGY_ACORN1 ?
+			 HNSW_TRAVERSAL_PATH_HYBRID_L0 :
+			 HNSW_TRAVERSAL_PATH_LEGACY_GUIDED) :
 			HNSW_TRAVERSAL_PATH_STOCK_BYPASS;
 		if (!guidanceActive)
 		{
@@ -400,7 +439,7 @@ ResumeScanItems(IndexScanDesc scan)
 		INSTR_TIME_SET_CURRENT(start);
 		so->traversal.resumeBatches++;
 		next = HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false,
-									  &so->tuples, &so->distanceComputations, &so->traversal, so->guidance, &so->traversalGuidance, &so->indexPageProfile);
+									  &so->tuples, &so->distanceComputations, &so->traversal, so->guidance, &so->traversalGuidance, &so->indexPageProfile, HnswGetAcornBuild(index));
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, start);
 		so->vectorSearchMs += INSTR_TIME_GET_MILLISEC(elapsed);

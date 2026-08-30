@@ -76,7 +76,7 @@ typedef Pointer Item;
 #define HNSW_INDEX_PAGE_UNIQUE_SLOTS (HNSW_INDEX_PAGE_UNIQUE_LIMIT * 2)
 
 #define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
-#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
+#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	HnswNeighborTupleSize((level), (m), false)
 
 #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
 
@@ -94,8 +94,26 @@ typedef Pointer Item;
 #define HnswIsElementTuple(tup) ((tup)->type == HNSW_ELEMENT_TUPLE_TYPE)
 #define HnswIsNeighborTuple(tup) ((tup)->type == HNSW_NEIGHBOR_TUPLE_TYPE)
 
-/* 2 * M connections for ground layer */
-#define HnswGetLayerM(m, layer) (layer == 0 ? (m) * 2 : (m))
+/* ACORN-1 level-0 slot count: M_beta + 1.5*M with M_beta = 2*M. */
+static inline int
+HnswAcornLayerM0(int m)
+{
+	return m * 2 + (m * 3 / 2);
+}
+
+static inline int
+HnswAcornMBeta(int m)
+{
+	return m * 2;
+}
+
+static inline int
+HnswGetLayerM(int m, int layer, bool acorn)
+{
+	if (layer == 0)
+		return acorn ? HnswAcornLayerM0(m) : m * 2;
+	return m;
+}
 
 /* Optimal ML from paper */
 #define HnswGetMl(m) (1 / log(m))
@@ -192,7 +210,8 @@ typedef enum HnswTraversalFinalPath
 	HNSW_TRAVERSAL_PATH_CANDIDATE_ADMISSION,
 	HNSW_TRAVERSAL_PATH_APPROXIMATE_PRIORITIZATION,
 	HNSW_TRAVERSAL_PATH_STOCK_BYPASS,
-	HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK
+	HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK,
+	HNSW_TRAVERSAL_PATH_HYBRID_L0
 } HnswTraversalFinalPath;
 
 typedef enum HnswTraversalStockBypassReason
@@ -554,6 +573,7 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+	bool		acorn;			/* ACORN-1 level-0 construction shrink */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -647,6 +667,7 @@ typedef struct HnswBuildState
 	int			dimensions;
 	int			m;
 	int			efConstruction;
+	bool		acornBuild;
 
 	/* Statistics */
 	double		indtuples;
@@ -719,6 +740,15 @@ typedef struct HnswNeighborTupleData
 }			HnswNeighborTupleData;
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
+
+static inline Size
+HnswNeighborTupleSize(int level, int m, bool acorn)
+{
+	int			l0slots = acorn ? HnswAcornLayerM0(m) : m * 2;
+
+	return MAXALIGN(offsetof(HnswNeighborTupleData, indextids) +
+				   (level * m + l0slots) * sizeof(ItemPointerData));
+}
 
 typedef union
 {
@@ -821,6 +851,7 @@ typedef struct HnswVacuumState
 /* Methods */
 int			HnswGetM(Relation index);
 int			HnswGetEfConstruction(Relation index);
+bool		HnswGetAcornBuild(Relation index);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
@@ -828,28 +859,30 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
-List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations, HnswTraversalProfile *traversalProfile, HnswScanGuidance *guidance, HnswTraversalGuidanceState *traversalGuidance, HnswIndexPageProfileState *indexPageProfile);
+List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations, HnswTraversalProfile *traversalProfile, HnswScanGuidance *guidance, HnswTraversalGuidanceState *traversalGuidance, HnswIndexPageProfileState *indexPageProfile, bool acornBuild);
+void		HnswHybridGreedyUpdateNearest(char *base, HnswQuery * q, HnswElement * nearest, double *dNearest, int lc, Relation index, HnswSupport * support, int m, bool acornBuild, HnswScanGuidance *guidance, HnswIndexPageProfileState *indexPageProfile, int64 *distanceComputations);
+List	   *HnswSearchHybridL0(char *base, HnswQuery * q, List *ep, int ef, Relation index, HnswSupport * support, int m, bool acornBuild, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, int64 *distanceComputations, HnswTraversalProfile *traversalProfile, HnswScanGuidance *guidance, HnswIndexPageProfileState *indexPageProfile);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void		HnswGetMetaPageInfoTracked(Relation index, int *m, HnswElement * entryPoint, HnswIndexPageProfileState *profile);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
-HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
+HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, bool acornBuild, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
-void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
+void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing, bool acornBuild);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec);
 HnswSearchCandidate *HnswEntryCandidateTracked(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, HnswIndexPageProfileState *profile);
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
-void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
+void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m, bool acornBuild);
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
 HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
-void		HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloc);
+void		HnswInitNeighbors(char *base, HnswElement element, int m, bool acornBuild, HnswAllocator * alloc);
 bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building);
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
 void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
-void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
+void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support, bool acornBuild, int layer);
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);

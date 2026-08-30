@@ -683,6 +683,8 @@ HnswTraversalFinalPathName(HnswTraversalFinalPath path)
 			return "stock_bypass";
 		case HNSW_TRAVERSAL_PATH_FRESH_STOCK_FALLBACK:
 			return "fresh_stock_fallback";
+		case HNSW_TRAVERSAL_PATH_HYBRID_L0:
+			return "hybrid_l0";
 	}
 	return "unknown";
 }
@@ -744,6 +746,8 @@ HnswTraversalGuidanceScopeName(HnswTraversalFinalPath path)
 		return "pre_heap_tid_validation";
 	if (path == HNSW_TRAVERSAL_PATH_LEGACY_GUIDED)
 		return "legacy_experimental_guidance";
+	if (path == HNSW_TRAVERSAL_PATH_HYBRID_L0)
+		return "hybrid_l0_two_hop_expansion";
 	return "none";
 }
 

@@ -392,6 +392,13 @@ MODE_SPECS = {
         False,
         "candidate_admission_and_validation_guidance",
     ),
+    "d1_d3": ModeSpec(
+        "source",
+        "safe_guided",
+        "adaptive",
+        True,
+        "workload_driven_adaptive_candidate_admission_and_validation_guidance_on_source",
+    ),
     "d1_d2": ModeSpec(
         "clone",
         "safe_guided",
@@ -2223,7 +2230,12 @@ def scan_profile_export(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 def configure_guidance(
-    cur: Any, mode: str, vector_index: str, atoms: Sequence[str]
+    cur: Any,
+    mode: str,
+    vector_index: str,
+    atoms: Sequence[str],
+    *,
+    guidance_kind: str | None = None,
 ) -> dict[str, Any]:
     if mode == SQL_FIRST_MODE:
         return {
@@ -2252,9 +2264,10 @@ def configure_guidance(
             "activation_ms": activation_ms,
         }
     cur.execute(f"SET hnsw.filter_strategy = {mode_spec.filter_strategy}")
+    kind = guidance_kind or mode_spec.guidance_kind
     cur.execute(
         "SELECT vector_hnsw_guidance_activate(%s::regclass, %s::text[], %s)",
-        (vector_index, list(atoms), mode_spec.guidance_kind),
+        (vector_index, list(atoms), kind),
     )
     row = cur.fetchone()
     activated_atoms = int(row[0]) if row and row[0] is not None else 0
