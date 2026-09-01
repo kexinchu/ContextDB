@@ -1,36 +1,36 @@
-# Hybrid Retrieval
+# SQLens
 
-This repository contains prototype code and experiment harnesses for
-SQL-native filtered vector search in PostgreSQL with pgvector. The main goal is
-to study how SQL predicate state, HNSW traversal, page locality, and reusable
-filter metadata interact in hybrid vector queries.
+Prototype code for SQL-native filtered vector search in PostgreSQL with
+pgvector. SQLens adds conservative predicate guidance at the HNSW candidate
+boundary, reusable heap-local fragments, and same-graph BFS packing. PostgreSQL
+still performs MVCC, residual SQL, and final validation.
 
-The repository does not include raw datasets, generated indexes, PostgreSQL
-data directories, or experiment outputs. Those files should be regenerated
-locally.
+This repository is the source snapshot referenced by the paper. It does not
+include raw datasets, generated HNSW indexes, PostgreSQL data directories, or
+the numeric artifacts behind the paper tables. Those must be rebuilt locally.
 
-## Repository Layout
+The evaluated paper binary is the r44 fork.
+
+## Layout
 
 | Path | Contents |
 |---|---|
-| `docs/` | Project notes, related work, and experiment summaries |
-| `experiments/hybrid_vector_db/scripts/` | Data preparation, benchmark, and result-summary scripts |
-| `experiments/hybrid_vector_db/sql/` | SQL schemas and smoke-test queries |
-| `experiments/hybrid_vector_db/pg_ext/` | Small PostgreSQL helper extension used for profiling |
-| `third_party/pgvector-sqlens/` | Vendored pgvector source with SQLens instrumentation and HNSW changes |
-| `patches/pgvector-sqlens.patch` | Audit patch against upstream pgvector commit `cab9da72c04353f143bb06b42ab70a403daac64a` |
+| `third_party/pgvector-sqlens-r44/` | **Default / paper binary.** pgvector 0.8.2 with SQLens (r44) |
+| `third_party/pgvector-sqlens/` | Earlier SQLens tree kept for comparison |
+| `third_party/hnswlib/` | In-memory HNSW / ACORN diagnostic sources |
+| `patches/` | Audit patches against upstream pgvector |
+| `experiments/hybrid_vector_db/` | Benchmark scripts, SQL smoke tests, and pytest suite |
+| `docs/` | Artifact notes |
 
 ## Dependencies
-
-Install Python dependencies:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-The PostgreSQL scripts read connection settings from standard environment
-variables:
+PostgreSQL 16.14 is the evaluated server. Connection settings use the usual
+environment variables (the local Docker default password is `postgres`):
 
 ```bash
 export PGHOST=127.0.0.1
@@ -40,49 +40,44 @@ export PGUSER=postgres
 export PGPASSWORD=postgres
 ```
 
-Dataset locations can be configured with:
+Dataset roots, if you rebuild the paper workloads:
 
 ```bash
 export OOD_ANNS_DATA=/path/to/ood-anns/data
 export LAION25M_DATA_DIR=/path/to/LAION25M
-export LAION10M_DATA_DIR=/path/to/LAION10M
 export YFCC10M_DATA_DIR=/path/to/YFCC10M
 ```
 
-## pgvector Source
-
-Build and install the vendored SQLens pgvector source:
+## Build the paper binary (r44)
 
 ```bash
-cd third_party/pgvector-sqlens
+cd third_party/pgvector-sqlens-r44
 make
 make install
 ```
 
-Restart PostgreSQL after replacing `vector.so`, then verify that the server is
-using the expected SQLens build:
+Restart PostgreSQL after replacing `vector.so`, then check the build id:
 
 ```sql
 SELECT vector_sqlens_build_id();
 ```
 
-Run the Python regression suite from the repository root:
+The audit patch in `patches/pgvector-sqlens.patch` is against upstream
+pgvector commit `cab9da72c04353f143bb06b42ab70a403daac64a`.
+
+## Tests that run without the paper datasets
 
 ```bash
 .venv/bin/python -m pytest -q experiments/hybrid_vector_db/tests
 ```
 
-The SQL smoke tests in `experiments/hybrid_vector_db/sql/pgvector_*_smoke.sql`
-cover candidate-admission safety, MVCC/epoch invalidation, HOT updates,
-same-graph physical layout, build guards, and adaptive fragment reuse.
+SQL smoke tests under `experiments/hybrid_vector_db/sql/` cover candidate
+admission, MVCC/epoch invalidation, HOT updates, same-graph layout, and
+fragment reuse.
 
-The patch in `patches/pgvector-sqlens.patch` is kept for auditability. It shows
-the SQLens changes relative to upstream pgvector commit
-`cab9da72c04353f143bb06b42ab70a403daac64a`.
+## What this snapshot is not
 
-## Reproducibility Notes
-
-- Generated data and results are intentionally ignored by Git.
-- Exact result filenames and experiment status are tracked in `docs/`.
-- The benchmark scripts preserve PostgreSQL final validation semantics; cached
-  or guided metadata is used only to reduce work before final SQL/MVCC checks.
+It is not a one-command reproduction of the paper's 10M/25M tables. Amazon
+Reviews, YFCC, and LAION embeddings, index builds, and overnight benchmark
+scripts are environment-specific. Use the pytest suite and SQL smoke tests to
+inspect safety and the access-method contract.

@@ -40,7 +40,6 @@ results/
 research/results/
 research/
 *.csv
-!paper/scripts/motivation_data/*.csv
 !experiments/hybrid_vector_db/configs/*.csv
 *.png
 *.pdf
