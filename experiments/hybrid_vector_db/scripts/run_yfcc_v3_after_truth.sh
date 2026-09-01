@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/home/kec23008/Hybrid-Retrieval
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 WDIR="$ROOT/results/hybrid_vector_db/figure5_r41_yfcc_v3filters_workloads"
 TRUTH="$WDIR/figure5_r41_yfcc_v3_exact_truth_q12800.csv"
 TRUTH_MANIFEST="$WDIR/figure5_r41_yfcc_v3_exact_truth_q12800_manifest.json"

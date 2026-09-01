@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Side copy for FragReuse r44. Port 55439. Does not touch 55437.
 set -euo pipefail
-repo=/home/kec23008/Hybrid-Retrieval
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 so=$repo/results/hybrid_vector_db/release_binaries/r44/vector.so
 src=$repo/third_party/pgvector-sqlens-r44
 container=sqlens-r44-dev
@@ -13,7 +13,7 @@ docker run -d \
   --name "$container" \
   -p 55439:5432 \
   -v "$so:/usr/lib/postgresql/16/lib/vector.so:ro" \
-  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_PASSWORD="${PGPASSWORD:?set PGPASSWORD}" \
   -e POSTGRES_DB=hybrid_vector \
   "$image" >/dev/null
 for _ in $(seq 1 60); do

@@ -20,7 +20,7 @@ import math
 import re
 from pathlib import Path
 
-ROOT = Path("/home/kec23008/Hybrid-Retrieval")
+ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DIRS = [
     ROOT / "results/hybrid_vector_db/figure5_r41_yfcc_v3_matched_iso/stock",
     ROOT / "results/hybrid_vector_db/figure5_r41_yfcc_v3_matched_iso/sqlens",

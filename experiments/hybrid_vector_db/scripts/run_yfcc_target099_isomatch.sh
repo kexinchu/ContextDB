@@ -6,7 +6,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${repo_root}"
 
-python_bin="${PYTHON:-/home/kec23008/miniconda3/bin/python}"
+python_bin="${PYTHON:-python3}"
 out_dir="${OUT_DIR:-results/hybrid_vector_db/table6_r41_yfcc_target099_isomatch}"
 bypass_ef="${BYPASS_EF:-10000}"
 run_tag="${RUN_TAG:-bypass${bypass_ef}_ef1000_t200}"
@@ -17,7 +17,7 @@ export PGHOST=127.0.0.1
 export PGPORT=55432
 export PGDATABASE=hybrid_vector
 export PGUSER=postgres
-export PGPASSWORD=postgres
+: "${PGPASSWORD:?set PGPASSWORD}"
 export PYTHONUNBUFFERED=1
 
 stock_source="results/hybrid_vector_db/table6_r41_yfcc_target099/yfcc_target099_paired_q10k.csv"

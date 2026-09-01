@@ -7,7 +7,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../../../.." && pwd)
 shared_root="${TABLE10_SHARED_ROOT:-$repo_root}"
 results="$shared_root/results/hybrid_vector_db"
-python=${TABLE10_PYTHON:-/home/kec23008/miniconda3/bin/python3}
+python=${TABLE10_PYTHON:-python3}
 lock_path="$results/.pg55440_experiment.lock"
 out_dir="$results/revision45/q3_full_vs_acorn"
 
@@ -23,7 +23,7 @@ export PGHOST=127.0.0.1
 export PGPORT=55440
 export PGDATABASE=hybrid_vector
 export PGUSER=postgres
-export PGPASSWORD=postgres
+: "${PGPASSWORD:?set PGPASSWORD}"
 export PYTHONPATH="$(dirname -- "$script_dir")${PYTHONPATH:+:$PYTHONPATH}"
 
 exec 9>>"$lock_path"

@@ -6,11 +6,11 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../../../.." && pwd)
 results="$repo_root/results/hybrid_vector_db"
-python=${TABLE10_PYTHON:-/home/kec23008/miniconda3/bin/python3}
+python=${TABLE10_PYTHON:-python3}
 lock_path="$results/.pg55437_experiment.lock"
 container=${TABLE10_AMAZON_CONTAINER:-hybrid-pgvector-amazon-table10-r43}
 image=${TABLE10_IMAGE:-pgvector/pgvector:pg16}
-pgdata=${TABLE10_PGDATA:-/mnt/nvme-pg/home/kec23008/pgdata-amazon-table10-r43}
+pgdata=${TABLE10_PGDATA:?set TABLE10_PGDATA}
 vector_so=${TABLE10_VECTOR_SO:-$results/release_binaries/r43/vector.so}
 expected_sha=2056a67b9b0012c401c6684d49915cbc31bc8fa770946dbfaddda9d779eecbf2
 expected_build=sqlens-v17-predistance-promotion-20260806-r43
@@ -25,7 +25,7 @@ fi
 
 mkdir -p "$out_root"
 export PYTHONUNBUFFERED=1 PGHOST=127.0.0.1 PGPORT=55437 PGDATABASE=hybrid_vector
-export PGUSER=postgres PGPASSWORD=postgres
+: "${PGUSER:?set PGUSER}" "${PGPASSWORD:?set PGPASSWORD}"
 export PYTHONPATH="$(dirname -- "$script_dir")${PYTHONPATH:+:$PYTHONPATH}"
 
 wait_ready() {
@@ -69,7 +69,7 @@ recreate() {
     -p 55437:5432 \
     -v "$pgdata:/var/lib/postgresql/data" \
     -v "$vector_so:/usr/lib/postgresql/16/lib/vector.so:ro" \
-    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_PASSWORD="${PGPASSWORD:?set PGPASSWORD}" \
     -e POSTGRES_DB=hybrid_vector \
     "$image" \
     -c max_worker_processes=32 \

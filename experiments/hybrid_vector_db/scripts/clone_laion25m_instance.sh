@@ -61,7 +61,7 @@ if (( container_exists == 0 )); then
     --shm-size "$SHM_SIZE" \
     -p "$HOST_PORT:5432" \
     -v "$PGDATA_DIR:/var/lib/postgresql/data" \
-    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_PASSWORD="${PGPASSWORD:?set PGPASSWORD}" \
     -e POSTGRES_DB="$DATABASE" \
     "$IMAGE" \
     -c max_worker_processes=32 \
@@ -165,7 +165,7 @@ SQL
 echo "building_same_graph_bfs_clone:$(date -Is)" >"$STATUS"
 rm -f "$PROOF"
 PGHOST=127.0.0.1 PGPORT="$HOST_PORT" PGDATABASE="$DATABASE" \
-PGUSER=postgres PGPASSWORD=postgres \
+PGUSER=postgres PGPASSWORD="${PGPASSWORD:?set PGPASSWORD}" \
   "${python_bin}" \
   "${repo_root}/experiments/hybrid_vector_db/scripts/prepare_pgvector_same_graph_bfs_clone.py" \
   --table public.laion25m_pgvector \

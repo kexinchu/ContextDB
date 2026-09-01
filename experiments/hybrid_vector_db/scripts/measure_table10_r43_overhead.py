@@ -225,6 +225,8 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
             "details": details,
         }
 
+    if (args.measure_memory or args.measure_storage) and not args.pgpassword:
+        raise SystemExit("set PGPASSWORD or --pgpassword")
     if args.measure_memory:
         by_cost["resident_guidance_reuse_memory"] = measure_memory(args)
     if args.measure_storage:
@@ -269,7 +271,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pgport", type=int, default=int(os.environ.get("PGPORT", "55437")))
     parser.add_argument("--pgdatabase", default=os.environ.get("PGDATABASE", "hybrid_vector"))
     parser.add_argument("--pguser", default=os.environ.get("PGUSER", "postgres"))
-    parser.add_argument("--pgpassword", default=os.environ.get("PGPASSWORD", "postgres"))
+    parser.add_argument("--pgpassword", default=os.environ.get("PGPASSWORD"))
     parser.add_argument(
         "--stock-relation",
         default="public.amazon10m_hnsw_m32ef200_dupbridge_r29_source_idx",

@@ -6,10 +6,10 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../../.." && pwd)
-shared_root="${TABLE10_SHARED_ROOT:-/home/kec23008/Hybrid-Retrieval}"
+shared_root="${TABLE10_SHARED_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 results="$shared_root/results/hybrid_vector_db"
 container=${TABLE10_AMAZON_CONTAINER:-hybrid-pgvector-amazon-table10-r43}
-python=${TABLE10_PYTHON:-/home/kec23008/miniconda3/bin/python3}
+python=${TABLE10_PYTHON:-python3}
 lock_path="$results/.pg55437_experiment.lock"
 runner="$repo_root/experiments/hybrid_vector_db/scripts/pgvector_update_concurrency_benchmark.py"
 selector_root="$results/table10_r43/selector_formal"
@@ -67,7 +67,7 @@ flock "$lock_path" env \
     PGPORT=55437 \
     PGDATABASE=hybrid_vector \
     PGUSER=postgres \
-    PGPASSWORD=postgres \
+    PGPASSWORD="${PGPASSWORD:?set PGPASSWORD}" \
     "$python" "$runner" \
     --protocol p0_6_full \
     --paper-table-slice \
@@ -103,7 +103,7 @@ flock "$lock_path" env \
     --client-cpu-list "${TABLE10_CLIENT_CPU:-16-47}" \
     --start-barrier-timeout-seconds "${TABLE10_BARRIER_TIMEOUT:-600}" \
     --backend-proc-root "$backend_proc_root" \
-    --telemetry-path /mnt/nvme-pg/home/kec23008/pgdata-amazon-table10-r43 \
+    --telemetry-path "${TABLE10_PGDATA:?set TABLE10_PGDATA}" \
     --expected-runner-sha256 "$runner_sha" \
     --expected-git-revision "$git_revision" \
     --out "$out" \

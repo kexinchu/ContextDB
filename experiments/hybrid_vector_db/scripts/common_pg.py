@@ -21,12 +21,15 @@ class PgConfig:
 
 
 def pg_config_from_env() -> PgConfig:
+    password = os.environ.get("PGPASSWORD")
+    if not password:
+        raise SystemExit("set PGPASSWORD")
     return PgConfig(
         host=os.environ.get("PGHOST", "127.0.0.1"),
         port=int(os.environ.get("PGPORT", "55432")),
         dbname=os.environ.get("PGDATABASE", "hybrid_vector"),
         user=os.environ.get("PGUSER", "postgres"),
-        password=os.environ.get("PGPASSWORD", "postgres"),
+        password=password,
     )
 
 

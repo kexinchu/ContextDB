@@ -9,7 +9,7 @@ dataset=${1:?usage: run_target090_q5k_matched_qps.sh amazon|yfcc}
 case "$dataset" in
   amazon)
     export PGHOST=127.0.0.1 PGPORT=55433 PGDATABASE=hybrid_vector
-    export PGUSER=postgres PGPASSWORD=postgres
+    : "${PGUSER:?set PGUSER}" "${PGPASSWORD:?set PGPASSWORD}"
     workload_manifest=results/hybrid_vector_db/table6_r41_target090_q5k_workloads/amazon_target090_q5k_manifest.json
     workload_limit=0
     backend_cpus=0-31
@@ -18,7 +18,7 @@ case "$dataset" in
     ;;
   yfcc)
     export PGHOST=127.0.0.1 PGPORT=55432 PGDATABASE=hybrid_vector
-    export PGUSER=postgres PGPASSWORD=postgres
+    : "${PGUSER:?set PGUSER}" "${PGPASSWORD:?set PGPASSWORD}"
     workload_manifest=results/hybrid_vector_db/figure5_r37_formal_workloads/figure5_r37_yfcc_manifest.json
     workload_limit=5000
     backend_cpus=48-63

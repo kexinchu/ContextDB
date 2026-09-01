@@ -10,7 +10,7 @@ export PGHOST=127.0.0.1
 export PGPORT=55432
 export PGDATABASE=hybrid_vector
 export PGUSER=postgres
-export PGPASSWORD=postgres
+: "${PGPASSWORD:?set PGPASSWORD}"
 export PYTHONUNBUFFERED=1
 
 out_dir="${OUT_DIR:-results/hybrid_vector_db/table6_r41_laion_target099_per_filter_qps_q5k}"

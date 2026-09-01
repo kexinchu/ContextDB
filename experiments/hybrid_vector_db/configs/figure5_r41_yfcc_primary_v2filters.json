@@ -68,10 +68,10 @@
       "truth_self_excluded": false,
       "filters_csv": "results/hybrid_vector_db/yfcc10m_figure5_v2_filters_diverse_sel.csv",
       "query_cohort_csv": "results/hybrid_vector_db/figure5_r35_yfcc_query_cohort_q10200.csv",
-      "truth_csv": "/home/kec23008/Hybrid-Retrieval/results/hybrid_vector_db/figure5_r41_yfcc_v2filters_workloads/figure5_r41_yfcc_v2_exact_truth_q12800.csv",
-      "calibration_workload_csv": "/home/kec23008/Hybrid-Retrieval/results/hybrid_vector_db/figure5_r41_yfcc_v2filters_workloads/figure5_r41_yfcc_v2_calibration.csv",
-      "measurement_workload_csv": "/home/kec23008/Hybrid-Retrieval/results/hybrid_vector_db/figure5_r41_yfcc_v2filters_workloads/figure5_r41_yfcc_v2_measurement.csv",
-      "workload_manifest_json": "/home/kec23008/Hybrid-Retrieval/results/hybrid_vector_db/figure5_r41_yfcc_v2filters_workloads/figure5_r41_yfcc_v2_manifest.json",
+      "truth_csv": "results/hybrid_vector_db/figure5_r41_yfcc_v2filters_workloads/figure5_r41_yfcc_v2_exact_truth_q12800.csv",
+      "calibration_workload_csv": "results/hybrid_vector_db/figure5_r41_yfcc_v2filters_workloads/figure5_r41_yfcc_v2_calibration.csv",
+      "measurement_workload_csv": "results/hybrid_vector_db/figure5_r41_yfcc_v2filters_workloads/figure5_r41_yfcc_v2_measurement.csv",
+      "workload_manifest_json": "results/hybrid_vector_db/figure5_r41_yfcc_v2filters_workloads/figure5_r41_yfcc_v2_manifest.json",
       "d2_graph_proof_json": "results/hybrid_vector_db/yfcc10m_r31_table6_shared_d2_warm_q100r5_20260723.csv.d2_graph_proof.json"
     }
   }

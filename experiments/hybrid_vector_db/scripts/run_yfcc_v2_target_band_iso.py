@@ -23,7 +23,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-ROOT = Path("/home/kec23008/Hybrid-Retrieval")
+ROOT = Path(__file__).resolve().parents[3]
 CFG = ROOT / "experiments/hybrid_vector_db/configs/figure5_r41_yfcc_primary_v2filters.json"
 OUT = ROOT / "results/hybrid_vector_db/figure5_r41_yfcc_v2_target_band"
 PLOT = ROOT / "results/hybrid_vector_db/yfcc10m_v2_target_band_iso"

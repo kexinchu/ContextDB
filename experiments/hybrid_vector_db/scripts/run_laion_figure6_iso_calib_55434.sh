@@ -3,8 +3,8 @@
 # CPU 32-47 (primary YFCC uses 48-63; Amazon secondary uses 0-31).
 set -euo pipefail
 
-ROOT=/home/kec23008/Hybrid-Retrieval
-WORKDIR=/mnt/nvme-pg/home/kec23008/pg-amazon-frontier
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+WORKDIR="${WORKDIR:?set WORKDIR}"
 OUT=$ROOT/results/hybrid_vector_db/figure5_r41_laion_iso_calib
 STATUS=$ROOT/results/hybrid_vector_db/figure6_iso_recall_fill/laion_pipeline.status
 TS=$(date +%Y%m%d_%H%M%S)
@@ -21,7 +21,7 @@ export PGHOST=127.0.0.1
 export PGPORT=55434
 export PGDATABASE=hybrid_vector
 export PGUSER=postgres
-export PGPASSWORD=postgres
+: "${PGPASSWORD:?set PGPASSWORD}"
 export PYTHONUNBUFFERED=1
 
 exec > >(tee -a "$LOG") 2>&1
@@ -113,7 +113,7 @@ import csv, re, math
 from pathlib import Path
 from collections import defaultdict
 
-ROOT = Path("/home/kec23008/Hybrid-Retrieval")
+ROOT = Path(".")
 targets = [0.75, 0.80, 0.85, 0.90, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99]
 dirs = sorted(ROOT.glob("results/hybrid_vector_db/figure5_r41_laion_iso_calib*"))
 MODE_S, MODE_Q = "original", "design1_bloom_bfs_layout_d3"

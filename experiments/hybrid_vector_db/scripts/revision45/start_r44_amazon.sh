@@ -2,10 +2,10 @@
 # Amazon-10M replica for FragReuse r44. Port 55440. Does not touch 55437.
 set -euo pipefail
 
-repo=/home/kec23008/Hybrid-Retrieval
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 container=${R44_AMAZON_CONTAINER:-sqlens-r44-amazon}
 image=${TABLE10_IMAGE:-pgvector/pgvector:pg16}
-pgdata=${R44_PGDATA:-/mnt/nvme-pg/home/kec23008/pgdata-amazon-table10-r44}
+pgdata=${R44_PGDATA:?set R44_PGDATA}
 so=${R44_VECTOR_SO:-$repo/results/hybrid_vector_db/release_binaries/r44/vector.so}
 src=$repo/third_party/pgvector-sqlens-r44
 host_port=${R44_HOST_PORT:-55440}
@@ -57,7 +57,7 @@ else
     -p "$host_port:5432" \
     -v "$pgdata:/var/lib/postgresql/data" \
     -v "$so:/usr/lib/postgresql/16/lib/vector.so:ro" \
-    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_PASSWORD="${PGPASSWORD:?set PGPASSWORD}" \
     -e POSTGRES_DB=hybrid_vector \
     "$image" \
     -c max_worker_processes=32 \

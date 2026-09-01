@@ -55,7 +55,7 @@ export PGHOST=127.0.0.1
 export PGPORT=55432
 export PGDATABASE=hybrid_vector
 export PGUSER=postgres
-export PGPASSWORD=postgres
+: "${PGPASSWORD:?set PGPASSWORD}"
 export PYTHONUNBUFFERED=1
 
 for filter_name in "${filters[@]}"; do

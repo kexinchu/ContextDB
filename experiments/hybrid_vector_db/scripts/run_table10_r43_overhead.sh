@@ -5,9 +5,9 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../../.." && pwd)
-shared_root="${TABLE10_SHARED_ROOT:-/home/kec23008/Hybrid-Retrieval}"
+shared_root="${TABLE10_SHARED_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 results="$shared_root/results/hybrid_vector_db/table10_r43"
-python=${TABLE10_PYTHON:-/home/kec23008/miniconda3/bin/python3}
+python=${TABLE10_PYTHON:-python3}
 out_json="$results/overhead/table10_r43_overhead.json"
 lifecycle_csv="${TABLE10_LIFECYCLE_CSV:-$results/concurrency/table10_r43_amazon_concurrency_lifecycle.csv}"
 build_proof="${TABLE10_BUILD_PROOF_JSON:-}"
@@ -42,6 +42,7 @@ if [[ "${MARK_PAPER_ELIGIBLE:-0}" == "1" ]]; then
   args+=(--mark-paper-eligible)
 fi
 
-export PGHOST=127.0.0.1 PGPORT=55437 PGDATABASE=hybrid_vector PGUSER=postgres PGPASSWORD=postgres
+export PGHOST="${PGHOST:-127.0.0.1}" PGPORT="${PGPORT:-55437}" PGDATABASE="${PGDATABASE:-hybrid_vector}"
+: "${PGUSER:?set PGUSER}" "${PGPASSWORD:?set PGPASSWORD}"
 echo "[table10-overhead] execute -> $out_json"
 "${args[@]}"

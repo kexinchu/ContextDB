@@ -2,7 +2,7 @@
 # YFCC v4 (0.5–8% filters): wait for exact truth + primary DB, then matched-iso.
 set -euo pipefail
 
-ROOT=/home/kec23008/Hybrid-Retrieval
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 WDIR="$ROOT/results/hybrid_vector_db/figure5_r41_yfcc_v4filters_workloads"
 TRUTH="$WDIR/figure5_r41_yfcc_v4_exact_truth_q12800.csv"
 TRUTH_MANIFEST="$WDIR/figure5_r41_yfcc_v4_exact_truth_q12800_manifest.json"
@@ -10,7 +10,7 @@ CFG="$ROOT/experiments/hybrid_vector_db/configs/figure5_r41_yfcc_primary_v4filte
 OUT="$ROOT/results/hybrid_vector_db/figure5_r41_yfcc_v4_matched_iso"
 PLOT="$ROOT/results/hybrid_vector_db/yfcc10m_v4_matched_iso"
 WARM="$ROOT/results/hybrid_vector_db/yfcc10m_v4_matched_iso_warm"
-LOGDIR=/mnt/nvme-pg/home/kec23008/pg-amazon-frontier/logs
+LOGDIR="${WORKDIR:?set WORKDIR}/logs"
 STATUS="$OUT/pipeline.status.json"
 mkdir -p "$OUT" "$PLOT" "$WARM" "$LOGDIR"
 

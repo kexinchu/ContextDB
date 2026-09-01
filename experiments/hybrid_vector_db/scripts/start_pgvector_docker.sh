@@ -3,7 +3,7 @@ set -euo pipefail
 
 CONTAINER_NAME="${PGVECTOR_CONTAINER:-hybrid-pgvector}"
 PGPORT="${PGPORT:-55432}"
-PGPASSWORD="${PGPASSWORD:-postgres}"
+: "${PGPASSWORD:?set PGPASSWORD}"
 PGDATABASE="${PGDATABASE:-hybrid_vector}"
 IMAGE="${PGVECTOR_IMAGE:-pgvector/pgvector:pg16}"
 DATA_DIR="${PGVECTOR_DATA_DIR:-$PWD/.pgvector-data}"

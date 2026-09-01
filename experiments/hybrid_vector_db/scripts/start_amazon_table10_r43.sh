@@ -6,8 +6,8 @@ set -euo pipefail
 
 container=${TABLE10_AMAZON_CONTAINER:-hybrid-pgvector-amazon-table10-r43}
 image=${TABLE10_IMAGE:-pgvector/pgvector:pg16}
-pgdata=${TABLE10_PGDATA:-/mnt/nvme-pg/home/kec23008/pgdata-amazon-table10-r43}
-vector_so=${TABLE10_VECTOR_SO:-/home/kec23008/Hybrid-Retrieval/results/hybrid_vector_db/release_binaries/r43/vector.so}
+pgdata=${TABLE10_PGDATA:?set TABLE10_PGDATA}
+vector_so=${TABLE10_VECTOR_SO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/results/hybrid_vector_db/release_binaries/r43/vector.so}
 host_port=${TABLE10_HOST_PORT:-55437}
 cpuset=${TABLE10_CPUSET:-0-31}
 shm_size=${TABLE10_SHM_SIZE:-320g}
@@ -55,7 +55,7 @@ else
     -p "$host_port:5432" \
     -v "$pgdata:/var/lib/postgresql/data" \
     -v "$vector_so:/usr/lib/postgresql/16/lib/vector.so:ro" \
-    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_PASSWORD="${PGPASSWORD:?set PGPASSWORD}" \
     -e POSTGRES_DB=hybrid_vector \
     "$image" \
     -c max_worker_processes=32 \

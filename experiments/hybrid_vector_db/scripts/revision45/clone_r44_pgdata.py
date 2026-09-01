@@ -9,10 +9,9 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import os
 from pathlib import Path
 
-SRC = Path("/mnt/nvme-pg/home/kec23008/pgdata-amazon-table10-r43")
-DEST = Path("/mnt/nvme-pg/home/kec23008/pgdata-amazon-table10-r44")
 EXCLUDE = (
     "postmaster.pid",
     "postmaster.opts",
@@ -56,26 +55,34 @@ def _write(path: Path, text: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--src", type=Path, default=SRC)
-    parser.add_argument("--dest", type=Path, default=DEST)
+    parser.add_argument("--src", type=Path, default=None)
+    parser.add_argument("--dest", type=Path, default=None)
     parser.add_argument("--pgport", type=int, default=55437)
     args = parser.parse_args()
+
+    try:
+        src = args.src or Path(os.environ["TABLE10_PGDATA"])
+        dest = args.dest or Path(os.environ["R44_PGDATA"])
+        password = os.environ["PGPASSWORD"]
+    except KeyError as exc:
+        print(f"set {exc.args[0]}", file=sys.stderr)
+        return 2
 
     import psycopg
 
     src_ok = subprocess.run(
-        ["sudo", "-n", "test", "-f", str(args.src / "PG_VERSION")]
+        ["sudo", "-n", "test", "-f", str(src / "PG_VERSION")]
     ).returncode == 0
     if not src_ok:
-        print(f"source PGDATA missing: {args.src}", file=sys.stderr)
+        print(f"source PGDATA missing: {src}", file=sys.stderr)
         return 2
-    subprocess.run(["sudo", "-n", "mkdir", "-p", str(args.dest)], check=True)
-    subprocess.run(["sudo", "-n", "chown", "999:999", str(args.dest)], check=True)
-    subprocess.run(["sudo", "-n", "chmod", "700", str(args.dest)], check=True)
+    subprocess.run(["sudo", "-n", "mkdir", "-p", str(dest)], check=True)
+    subprocess.run(["sudo", "-n", "chown", "999:999", str(dest)], check=True)
+    subprocess.run(["sudo", "-n", "chmod", "700", str(dest)], check=True)
 
     conninfo = (
         f"host=127.0.0.1 port={args.pgport} dbname=hybrid_vector "
-        "user=postgres password=postgres"
+        "user=%s password=%s" % (os.environ.get("PGUSER", "postgres"), password)
     )
     with psycopg.connect(conninfo, autocommit=True) as conn:
         cur = conn.cursor()
@@ -88,7 +95,7 @@ def main() -> int:
         start_lsn = cur.fetchone()[0]
         print(f"start_lsn={start_lsn}", flush=True)
         try:
-            _rsync(args.src, args.dest)
+            _rsync(src, dest)
         except Exception:
             try:
                 cur.execute("SELECT pg_backup_stop(false)")
@@ -98,9 +105,9 @@ def main() -> int:
         cur.execute("SELECT lsn, labelfile, spcmapfile FROM pg_backup_stop(false)")
         stop_lsn, labelfile, spcmapfile = cur.fetchone()
         print(f"stop_lsn={stop_lsn}", flush=True)
-    _write(args.dest / "backup_label", labelfile)
+    _write(dest / "backup_label", labelfile)
     if spcmapfile:
-        _write(args.dest / "tablespace_map", spcmapfile)
+        _write(dest / "tablespace_map", spcmapfile)
     print("RSYNC_WAL", flush=True)
     wal_cmd = [
         "sudo",
@@ -109,12 +116,12 @@ def main() -> int:
         "-aH",
         "--numeric-ids",
         "--info=progress2",
-        f"{args.src}/pg_wal/",
-        f"{args.dest}/pg_wal/",
+        f"{src}/pg_wal/",
+        f"{dest}/pg_wal/",
     ]
     print("RUN", " ".join(wal_cmd), flush=True)
     subprocess.run(wal_cmd, check=True)
-    subprocess.run(["sudo", "-n", "rm", "-f", str(args.dest / "postmaster.pid")], check=True)
+    subprocess.run(["sudo", "-n", "rm", "-f", str(dest / "postmaster.pid")], check=True)
     for name in (
         "pg_dynshmem",
         "pg_notify",
@@ -123,17 +130,17 @@ def main() -> int:
         "pg_stat_tmp",
         "pg_subtrans",
     ):
-        path = args.dest / name
+        path = dest / name
         subprocess.run(["sudo", "-n", "mkdir", "-p", str(path)], check=True)
         subprocess.run(["sudo", "-n", "chown", "999:999", str(path)], check=True)
         subprocess.run(["sudo", "-n", "chmod", "700", str(path)], check=True)
     version = subprocess.check_output(
-        ["sudo", "-n", "cat", str(args.dest / "PG_VERSION")], text=True
+        ["sudo", "-n", "cat", str(dest / "PG_VERSION")], text=True
     ).strip()
     if version != "16":
         print(f"cloned major {version} != 16", file=sys.stderr)
         return 1
-    print(f"cloned:{args.dest}:pg{version}:start={start_lsn}:stop={stop_lsn}")
+    print(f"cloned:{dest}:pg{version}:start={start_lsn}:stop={stop_lsn}")
     return 0
 
 

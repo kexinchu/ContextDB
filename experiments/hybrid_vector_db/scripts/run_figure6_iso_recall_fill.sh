@@ -14,9 +14,9 @@
 #   all-offline     — audit + amazon-refresh only
 set -euo pipefail
 
-ROOT=/home/kec23008/Hybrid-Retrieval
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "$ROOT"
-PY="${PYTHON:-/home/kec23008/miniconda3/bin/python}"
+PY="${PYTHON:-python3}"
 CFG=experiments/hybrid_vector_db/configs/figure6_iso_recall_targets.json
 OUT=results/hybrid_vector_db/figure6_iso_recall_fill
 TARGETS=0.75,0.80,0.85,0.90,0.94,0.95,0.96,0.97,0.98,0.99

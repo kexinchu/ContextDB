@@ -30,14 +30,14 @@ python3 -m venv .venv
 ```
 
 PostgreSQL 16.14 is the evaluated server. Connection settings use the usual
-environment variables (the local Docker default password is `postgres`):
+environment variables. `PGPASSWORD` is required and must not be committed:
 
 ```bash
 export PGHOST=127.0.0.1
 export PGPORT=55432
 export PGDATABASE=hybrid_vector
 export PGUSER=postgres
-export PGPASSWORD=postgres
+export PGPASSWORD
 ```
 
 Dataset roots, if you rebuild the paper workloads:
@@ -46,6 +46,9 @@ Dataset roots, if you rebuild the paper workloads:
 export OOD_ANNS_DATA=/path/to/ood-anns/data
 export LAION25M_DATA_DIR=/path/to/LAION25M
 export YFCC10M_DATA_DIR=/path/to/YFCC10M
+export TABLE10_PGDATA=/path/to/pgdata
+export R44_PGDATA=/path/to/pgdata-r44
+export WORKDIR=/path/to/scratch
 ```
 
 ## Build the paper binary (r44)

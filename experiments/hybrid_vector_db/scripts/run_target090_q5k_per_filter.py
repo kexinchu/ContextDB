@@ -236,7 +236,7 @@ def main() -> int:
         "PGPORT": DATASETS[args.dataset]["port"],
         "PGDATABASE": "hybrid_vector",
         "PGUSER": "postgres",
-        "PGPASSWORD": "postgres",
+        "PGPASSWORD": os.environ["PGPASSWORD"],
         "PYTHONUNBUFFERED": "1",
     })
 

@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/../../.." && pwd)
 results="$root/results/hybrid_vector_db"
-python=${TABLE10_PYTHON:-/home/kec23008/miniconda3/bin/python3}
+python=${TABLE10_PYTHON:-python3}
 lock_path="$results/.pg55437_experiment.lock"
 start_script="$script_dir/start_amazon_table10_r43.sh"
 frozen="$results/figure5_hybrid_allowlist_q1k_screen_frozen_20260820"
@@ -20,7 +20,7 @@ if ! flock -n "$lock_path" -c true; then
   exit 2
 fi
 export PYTHONUNBUFFERED=1 PGHOST=127.0.0.1 PGPORT=55437 PGDATABASE=hybrid_vector
-export PGUSER=postgres PGPASSWORD=postgres
+: "${PGUSER:?set PGUSER}" "${PGPASSWORD:?set PGPASSWORD}"
 export PYTHONPATH="$script_dir${PYTHONPATH:+:$PYTHONPATH}"
 
 exec 9>>"$lock_path"

@@ -5,9 +5,9 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-shared_root="${TABLE10_SHARED_ROOT:-/home/kec23008/Hybrid-Retrieval}"
+shared_root="${TABLE10_SHARED_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 results="$shared_root/results/hybrid_vector_db"
-python=${TABLE10_PYTHON:-/home/kec23008/miniconda3/bin/python3}
+python=${TABLE10_PYTHON:-python3}
 lock_path="$results/.pg55437_experiment.lock"
 runner="$script_dir/figure5_hybrid_allowlist_screen.py"
 start_script="$script_dir/start_amazon_table10_r43.sh"
@@ -33,7 +33,7 @@ export PGHOST=127.0.0.1
 export PGPORT=55437
 export PGDATABASE=hybrid_vector
 export PGUSER=postgres
-export PGPASSWORD=postgres
+: "${PGPASSWORD:?set PGPASSWORD}"
 export PYTHONPATH="$script_dir${PYTHONPATH:+:$PYTHONPATH}"
 
 exec 9>>"$lock_path"

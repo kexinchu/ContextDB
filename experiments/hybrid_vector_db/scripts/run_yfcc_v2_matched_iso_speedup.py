@@ -21,7 +21,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-ROOT = Path("/home/kec23008/Hybrid-Retrieval")
+ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CFG = ROOT / "experiments/hybrid_vector_db/configs/figure5_r41_yfcc_primary_v3filters.json"
 DEFAULT_OUT = ROOT / "results/hybrid_vector_db/figure5_r41_yfcc_v3_matched_iso"
 DEFAULT_PLOT = ROOT / "results/hybrid_vector_db/yfcc10m_v3_matched_iso"

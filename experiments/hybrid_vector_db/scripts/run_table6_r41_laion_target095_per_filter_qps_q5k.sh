@@ -7,16 +7,14 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${repo_root}"
-python_bin="${PYTHON:-/home/kec23008/miniconda3/bin/python3}"
+python_bin="${PYTHON:-python3}"
 telemetry_path="${SQLENS_TELEMETRY_PATH:-${repo_root}/.pgvector-data}"
-export PATH="/home/kec23008/miniconda3/bin:/home/kec23008/.local/bin:${PATH:-/usr/bin}"
-export PYTHONPATH="/home/kec23008/.local/lib/python3.13/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 
 export PGHOST="${PGHOST:-127.0.0.1}"
 export PGPORT="${PGPORT:-55432}"
 export PGDATABASE="${PGDATABASE:-hybrid_vector}"
 export PGUSER="${PGUSER:-postgres}"
-export PGPASSWORD="${PGPASSWORD:-postgres}"
+: "${PGPASSWORD:?set PGPASSWORD}"
 export PYTHONUNBUFFERED=1
 
 out_dir="${OUT_DIR:-results/hybrid_vector_db/table6_r41_laion_target095_per_filter_qps_q5k}"

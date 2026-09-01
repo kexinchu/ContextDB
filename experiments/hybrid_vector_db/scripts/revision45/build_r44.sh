@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the r44 FragReuse copy. Does not touch the 55437 table10 instance.
 set -euo pipefail
-src=/home/kec23008/Hybrid-Retrieval/third_party/pgvector-sqlens-r44
-out=/home/kec23008/Hybrid-Retrieval/results/hybrid_vector_db/release_binaries/r44
+src=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)/third_party/pgvector-sqlens-r44
+out=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)/results/hybrid_vector_db/release_binaries/r44
 image=${TABLE10_IMAGE:-pgvector/pgvector:pg16}
 
 mkdir -p "$out"

@@ -8,7 +8,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../../../.." && pwd)
 shared_root="${TABLE10_SHARED_ROOT:-$repo_root}"
 results="$shared_root/results/hybrid_vector_db"
-python=${TABLE10_PYTHON:-/home/kec23008/miniconda3/bin/python3}
+python=${TABLE10_PYTHON:-python3}
 lock_path="$results/.pg55437_experiment.lock"
 runner="$script_dir/../pgvector_update_concurrency_benchmark.py"
 start_script="$script_dir/../start_amazon_table10_r43.sh"
@@ -78,7 +78,7 @@ export PGHOST=127.0.0.1
 export PGPORT=55437
 export PGDATABASE=hybrid_vector
 export PGUSER=postgres
-export PGPASSWORD=postgres
+: "${PGPASSWORD:?set PGPASSWORD}"
 
 exec 9>>"$lock_path"
 flock 9
@@ -89,7 +89,7 @@ flock 9
     --client-cpu-list "${TABLE10_CLIENT_CPU:-16-47}" \
     --start-barrier-timeout-seconds "${TABLE10_BARRIER_TIMEOUT:-600}" \
     --backend-proc-root "$backend_proc_root" \
-    --telemetry-path /mnt/nvme-pg/home/kec23008/pgdata-amazon-table10-r43 \
+    --telemetry-path "${TABLE10_PGDATA:?set TABLE10_PGDATA}" \
     --expected-runner-sha256 "$runner_sha" \
     --expected-git-revision "$git_revision" \
     --out "$out" \
