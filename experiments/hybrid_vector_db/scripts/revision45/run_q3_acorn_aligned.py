@@ -408,15 +408,26 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=OUT_DIR)
     parser.add_argument("--filter-names", nargs="*")
     parser.add_argument("--query-count", type=int)
+    parser.add_argument("--efs", nargs="+", type=int)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     smoke = bool(args.smoke)
     names = list(args.filter_names or (SMOKE_FILTERS if smoke else SCREEN_FILTERS))
     query_count = int(args.query_count or (SMOKE_QUERY_COUNT if smoke else QUERY_COUNT))
-    efs = SMOKE_EFS if smoke else q3.ACORN_EFS
+    if args.efs:
+        efs = tuple(int(v) for v in args.efs)
+    elif smoke:
+        efs = SMOKE_EFS
+    else:
+        efs = q3.ACORN_EFS
+    high_ef = bool(args.efs)
     contract = {
         "paper_eligible": False,
-        "plan_item": "Q3_ACORN_ALIGNED_SMOKE" if smoke else "Q3_ACORN_ALIGNED",
+        "plan_item": (
+            "Q3_ACORN_ALIGNED_SMOKE" if smoke
+            else "Q3_ACORN_ALIGNED_HIGH_EF" if high_ef
+            else "Q3_ACORN_ALIGNED"
+        ),
         "protocol": {
             "index": fig5.CLONE_INDEX,
             "ann": "HnswSearchHybridL0",
@@ -449,7 +460,9 @@ def main() -> int:
     cfg = pg_config_from_env()
     if int(cfg.port) == 55437:
         raise SystemExit("refusing to run the aligned ACORN screen on 55437")
-    score_path = args.out_dir / ("smoke.json" if smoke else "score.json")
+    score_path = args.out_dir / (
+        "smoke.json" if smoke else "score_high_ef.json" if high_ef else "score.json"
+    )
     prior = (
         json.loads(score_path.read_text(encoding="utf-8"))
         if args.resume and score_path.exists()
