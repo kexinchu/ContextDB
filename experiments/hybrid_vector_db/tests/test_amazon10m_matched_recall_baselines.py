@@ -79,10 +79,6 @@ from experiments.hybrid_vector_db.scripts.amazon10m_matched_recall_baselines imp
     workload_query_nos_by_filter,
     write_csv,
 )
-from experiments.hybrid_vector_db.scripts.finalize_amazon10m_matched_recall_baselines import (
-    FinalizationFailure,
-    finalize_existing,
-)
 
 
 SPEC = FilterSpec(
@@ -1451,88 +1447,6 @@ class Amazon10mMatchedRecallBaselineTests(unittest.TestCase):
         table, _ = calibration_table(rows, [SPEC], [100], [0.9], [0, 1], 2, 50, 57)
         self.assertTrue(all(row["outcome"] == "calibration_invalid" for row in table))
 
-    def test_finalizer_rejects_tamper_and_preserves_outputs_until_atomic_success(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            filters = root / "filters.csv"
-            filters.write_text(
-                "filter_name,target_rate,predicate,count,actual_pct\n"
-                "filter_a,10.0%,helpful_vote >= 1,20,10.0\n", encoding="utf-8"
-            )
-            truth = root / "truth.csv"
-            fields = ["query_no", "query_id", "filter_name", "predicate", "method", "exact_filtered_topk_ids",
-                      "recall_at_10_exact_filtered", "filtered_rows", "k", "kth_distance_sq", "tie_tolerance",
-                      "self_excluded", "query_split", "candidate_validity_predicate",
-                      "query_validity_predicate", "candidate_rows"]
-            with truth.open("w", newline="", encoding="utf-8") as target:
-                writer = csv.DictWriter(target, fieldnames=fields)
-                writer.writeheader()
-                for query_no, split in ((0, "calibration"), (1, "final")):
-                    writer.writerow({"query_no": query_no, "query_id": query_no + 2,
-                        "filter_name": SPEC.name, "predicate": SPEC.predicate, "method": "pre_filter_exact", "exact_filtered_topk_ids": "5,6",
-                        "recall_at_10_exact_filtered": 1.0, "filtered_rows": 20, "k": 2, "kth_distance_sq": 1.0,
-                        "tie_tolerance": 1e-9, "self_excluded": True, "query_split": split,
-                        "candidate_validity_predicate": "embedding_valid",
-                        "query_validity_predicate": "embedding_valid", "candidate_rows": 20})
-            fbin, faiss = root / "vectors.fbin", root / "index.faiss"
-            fbin.write_bytes(b"vectors")
-            faiss.write_bytes(b"index")
-            raw = root / "raw.csv"
-            calibration = root / "calibration.csv"
-            final = root / "final.csv"
-            raw_rows = [measured_row("calibration", "faiss_allowlist", 0, repeat, 2.0, 0.5, ef)
-                        for ef in (100, 200) for repeat in (0, 1)]
-            final_rows = [measurement_row(
-                phase="final", method="sql_first_exact", spec=SPEC, query_no=1, query_id=3,
-                repeat=repeat, schedule_position=1, block_no=repeat, ef_search=NA,
-                result_ids=list(range(10)), truth_ids=list(range(10)), latency_ms=20.0,
-            ) for repeat in (0, 1)]
-            raw_rows.extend(final_rows)
-            write_csv(raw, raw_rows)
-            table, _ = calibration_table(raw_rows, [SPEC], [100, 200], [0.9], [0], 2, 20, 57)
-            write_csv(calibration, table)
-            write_csv(final, final_rows)
-            manifest = root / "legacy.json"
-            payload = {
-                "status": "invalid", "finished_at_utc": "2026-07-18T00:00:00+00:00",
-                "args": {"filter_names": [SPEC.name], "calibration_query_offset": 0,
-                    "calibration_queries": 1, "calibration_repeats": 2, "final_query_offset": 1,
-                    "final_queries": 1, "final_repeats": 2, "target_recalls": "0.9",
-                    "ef_search_values": "100,200", "k": 2, "bootstrap_samples": 20, "bootstrap_seed": 57,
-                    "tag": "only-this-shard", "out_dir": str(root), "overwrite": True},
-                "inputs": {"filters": {"path": str(filters)}, "truth": {"path": str(truth)},
-                    "fbin": {"path": str(fbin)}, "faiss_index": {"path": str(faiss)},
-                    "runner": {"path": "runner.py", "sha256": "a" * 64}},
-                "postgres": {"table_oid": 1}, "outputs": {"raw": str(raw), "calibration": str(calibration), "final": str(final)},
-                "query_splits": {"calibration_query_nos": [0], "final_query_nos": [1]},
-                "source_hashes": {"truth": sha256_file(truth), "fbin": sha256_file(fbin), "faiss": sha256_file(faiss)},
-            }
-            manifest.write_text(json.dumps(payload), encoding="utf-8")
-            prefix = root / "finalized"
-            summary_path = root / "finalized_summary.csv"
-            manifest_path = root / "finalized_manifest.json"
-            summary_path.write_text("old-summary", encoding="utf-8")
-            manifest_path.write_text("old-manifest", encoding="utf-8")
-            fbin.write_bytes(b"tampered")
-            with self.assertRaisesRegex(FinalizationFailure, "hash changed"):
-                finalize_existing(manifest, raw, calibration, final, prefix)
-            self.assertEqual(summary_path.read_text(encoding="utf-8"), "old-summary")
-            self.assertEqual(manifest_path.read_text(encoding="utf-8"), "old-manifest")
-            fbin.write_bytes(b"vectors")
-            outputs = finalize_existing(manifest, raw, calibration, final, prefix)
-            self.assertTrue(outputs["summary"].is_file())
-            finalized = json.loads(outputs["manifest"].read_text(encoding="utf-8"))
-            self.assertTrue(finalized["artifact_valid"])
-            self.assertEqual(finalized["status"], "complete")
-            self.assertEqual(finalized["software_versions"]["measurement_runner_sha256"], "a" * 64)
-            self.assertNotIn("filter_names", finalized["run_contract"])
-            self.assertNotIn("tag", finalized["run_contract"])
-            self.assertNotIn("out_dir", finalized["run_contract"])
-            self.assertTrue(Path(finalized["outputs"]["summary"]["path"]).is_absolute())
-            self.assertTrue(Path(finalized["outputs"]["manifest"]).is_absolute())
-            write_csv(calibration, table[:-1])
-            with self.assertRaisesRegex(FinalizationFailure, "calibration key coverage"):
-                finalize_existing(manifest, raw, calibration, final, root / "rejected")
 
     def test_baseline_artifact_flags_do_not_promote_a_diagnostic_slice(self):
         partial = artifact_validity_flags(

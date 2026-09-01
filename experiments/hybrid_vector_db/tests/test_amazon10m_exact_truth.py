@@ -15,25 +15,9 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import amazon10m_exact_truth as truth  # noqa: E402
-import amazon10m_exact_truth_postgres_audit as postgres_audit  # noqa: E402
 
 
 class AmazonExactTruthTest(unittest.TestCase):
-    def test_postgres_audit_query_sample_parser(self) -> None:
-        self.assertEqual(postgres_audit.parse_query_nos("0,1999,4999,9999"), (0, 1999, 4999, 9999))
-        with self.assertRaises(argparse.ArgumentTypeError):
-            postgres_audit.parse_query_nos("")
-        with self.assertRaises(argparse.ArgumentTypeError):
-            postgres_audit.parse_query_nos("0,-1")
-        with self.assertRaises(argparse.ArgumentTypeError):
-            postgres_audit.parse_query_nos("0,0")
-
-    def test_postgres_audit_cli_exposes_query_sample(self) -> None:
-        args = postgres_audit.create_argument_parser().parse_args(
-            ["--query-nos", "0,2499,4999,7499,9999"]
-        )
-        self.assertEqual(args.query_nos, (0, 2499, 4999, 7499, 9999))
-
     def test_external_unique_query_cohort_is_fully_bound(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

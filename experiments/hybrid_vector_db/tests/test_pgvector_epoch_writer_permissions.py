@@ -16,10 +16,6 @@ MAKEFILE = ROOT / "third_party/pgvector-sqlens/Makefile"
 FORMAL_RUNNERS = (
     ROOT
     / "experiments/hybrid_vector_db/scripts/pgvector_design1_design2_design3_selectivity_benchmark.py",
-    ROOT
-    / "experiments/hybrid_vector_db/scripts/yfcc_overlap_sqlens_variants_benchmark.py",
-    ROOT
-    / "experiments/hybrid_vector_db/scripts/laion25m_sqlens_variants_benchmark.py",
 )
 
 

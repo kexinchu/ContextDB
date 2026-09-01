@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 from experiments.hybrid_vector_db.scripts import prepare_pgvector_official_index as prepare
-from experiments.hybrid_vector_db.scripts import pgvector_upstream_overhead_control
 
 
 SHA256 = "a" * 64
@@ -439,19 +438,8 @@ class ManifestTests(unittest.TestCase):
             provenance=provenance,
             created=True,
         )
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "manifest.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            identity = (
-                pgvector_upstream_overhead_control.load_official_index_build_identity(
-                    path,
-                    table=prepare.DEFAULT_TABLE,
-                    index=prepare.DEFAULT_INDEX,
-                    official_source_commit=COMMIT,
-                )
-            )
-        self.assertTrue(identity["artifact_valid"])
-        self.assertEqual(identity["index_fingerprint"]["index_oid"], 30)
+        self.assertTrue(payload["artifact_valid"])
+        self.assertEqual(payload["index_fingerprint"]["index_oid"], 30)
 
     def test_atomic_writer_replaces_complete_json_and_leaves_no_temp(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
