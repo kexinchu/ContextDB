@@ -10,15 +10,16 @@ eligible for deletion.
 pytest and SQL smoke tests stay. They do not produce paper numbers, but
 they are the reviewer-facing contract.
 
-Figure 1 (Amazon-200K HNSWlib vs pgvector) has no runner in this
-repository after the paper tree was removed. `third_party/hnswlib/`
-remains.
+Motivation runners live under `research/`. Result CSVs, compiled
+binaries, and `research/late_bound_visibility/` stay local. Official
+ACORN is cloned into `external/ACORN` and is not tracked.
 
 | Paper | What it reports | Keep |
 |---|---|---|
-| Fig 2(a) | Candidates per SQL-valid row | `sigmod_candidate_waste_summary.py` |
-| Fig 2(b) / page-load note | Heap page runs | `sigmod_page_access_summary.py`, `fixed_candidate_page_verify.py`, `pgvector_page_cluster_verify.py`, `pgvector_hnsw_materialize_benchmark.py` |
-| Table 1 | C4 atom-reuse rates | `analyze_amazon_c4_trace_cache.py`, `select_amazon_c4_pgvector_queries.py` |
+| Fig 1 | Amazon-200K HNSWlib / ACORN vs pgvector | `research/fig1_four_curve_frontier.py`, `research/fig1_aligned_1pct.py`, `research/fig1_iso_recall_1pct.py`, `research/hnswlib_vs_pgvector_selectivity.py`, `research/run_hnsw_engine_comparison.sh`, `research/setup_fig1_200k_pg.sh` |
+| Fig 2(a) | Candidates per SQL-valid row | `research/controlled_selectivity_multidataset.py`, `sigmod_candidate_waste_summary.py` |
+| Fig 2(b) / page-load note | Heap page runs | `research/page_locality_multidataset.py`, `research/page_locality_reordered_multidataset.py`, `research/build_vector_clustered_heap.py`, `sigmod_page_access_summary.py`, `fixed_candidate_page_verify.py`, `pgvector_page_cluster_verify.py`, `pgvector_hnsw_materialize_benchmark.py` |
+| Table 1 | C4 atom-reuse rates | `research/filter_reuse_benchmark.py`, `analyze_amazon_c4_trace_cache.py`, `select_amazon_c4_pgvector_queries.py` |
 | Table 4 | Dataset footprints | `prepare_amazon10m_sql_native.py`, `prepare_amazon10m_valid_embedding_indexes.py`, `prepare_yfcc_pgvector.py`, `prepare_laion25m_pgvector.py`, `prepare_laion_pgvector.py`, `prepare_pgvector_official_index.py`, `prepare_figure5_external_queries.py`, `build_amazon10m_unique_query_cohort.py` |
 | Table 5 | Calibrated held-out latency / QPS | `select_figure5_matched_configs.py`, `run_figure5_matched_latency.py`, `run_figure5_matched_throughput.py`, `pgvector_figure5_throughput.py`, `calibrate_external_table6_configs.py`, `external_dataset_matched_recall_runner.py`, `pgvector_target_recall_selectivity_runner.py`, `yfcc_pgvector_target_recall_runner.py`, `laion_pgvector_target_recall_runner.py` |
 | Fig 4 | Recall–cost frontiers | `run_figure5_frontier.py`, `figure5_frontier_artifact.py`, `build_figure5_frontier_workload.py`, `plot_amazon10m_iso_recall.py`, `audit_figure6_iso_recall_coverage.py` |

@@ -20,6 +20,7 @@ The evaluated paper binary is the r44 fork.
 | `third_party/hnswlib/` | In-memory HNSW / ACORN diagnostic sources |
 | `patches/` | Audit patches against upstream pgvector |
 | `experiments/hybrid_vector_db/` | Paper-facing benchmark scripts, SQL smoke tests, and pytest suite |
+| `research/` | Motivation runners for Figures 1–2 and Table 1 |
 | `docs/` | Artifact notes and [paper table → script map](docs/paper-script-map.md) |
 
 ## Dependencies
@@ -76,15 +77,14 @@ camera-ready numbering. The keep set is listed in
 
 | Paper | Scripts |
 |---|---|
+| Fig 1 | `research/fig1_four_curve_frontier.py`, `research/run_hnsw_engine_comparison.sh` |
+| Fig 2 / Table 1 | `research/controlled_selectivity_multidataset.py`, `research/page_locality_multidataset.py`, `research/filter_reuse_benchmark.py` |
 | Table 5 / Fig 4 | `run_figure5_matched_latency.py`, `run_figure5_matched_throughput.py`, `run_figure5_frontier.py` |
 | Fig 5 | `amazon10m_sql_native_benchmark.py`, `revision45/run_b2_join_warm.sh` |
 | Table 6 | `revision45/run_b1_sql_first_q1k.py` |
 | Table 7 | `revision45/run_q3_acorn_matched.py`, `revision45/run_q3_acorn_aligned.py` |
 | Tables 8–11 | `pgvector_design1_design2_design3_selectivity_benchmark.py`, `pgvector_d2_cache_isolation_control.py`, `amazon10m_d3_adaptation_lifecycle_benchmark.py` |
 | Tables 12–13 | `pgvector_update_correctness_stress.py`, `pgvector_update_concurrency_benchmark.py`, `revision45/run_c2_failopen_write_sweep.sh` |
-
-Figure 1 (Amazon-200K HNSWlib vs pgvector) is not runnable from this
-snapshot. `third_party/hnswlib/` remains for the diagnostic sources.
 
 ## Tests that run without the paper datasets
 

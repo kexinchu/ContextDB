@@ -37,12 +37,29 @@ Hybrid-Retrieval-Late-Bound-Visibility-Handoff.md
 
 # Results
 results/
-research/results/
-research/
 *.csv
 !experiments/hybrid_vector_db/configs/*.csv
 *.png
 *.pdf
+
+# Motivation sources under research/ are tracked. Local outputs are not.
+/research/results/
+/research/late_bound_visibility/
+/research/paper/
+/research/__pycache__/
+/research/acorn_faiss_graph_stats
+/research/acorn_faiss_hop_debug
+/research/acorn_faiss_mixed_frontier
+/research/acorn_faiss_selectivity
+/research/acorn_hnswlib_build
+/research/acorn_hnswlib_mixed_frontier
+/research/acorn_hybrid_l0_debug
+/research/acorn_index_sanity
+/research/acorn_search_debug
+/research/acorn_sweeping_smoke
+
+# Local Figure-1 PostgreSQL data directory
+/.pgdata-fig1-200k/
 
 # Paper build products
 *.aux
